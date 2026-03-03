@@ -1,13 +1,12 @@
+obj-m := correction_driver.o
+
+correction_driver-objs := src/correction-driver.o src/clone_bio.o
+
 KDIR := /lib/modules/$(shell uname -r)/build
-BUILD_DIR := $(CURDIR)/build
-SRC_DIR := $(CURDIR)/src
+PWD  := $(shell pwd)
 
 all:
-	mkdir -p $(BUILD_DIR)
-	echo "obj-m := correction-driver.o" > $(BUILD_DIR)/Makefile
-	ln -sf $(SRC_DIR)/correction-driver.c $(BUILD_DIR)/correction-driver.c
-	$(MAKE) -C $(KDIR) M=$(BUILD_DIR) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(BUILD_DIR) clean || true
-	rm -rf $(BUILD_DIR)
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
