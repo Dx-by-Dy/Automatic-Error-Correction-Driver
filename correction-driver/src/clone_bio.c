@@ -17,7 +17,7 @@ void clone_end_io(struct bio *clone)
 }
 
 /*
-Функция для высвобождения clone
+Функция для копирования bio
 */
 struct bio *clone_bio(struct bio *orig, struct block_device *bdev)
 {
