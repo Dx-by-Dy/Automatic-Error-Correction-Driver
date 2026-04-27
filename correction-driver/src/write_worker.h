@@ -2,16 +2,19 @@
 #define WRITE_WORKER_H
 
 #include <linux/workqueue.h>
+#include "correction-driver.h"
+#include "alignment.h"
 
-struct write_worker
+struct write_request
 {
     struct work_struct work;
     struct bio *orig_bio;
-    struct mutex *gl_mutex;
-    // spinlock_t list_spinlock;
-    // struct list_head queue;
+    struct dm_context *dm_ctx;
+    struct bio *orig_bio_parts[MAX_ORIG_BIO_PARTS];
+    unsigned int num_parts;
+    atomic_t pending;
 };
 
-struct write_worker *write_worker_init(struct bio *bio, struct mutex *mutex);
+struct write_request *write_request_init(struct bio *orig_bio, struct dm_context *dm_ctx);
 
 #endif

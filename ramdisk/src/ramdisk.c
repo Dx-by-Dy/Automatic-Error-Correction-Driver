@@ -61,7 +61,7 @@ static const struct blk_mq_ops ramdisk_mq_ops = {
     .queue_rq = ramdisk_queue_rq,
 };
 
-static int ramdisk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+static int ramdisk_getgeo(struct gendisk *ramdisk_disk, struct hd_geometry *geo)
 {
     geo->heads = 4;
     geo->sectors = 16;
