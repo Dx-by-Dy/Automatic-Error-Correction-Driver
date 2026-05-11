@@ -11,5 +11,6 @@
 
 sector_t align_data_sector(sector_t sector);
 sector_t misalign_data_sector(sector_t sector);
+sector_t start_data_sector(sector_t sector);
 
 #endif

@@ -4,6 +4,7 @@
 #include <linux/workqueue.h>
 #include "correction-driver.h"
 #include "alignment.h"
+#include "locker.h"
 
 struct write_request
 {

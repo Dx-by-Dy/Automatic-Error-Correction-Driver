@@ -3,7 +3,11 @@
 
 void write_orig_bio_part_end_io(struct bio *bio)
 {
-    struct write_request *req = bio->bi_private;
+    struct write_bio_part_private *priv = bio->bi_private;
+    struct write_request *req = priv->req;
+
+    up_write(&priv->lock->sem);
+    locker_put_lock(req->dm_ctx->locker, priv->index, priv->lock);
 
     if (bio->bi_status)
         req->orig_bio->bi_status = bio->bi_status;
@@ -18,9 +22,8 @@ void write_orig_bio_part_end_io(struct bio *bio)
     bio_put(bio);
 }
 
-/*
-Функция для записи bio в dmesg
-*/
+/// @brief Функция вывода структуры bio
+/// @param bio Структура bio
 void print_bio(struct bio *bio)
 {
     pr_info("BIO %p\n", bio);

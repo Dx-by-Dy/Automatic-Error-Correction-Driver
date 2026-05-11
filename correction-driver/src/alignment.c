@@ -8,10 +8,18 @@ sector_t align_data_sector(sector_t sector)
     return ((sector / (DATA_SIZE_SECTORS - 1)) * (CHUNK_SIZE_SECTORS - 1)) + (sector % (DATA_SIZE_SECTORS - 1));
 }
 
-/// @brief Рассчитывает количество секторов до следующей границы выравнивания для невыровненных секторов
+/// @brief Рассчитывает количество секторов до следующего чанка для невыровненных секторов
 /// @param sector номер невыровненного сектора
-/// @return количество секторов до следующей границы выравнивания
+/// @return количество секторов до следующего чанка
 sector_t misalign_data_sector(sector_t sector)
 {
     return DATA_SIZE_SECTORS - (sector % DATA_SIZE_SECTORS);
+}
+
+/// @brief Рассчитывает номер начала данных в чанке для выровненного сектора
+/// @param sector номер выровненного сектора
+/// @return номер начала данных в чанке
+sector_t start_data_sector(sector_t sector)
+{
+    return sector - (sector % CHUNK_SIZE_SECTORS);
 }

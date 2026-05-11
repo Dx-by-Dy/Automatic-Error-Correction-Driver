@@ -29,7 +29,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         return DM_MAPIO_REMAPPED;
 
     case REQ_OP_WRITE:
-        print_bio(bio);
+        // print_bio(bio);
         struct write_request *req = write_request_init(bio, dm_ctx);
         if (!req)
         {
@@ -54,9 +54,19 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (!dm_ctx)
         return -ENOMEM;
 
+    dm_ctx->locker = kzalloc(sizeof(*dm_ctx->locker), GFP_KERNEL);
+    if (!dm_ctx->locker)
+    {
+        kfree(dm_ctx);
+        return -ENOMEM;
+    }
+    locker_init(dm_ctx->locker);
+
     dm_ctx->write_wq = alloc_workqueue("write_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1024);
     if (!dm_ctx->write_wq)
     {
+        locker_exit(dm_ctx->locker);
+        kfree(dm_ctx->locker);
         kfree(dm_ctx);
         return -ENOMEM;
     }
@@ -65,6 +75,8 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (!dm_ctx->write_rq_bs)
     {
         destroy_workqueue(dm_ctx->write_wq);
+        locker_exit(dm_ctx->locker);
+        kfree(dm_ctx->locker);
         kfree(dm_ctx);
         return -ENOMEM;
     }
@@ -73,6 +85,8 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (r)
     {
         destroy_workqueue(dm_ctx->write_wq);
+        locker_exit(dm_ctx->locker);
+        kfree(dm_ctx->locker);
         kfree(dm_ctx);
         return r;
     }
@@ -84,6 +98,8 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         bioset_exit(dm_ctx->write_rq_bs);
         kfree(dm_ctx->write_rq_bs);
         destroy_workqueue(dm_ctx->write_wq);
+        locker_exit(dm_ctx->locker);
+        kfree(dm_ctx->locker);
         kfree(dm_ctx);
         return r;
     }
@@ -102,6 +118,8 @@ static void dm_dtr(struct dm_target *ti)
 
     flush_workqueue(dm_ctx->write_wq);
     destroy_workqueue(dm_ctx->write_wq);
+    locker_exit(dm_ctx->locker);
+    kfree(dm_ctx->locker);
     dm_put_device(ti, dm_ctx->dev);
     bioset_exit(dm_ctx->write_rq_bs);
     kfree(dm_ctx->write_rq_bs);
