@@ -1,34 +1,33 @@
-#include "write_worker.h"
-#include "alignment.h"
+#include "read_worker.h"
 #include "bio_helper.h"
 #include <linux/slab.h>
 
-static void write_handler(struct work_struct *work);
-static int create_orig_bio_parts(struct write_request *req);
-static int init_orig_bio_parts(struct write_request *req);
-static void submit_orig_bio_parts(struct write_request *req);
+static void read_handler(struct work_struct *work);
+static int create_orig_bio_parts(struct read_request *req);
+static int init_orig_bio_parts(struct read_request *req);
+static void submit_orig_bio_parts(struct read_request *req);
 
-struct write_request *write_request_init(struct bio *orig_bio, struct dm_context *ctx)
+struct read_request *read_request_init(struct bio *orig_bio, struct dm_context *ctx)
 {
-    struct write_request *req = kmalloc(sizeof(struct write_request), GFP_KERNEL);
+    struct read_request *req = kmalloc(sizeof(struct read_request), GFP_KERNEL);
     if (!req)
         return NULL;
 
     bio_get(orig_bio);
-    INIT_WORK(&req->work, write_handler);
+    INIT_WORK(&req->work, read_handler);
     req->orig_bio = orig_bio;
     req->dm_ctx = ctx;
     req->num_parts = 0;
     atomic_set(&req->pending, 0);
 
-    pr_info("write_request_init");
+    pr_info("read_request_init");
 
     return req;
 }
 
-static void write_handler(struct work_struct *work)
+static void read_handler(struct work_struct *work)
 {
-    struct write_request *req = container_of(work, struct write_request, work);
+    struct read_request *req = container_of(work, struct read_request, work);
     int ret;
 
     ret = create_orig_bio_parts(req);
@@ -60,7 +59,7 @@ static void write_handler(struct work_struct *work)
     // pr_info("submit_orig_bio_parts");
 }
 
-static int create_orig_bio_parts(struct write_request *req)
+static int create_orig_bio_parts(struct read_request *req)
 {
     struct bio *orig_bio = req->orig_bio;
     unsigned int misalign;
@@ -76,7 +75,8 @@ static int create_orig_bio_parts(struct write_request *req)
         misalign = min(misalign_data_sector(orig_bio->bi_iter.bi_sector), bio_sectors(orig_bio));
         if (misalign == bio_sectors(orig_bio))
         {
-            // TODO: добавить write_bio_part_private в bio_set
+            // TODO: добавить read_bio_part_private в bio_set
+            // TODO: добавить read_rq_bs
             struct bio *orig_bio_part = bio_alloc_clone(orig_bio->bi_bdev, orig_bio, GFP_NOIO, req->dm_ctx->write_rq_bs);
             if (!orig_bio_part)
                 goto error;
@@ -104,14 +104,14 @@ error:
     return -ENOMEM;
 }
 
-static int init_orig_bio_parts(struct write_request *req)
+static int init_orig_bio_parts(struct read_request *req)
 {
     unsigned int i;
 
     for (i = 0; i < req->num_parts; i++)
     {
         struct bio *part = req->orig_bio_parts[i];
-        struct write_bio_part_private *priv = kzalloc(sizeof(struct write_bio_part_private), GFP_KERNEL);
+        struct read_bio_part_private *priv = kzalloc(sizeof(struct read_bio_part_private), GFP_KERNEL);
         if (!priv)
         {
             bio_put(part);
@@ -132,7 +132,7 @@ static int init_orig_bio_parts(struct write_request *req)
         part->bi_private = priv;
 
         bio_set_dev(part, req->dm_ctx->dev->bdev);
-        part->bi_end_io = write_orig_bio_part_end_io;
+        part->bi_end_io = read_orig_bio_part_end_io;
         atomic_inc(&req->pending);
 
         pr_info("orig_bio_parts after:");
@@ -146,7 +146,7 @@ error:
     for (unsigned int j = 0; j < i; j++)
     {
         struct bio *part = req->orig_bio_parts[j];
-        struct write_bio_part_private *priv = part->bi_private;
+        struct read_bio_part_private *priv = part->bi_private;
         locker_put_lock(req->dm_ctx->locker, priv->index, priv->lock);
         kfree(priv);
         bio_put(part);
@@ -154,7 +154,7 @@ error:
     return -ENOMEM;
 }
 
-static void submit_orig_bio_parts(struct write_request *req)
+static void submit_orig_bio_parts(struct read_request *req)
 {
     int submitted_parts[MAX_ORIG_BIO_PARTS] = {0};
     int all_submitted = 1;
@@ -170,8 +170,8 @@ static void submit_orig_bio_parts(struct write_request *req)
             {
                 all_submitted = 0;
                 struct bio *part = req->orig_bio_parts[i];
-                struct write_bio_part_private *priv = part->bi_private;
-                if (down_write_trylock(&priv->lock->sem))
+                struct read_bio_part_private *priv = part->bi_private;
+                if (down_read_trylock(&priv->lock->sem))
                 {
                     submitted_parts[i] = 1;
                     submit_bio(part);

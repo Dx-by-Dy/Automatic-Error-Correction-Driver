@@ -5,7 +5,7 @@
 /// @return номер выровненного сектора
 sector_t align_data_sector(sector_t sector)
 {
-    return ((sector / (DATA_SIZE_SECTORS - 1)) * (CHUNK_SIZE_SECTORS - 1)) + (sector % (DATA_SIZE_SECTORS - 1));
+    return (sector / DATA_SIZE_SECTORS) * (CHUNK_SIZE_SECTORS) + (sector % DATA_SIZE_SECTORS);
 }
 
 /// @brief Рассчитывает количество секторов до следующего чанка для невыровненных секторов

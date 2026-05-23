@@ -19,6 +19,29 @@ void write_orig_bio_part_end_io(struct bio *bio)
         kfree(req);
     }
 
+    kfree(priv);
+    bio_put(bio);
+}
+
+void read_orig_bio_part_end_io(struct bio *bio)
+{
+    struct read_bio_part_private *priv = bio->bi_private;
+    struct read_request *req = priv->req;
+
+    up_read(&priv->lock->sem);
+    locker_put_lock(req->dm_ctx->locker, priv->index, priv->lock);
+
+    if (bio->bi_status)
+        req->orig_bio->bi_status = bio->bi_status;
+
+    if (atomic_dec_and_test(&req->pending))
+    {
+        bio_endio(req->orig_bio);
+        bio_put(req->orig_bio);
+        kfree(req);
+    }
+
+    kfree(priv);
     bio_put(bio);
 }
 

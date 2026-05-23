@@ -11,6 +11,7 @@
 
 #include "bio_helper.h"
 #include "write_worker.h"
+#include "read_worker.h"
 #include "correction-driver.h"
 
 MODULE_LICENSE("GPL");
@@ -25,23 +26,32 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
     switch (bio_op(bio))
     {
     case REQ_OP_READ:
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
+        struct read_request *read_req =
+            read_request_init(bio, dm_ctx);
+
+        if (!read_req)
+        {
+            pr_err("Failed to initialize read request\n");
+            return DM_MAPIO_KILL;
+        }
+
+        // TODO: сделать read_wq
+        queue_work(dm_ctx->write_wq, &read_req->work);
+        return DM_MAPIO_SUBMITTED;
 
     case REQ_OP_WRITE:
-        // print_bio(bio);
-        struct write_request *req = write_request_init(bio, dm_ctx);
-        if (!req)
+        struct write_request *write_req = write_request_init(bio, dm_ctx);
+        if (!write_req)
         {
             pr_err("Failed to initialize write request\n");
             return DM_MAPIO_KILL;
         }
-        queue_work(dm_ctx->write_wq, &req->work);
+        queue_work(dm_ctx->write_wq, &write_req->work);
         return DM_MAPIO_SUBMITTED;
 
     default:
         bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
+        return DM_MAPIO_SUBMITTED;
     }
 }
 
