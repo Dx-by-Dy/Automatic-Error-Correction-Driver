@@ -57,4 +57,5 @@ dkms.conf
 *.bin
 *.img
 *.bkp
-
+*.state
+correction-driver/.*
