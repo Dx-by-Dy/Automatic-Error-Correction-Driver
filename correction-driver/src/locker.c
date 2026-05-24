@@ -30,7 +30,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 
 retry:
 
-    // Пытаемся получить существующий лок
+    // Пытаемся получить существующий лок под rcu
     rcu_read_lock();
     old = xa_load(&locker->table, index);
     if (old)
@@ -44,7 +44,7 @@ retry:
     rcu_read_unlock();
 
     // Создаем новый лок
-    lock = kzalloc(sizeof(*lock), GFP_KERNEL);
+    lock = kzalloc(sizeof(*lock), GFP_NOIO);
     if (!lock)
         return NULL;
     init_rwsem(&lock->sem);
@@ -55,7 +55,7 @@ retry:
                      index,
                      NULL,
                      lock,
-                     GFP_KERNEL);
+                     GFP_NOIO);
 
     // Если ошибка, то выходим
     // TODO: Возможно стоит делать retry?
@@ -89,11 +89,15 @@ void locker_put_lock(struct locker *locker,
                      unsigned long index,
                      struct lock *lock)
 {
+    WARN_ON(refcount_read(&lock->refcnt) == 0);
+
     // Полученный лок все еще живой
     if (!refcount_dec_and_test(&lock->refcnt))
         return;
 
     // Удаляем лок из таблицы
+    // TODO: В таком виде нельзя использовать в softirq из-за глобального xa_lock внутри
+    // Нужно сделать work_queue для xa_erase, чтобы не блокировать softirq
     xa_erase(&locker->table, index);
 
     // Удаляем лок, когда это безопасно

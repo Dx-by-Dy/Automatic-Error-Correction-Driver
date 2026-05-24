@@ -23,3 +23,11 @@ sector_t start_data_sector(sector_t sector)
 {
     return sector - (sector % CHUNK_SIZE_SECTORS);
 }
+
+/// @brief Рассчитывает новую длину устройства
+/// @param sector количество секторов на устройстве
+/// @return новая длина устройства
+sector_t device_new_capacity(sector_t sector)
+{
+    return sector / CHUNK_SIZE_SECTORS * DATA_SIZE_SECTORS;
+}

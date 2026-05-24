@@ -10,7 +10,7 @@ static void submit_orig_bio_parts(struct write_request *req);
 
 struct write_request *write_request_init(struct bio *orig_bio, struct dm_context *ctx)
 {
-    struct write_request *req = kmalloc(sizeof(struct write_request), GFP_KERNEL);
+    struct write_request *req = kmalloc(sizeof(struct write_request), GFP_NOIO);
     if (!req)
         return NULL;
 
@@ -21,7 +21,7 @@ struct write_request *write_request_init(struct bio *orig_bio, struct dm_context
     req->num_parts = 0;
     atomic_set(&req->pending, 0);
 
-    pr_info("write_request_init");
+    // pr_info("write_request_init");
 
     return req;
 }
@@ -32,7 +32,6 @@ static void write_handler(struct work_struct *work)
     int ret;
 
     ret = create_orig_bio_parts(req);
-    // pr_info("create_orig_bio_parts");
     if (ret)
     {
         pr_err("Failed to create orig bio parts\n");
@@ -81,10 +80,6 @@ static int create_orig_bio_parts(struct write_request *req)
             if (!orig_bio_part)
                 goto error;
             req->orig_bio_parts[req->num_parts++] = orig_bio_part;
-
-            pr_info("orig_bio_parts before:");
-            print_bio(orig_bio_part);
-
             return 0;
         }
 
@@ -111,7 +106,7 @@ static int init_orig_bio_parts(struct write_request *req)
     for (i = 0; i < req->num_parts; i++)
     {
         struct bio *part = req->orig_bio_parts[i];
-        struct write_bio_part_private *priv = kzalloc(sizeof(struct write_bio_part_private), GFP_KERNEL);
+        struct write_bio_part_private *priv = kzalloc(sizeof(struct write_bio_part_private), GFP_NOIO);
         if (!priv)
         {
             bio_put(part);
@@ -134,9 +129,6 @@ static int init_orig_bio_parts(struct write_request *req)
         bio_set_dev(part, req->dm_ctx->dev->bdev);
         part->bi_end_io = write_orig_bio_part_end_io;
         atomic_inc(&req->pending);
-
-        pr_info("orig_bio_parts after:");
-        print_bio(part);
     }
 
     return 0;

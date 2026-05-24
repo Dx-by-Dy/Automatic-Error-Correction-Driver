@@ -9,7 +9,7 @@ static void submit_orig_bio_parts(struct read_request *req);
 
 struct read_request *read_request_init(struct bio *orig_bio, struct dm_context *ctx)
 {
-    struct read_request *req = kmalloc(sizeof(struct read_request), GFP_KERNEL);
+    struct read_request *req = kmalloc(sizeof(struct read_request), GFP_NOIO);
     if (!req)
         return NULL;
 
@@ -20,7 +20,7 @@ struct read_request *read_request_init(struct bio *orig_bio, struct dm_context *
     req->num_parts = 0;
     atomic_set(&req->pending, 0);
 
-    pr_info("read_request_init");
+    // pr_info("read_request_init");
 
     return req;
 }
@@ -82,8 +82,8 @@ static int create_orig_bio_parts(struct read_request *req)
                 goto error;
             req->orig_bio_parts[req->num_parts++] = orig_bio_part;
 
-            pr_info("orig_bio_parts before:");
-            print_bio(orig_bio_part);
+            // pr_info("orig_bio_parts before:");
+            // print_bio(orig_bio_part);
 
             return 0;
         }
@@ -111,7 +111,7 @@ static int init_orig_bio_parts(struct read_request *req)
     for (i = 0; i < req->num_parts; i++)
     {
         struct bio *part = req->orig_bio_parts[i];
-        struct read_bio_part_private *priv = kzalloc(sizeof(struct read_bio_part_private), GFP_KERNEL);
+        struct read_bio_part_private *priv = kzalloc(sizeof(struct read_bio_part_private), GFP_NOIO);
         if (!priv)
         {
             bio_put(part);
@@ -135,8 +135,8 @@ static int init_orig_bio_parts(struct read_request *req)
         part->bi_end_io = read_orig_bio_part_end_io;
         atomic_inc(&req->pending);
 
-        pr_info("orig_bio_parts after:");
-        print_bio(part);
+        // pr_info("orig_bio_parts after:");
+        // print_bio(part);
     }
 
     return 0;

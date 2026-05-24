@@ -67,57 +67,71 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     dm_ctx->locker = kzalloc(sizeof(*dm_ctx->locker), GFP_KERNEL);
     if (!dm_ctx->locker)
     {
-        kfree(dm_ctx);
-        return -ENOMEM;
+        ti->error = "locker_alloc failed";
+        r = -ENOMEM;
+        goto error_locker_alloc;
     }
+
     locker_init(dm_ctx->locker);
 
     dm_ctx->write_wq = alloc_workqueue("write_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1024);
     if (!dm_ctx->write_wq)
     {
-        locker_exit(dm_ctx->locker);
-        kfree(dm_ctx->locker);
-        kfree(dm_ctx);
-        return -ENOMEM;
+        ti->error = "alloc_workqueue failed";
+        r = -ENOMEM;
+        goto error_alloc_workqueue;
     }
 
     dm_ctx->write_rq_bs = kzalloc(sizeof(struct bio_set), GFP_KERNEL);
     if (!dm_ctx->write_rq_bs)
     {
-        destroy_workqueue(dm_ctx->write_wq);
-        locker_exit(dm_ctx->locker);
-        kfree(dm_ctx->locker);
-        kfree(dm_ctx);
-        return -ENOMEM;
+        ti->error = "alloc_bioset failed";
+        r = -ENOMEM;
+        goto error_alloc_bioset;
     }
 
     r = bioset_init(dm_ctx->write_rq_bs, 128, 0, BIOSET_NEED_BVECS | BIOSET_NEED_RESCUER);
     if (r)
     {
-        destroy_workqueue(dm_ctx->write_wq);
-        locker_exit(dm_ctx->locker);
-        kfree(dm_ctx->locker);
-        kfree(dm_ctx);
-        return r;
+        ti->error = "bioset_init failed";
+        goto error_bioset_init;
     }
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)
     {
         ti->error = "dm_get_device failed";
-        bioset_exit(dm_ctx->write_rq_bs);
-        kfree(dm_ctx->write_rq_bs);
-        destroy_workqueue(dm_ctx->write_wq);
-        locker_exit(dm_ctx->locker);
-        kfree(dm_ctx->locker);
-        kfree(dm_ctx);
-        return r;
+        goto error_dm_get_device;
     }
+
     ti->private = dm_ctx;
+    ti->len = device_new_capacity(get_capacity(dm_ctx->dev->bdev->bd_disk));
+
+    r = dm_set_target_max_io_len(ti, 8);
+    if (r)
+    {
+        ti->error = "dm_set_target_max_io_len failed";
+        goto error_set_target_max_io_len;
+    }
 
     pr_info(DM_MSG_PREFIX ": loaded dev=%s", argv[0]);
 
     return 0;
+
+error_set_target_max_io_len:
+    dm_put_device(ti, dm_ctx->dev);
+error_dm_get_device:
+    bioset_exit(dm_ctx->write_rq_bs);
+error_bioset_init:
+    kfree(dm_ctx->write_rq_bs);
+error_alloc_bioset:
+    destroy_workqueue(dm_ctx->write_wq);
+error_alloc_workqueue:
+    locker_exit(dm_ctx->locker);
+    kfree(dm_ctx->locker);
+error_locker_alloc:
+    kfree(dm_ctx);
+    return r;
 }
 
 static void dm_dtr(struct dm_target *ti)
