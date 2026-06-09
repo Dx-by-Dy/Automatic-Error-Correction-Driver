@@ -16,8 +16,14 @@ struct locker
 /// @brief Структура локальной блокировки
 struct lock
 {
+    /// @brief rw_semaphore для блокировки
     struct rw_semaphore sem;
+
+    /// @brief refcount для удаления лока
+    /// @details Определяет живость лока, если refcnt == 0, то лок не живой и будет удален
     refcount_t refcnt;
+
+    /// @brief Поле для системы rcu
     struct rcu_head rcu;
 };
 

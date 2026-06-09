@@ -1,17 +1,3 @@
-#include <linux/module.h>
-#include <linux/device-mapper.h>
-#include <linux/bio.h>
-#include <linux/blkdev.h>
-#include <linux/slab.h>
-#include <linux/err.h>
-#include <linux/types.h>
-#include <linux/bvec.h>
-#include <linux/crc64.h>
-#include <linux/workqueue.h>
-
-#include "bio_helper.h"
-#include "write_worker.h"
-#include "read_worker.h"
 #include "correction-driver.h"
 
 MODULE_LICENSE("GPL");
@@ -20,33 +6,33 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
-
+    struct transformation_request *req;
     struct dm_context *dm_ctx = ti->private;
 
     switch (bio_op(bio))
     {
     case REQ_OP_READ:
-        struct read_request *read_req =
-            read_request_init(bio, dm_ctx);
+        req = transformation_create(bio, dm_ctx, TRANSFORM_READ);
 
-        if (!read_req)
+        if (req)
         {
-            pr_err("Failed to initialize read request\n");
-            return DM_MAPIO_KILL;
+            transformation_submit(req);
+            return DM_MAPIO_SUBMITTED;
         }
 
-        // TODO: сделать read_wq
-        queue_work(dm_ctx->write_wq, &read_req->work);
+        pr_err("Failed to initialize read request\n");
         return DM_MAPIO_SUBMITTED;
 
     case REQ_OP_WRITE:
-        struct write_request *write_req = write_request_init(bio, dm_ctx);
-        if (!write_req)
+        req = transformation_create(bio, dm_ctx, TRANSFORM_WRITE);
+
+        if (req)
         {
-            pr_err("Failed to initialize write request\n");
-            return DM_MAPIO_KILL;
+            transformation_submit(req);
+            return DM_MAPIO_SUBMITTED;
         }
-        queue_work(dm_ctx->write_wq, &write_req->work);
+
+        pr_err("Failed to initialize read request\n");
         return DM_MAPIO_SUBMITTED;
 
     default:
@@ -74,23 +60,23 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
     locker_init(dm_ctx->locker);
 
-    dm_ctx->write_wq = alloc_workqueue("write_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1024);
-    if (!dm_ctx->write_wq)
+    dm_ctx->transform_wq = alloc_workqueue("transformation_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1024);
+    if (!dm_ctx->transform_wq)
     {
         ti->error = "alloc_workqueue failed";
         r = -ENOMEM;
         goto error_alloc_workqueue;
     }
 
-    dm_ctx->write_rq_bs = kzalloc(sizeof(struct bio_set), GFP_KERNEL);
-    if (!dm_ctx->write_rq_bs)
+    dm_ctx->transform_bs = kzalloc(sizeof(struct bio_set), GFP_KERNEL);
+    if (!dm_ctx->transform_bs)
     {
         ti->error = "alloc_bioset failed";
         r = -ENOMEM;
         goto error_alloc_bioset;
     }
 
-    r = bioset_init(dm_ctx->write_rq_bs, 128, 0, BIOSET_NEED_BVECS | BIOSET_NEED_RESCUER);
+    r = bioset_init(dm_ctx->transform_bs, 128, 0, BIOSET_NEED_BVECS | BIOSET_NEED_RESCUER);
     if (r)
     {
         ti->error = "bioset_init failed";
@@ -121,11 +107,11 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 error_set_target_max_io_len:
     dm_put_device(ti, dm_ctx->dev);
 error_dm_get_device:
-    bioset_exit(dm_ctx->write_rq_bs);
+    bioset_exit(dm_ctx->transform_bs);
 error_bioset_init:
-    kfree(dm_ctx->write_rq_bs);
+    kfree(dm_ctx->transform_bs);
 error_alloc_bioset:
-    destroy_workqueue(dm_ctx->write_wq);
+    destroy_workqueue(dm_ctx->transform_wq);
 error_alloc_workqueue:
     locker_exit(dm_ctx->locker);
     kfree(dm_ctx->locker);
@@ -140,13 +126,13 @@ static void dm_dtr(struct dm_target *ti)
     if (!dm_ctx)
         return;
 
-    flush_workqueue(dm_ctx->write_wq);
-    destroy_workqueue(dm_ctx->write_wq);
+    flush_workqueue(dm_ctx->transform_wq);
+    destroy_workqueue(dm_ctx->transform_wq);
     locker_exit(dm_ctx->locker);
     kfree(dm_ctx->locker);
     dm_put_device(ti, dm_ctx->dev);
-    bioset_exit(dm_ctx->write_rq_bs);
-    kfree(dm_ctx->write_rq_bs);
+    bioset_exit(dm_ctx->transform_bs);
+    kfree(dm_ctx->transform_bs);
     kfree(dm_ctx);
 }
 

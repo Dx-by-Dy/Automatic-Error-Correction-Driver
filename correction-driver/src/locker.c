@@ -51,14 +51,15 @@ retry:
     refcount_set(&lock->refcnt, 1);
 
     // Пробуем атомарную вставку если нет лока
-    old = xa_cmpxchg(&locker->table,
-                     index,
-                     NULL,
-                     lock,
-                     GFP_NOIO);
+    xa_lock_bh(&locker->table);
+    old = __xa_cmpxchg(&locker->table,
+                       index,
+                       NULL,
+                       lock,
+                       GFP_NOIO);
+    xa_unlock_bh(&locker->table);
 
-    // Если ошибка, то выходим
-    // TODO: Возможно стоит делать retry?
+    // Если ошибка, то возвращаем NULL
     if (xa_is_err(old))
     {
         kfree(lock);
@@ -96,8 +97,6 @@ void locker_put_lock(struct locker *locker,
         return;
 
     // Удаляем лок из таблицы
-    // TODO: В таком виде нельзя использовать в softirq из-за глобального xa_lock внутри
-    // Нужно сделать work_queue для xa_erase, чтобы не блокировать softirq
     xa_erase(&locker->table, index);
 
     // Удаляем лок, когда это безопасно
