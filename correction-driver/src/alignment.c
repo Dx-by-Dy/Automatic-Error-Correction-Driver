@@ -16,12 +16,22 @@ sector_t misalign_data_sector(sector_t sector)
     return DATA_SIZE_SECTORS - (sector % DATA_SIZE_SECTORS);
 }
 
-/// @brief Рассчитывает номер начала данных в чанке для выровненного сектора
-/// @param sector номер выровненного сектора
+/// @brief Рассчитывает номер начала данных в чанке для невыровненного сектора
+/// @param sector номер невыровненного сектора
 /// @return номер начала данных в чанке
 sector_t start_data_sector(sector_t sector)
 {
-    return sector - (sector % CHUNK_SIZE_SECTORS);
+    sector_t align_sector = align_data_sector(sector);
+    return align_sector - (align_sector % CHUNK_SIZE_SECTORS);
+}
+
+/// @brief Рассчитывает номер начала метаданных в чанке для невыровненного сектора
+/// @param sector номер невыровненного сектора
+/// @return номер начала метаданных в чанке
+sector_t start_metadata_sector(sector_t sector)
+{
+    sector_t align_sector = align_data_sector(sector);
+    return align_sector - (align_sector % CHUNK_SIZE_SECTORS) + DATA_SIZE_SECTORS;
 }
 
 /// @brief Рассчитывает новую длину устройства

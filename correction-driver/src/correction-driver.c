@@ -12,11 +12,11 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
     switch (bio_op(bio))
     {
     case REQ_OP_READ:
-        req = transformation_create(bio, dm_ctx, TRANSFORM_READ);
+        req = transformation_request_init(bio, dm_ctx, TRANSFORM_READ);
 
         if (req)
         {
-            transformation_submit(req);
+            transformation_request_submit(req);
             return DM_MAPIO_SUBMITTED;
         }
 
@@ -24,11 +24,11 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         return DM_MAPIO_SUBMITTED;
 
     case REQ_OP_WRITE:
-        req = transformation_create(bio, dm_ctx, TRANSFORM_WRITE);
+        req = transformation_request_init(bio, dm_ctx, TRANSFORM_WRITE);
 
         if (req)
         {
-            transformation_submit(req);
+            transformation_request_submit(req);
             return DM_MAPIO_SUBMITTED;
         }
 

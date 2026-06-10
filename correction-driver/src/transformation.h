@@ -10,11 +10,8 @@
 #include "locker.h"
 #include "alignment.h"
 
-enum transformation_type
-{
-    TRANSFORM_READ,
-    TRANSFORM_WRITE,
-};
+struct transformation_part;
+enum transformation_type;
 
 struct transformation_request
 {
@@ -29,26 +26,12 @@ struct transformation_request
     struct list_head parts;
 };
 
-struct transformation_part
-{
-    struct work_struct work;
-    struct list_head list;
-
-    struct transformation_request *req;
-
-    struct bio *bio;
-
-    unsigned long index;
-    struct lock *lock;
-
-    enum transformation_type type;
-};
-
 struct transformation_request *
-transformation_create(struct bio *orig_bio,
-                      struct dm_context *ctx,
-                      enum transformation_type type);
-void transformation_submit(struct transformation_request *req);
+transformation_request_init(struct bio *bio,
+                            struct dm_context *ctx,
+                            enum transformation_type type);
+void complete_request(struct transformation_request *req);
+void transformation_request_submit(struct transformation_request *req);
 void transformation_end_io(struct bio *bio);
 
 #endif

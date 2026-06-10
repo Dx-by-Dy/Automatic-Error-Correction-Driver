@@ -13,7 +13,7 @@ void locker_exit(struct locker *locker)
     xa_for_each(&locker->table, index, lock)
     {
         xa_erase(&locker->table, index);
-        kfree(lock);
+        kfree_rcu(lock, rcu);
     }
 
     xa_destroy(&locker->table);
@@ -74,8 +74,13 @@ retry:
     kfree(lock);
 
     // На нашем месте существует живой лок
+    rcu_read_lock();
     if (refcount_inc_not_zero(&old->refcnt))
+    {
+        rcu_read_unlock();
         return old;
+    }
+    rcu_read_unlock();
 
     // На нашем месте есть не живой лок, который сейчас удаляется,
     // поэтому пробуем еще раз

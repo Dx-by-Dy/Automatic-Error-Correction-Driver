@@ -1,4 +1,5 @@
 #include "bio_helper.h"
+#include "correction-driver.h"
 
 /// @brief Функция вывода структуры bio
 /// @param bio Структура bio
@@ -27,4 +28,29 @@ void print_bio(struct bio *bio)
                     bvec.bv_len);
         }
     }
+}
+
+int metadata_bio_init(struct bio **bio,
+                      struct page *page,
+                      unsigned int offset,
+                      struct dm_context *dm_ctx,
+                      void *private_data,
+                      sector_t sector,
+                      blk_opf_t opf)
+{
+    *bio = bio_alloc_bioset(dm_ctx->dev->bdev, 1, opf, GFP_NOIO, dm_ctx->transform_bs);
+    if (!(*bio))
+        return -ENOMEM;
+
+    (*bio)->bi_iter.bi_sector = sector;
+    (*bio)->bi_private = private_data;
+
+    if (bio_add_page(*bio, page, SECTOR_SIZE, offset) != SECTOR_SIZE)
+    {
+        bio_put(*bio);
+        *bio = NULL;
+        return -ENOMEM;
+    }
+
+    return 0;
 }
