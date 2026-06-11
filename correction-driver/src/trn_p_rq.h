@@ -1,5 +1,5 @@
-#ifndef TRANSFORMATION_PART_H
-#define TRANSFORMATION_PART_H
+#ifndef TRN_P_RQ_H
+#define TRN_P_RQ_H
 
 #include <linux/bio.h>
 #include <linux/workqueue.h>
@@ -10,24 +10,24 @@
 #include "locker.h"
 #include "alignment.h"
 
-struct transformation_request;
+struct trn_rq;
 
 /// @brief Тип преобразования
-enum transformation_type
+enum trn_p_type
 {
     TRANSFORM_READ,
     TRANSFORM_WRITE,
 };
 
 /// @brief Состояние transformation_part
-enum transformation_part_state
+enum trn_p_state
 {
     INITIALIZED,
     LOCKED,
 };
 
 /// @brief Структура представления преобразования одного чанка
-struct transformation_part
+struct trn_p_rq
 {
     /// @brief Работа по отправке данных на устройство ниже
     struct work_struct submit_work;
@@ -39,8 +39,8 @@ struct transformation_part
     /// @brief Работа по обновлению метаданных и отправке на устройство ниже
     struct work_struct metadata_work;
 
-    /// @brief Ссылка на соответствующий transformation_request
-    struct transformation_request *req;
+    /// @brief Ссылка на соответствующий trn_rq
+    struct trn_rq *req;
 
     /// @brief Bio преобразования данных (без метаданных) в чанке
     struct bio *bio;
@@ -54,20 +54,20 @@ struct transformation_part
 
     /// @brief Состояние transformation_part.
     /// Используется для правильного завершения transformation_part.
-    enum transformation_part_state state;
+    enum trn_p_state state;
 
     /// @brief Тип преобразования
-    enum transformation_type type;
+    enum trn_p_type type;
 
     /// @brief Структура представления преобразования метаданных чанка
-    struct transformation_meta *meta;
+    struct trn_mw_rq *meta;
 };
 
-struct transformation_part *
-transformation_part_init(struct bio *part_bio,
-                         struct transformation_request *req,
-                         struct dm_context *dm_ctx,
-                         enum transformation_type type);
-void complete_part(struct transformation_part *part);
+struct trn_p_rq *
+trn_p_rq_init(struct bio *part_bio,
+              struct trn_rq *req,
+              struct dm_context *dm_ctx,
+              enum trn_p_type type);
+void complete_trn_p_rq(struct trn_p_rq *part);
 
 #endif

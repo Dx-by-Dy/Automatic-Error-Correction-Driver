@@ -1,7 +1,7 @@
-#include "transformation_part.h"
-#include "transformation_meta.h"
+#include "trn_p_rq.h"
+#include "trn_mw_rq.h"
 
-static void locked(struct transformation_part *part)
+static void locked(struct trn_p_rq *part)
 {
     switch (part->type)
     {
@@ -18,8 +18,8 @@ static void locked(struct transformation_part *part)
 
 static void submit_work(struct work_struct *work)
 {
-    struct transformation_part *part = container_of(work, struct transformation_part, submit_work);
-    struct transformation_request *req = part->req;
+    struct trn_p_rq *part = container_of(work, struct trn_p_rq, submit_work);
+    struct trn_rq *req = part->req;
 
     if (atomic_read(&req->failed))
         goto fail;
@@ -28,7 +28,7 @@ static void submit_work(struct work_struct *work)
 
     if (atomic_read(&req->failed))
     {
-        complete_part(part);
+        complete_trn_p_rq(part);
         goto fail;
     }
 
@@ -48,22 +48,22 @@ static void submit_work(struct work_struct *work)
     return;
 
 fail:
-    pr_info("transformation_part_worker: error\n");
+    pr_info("trn_p_rq_worker: error\n");
 
     if (!atomic_xchg(&req->failed, 1))
         req->status = BLK_STS_IOERR;
 
     if (atomic_dec_and_test(&req->pending))
-        complete_request(req);
+        complete_trn_rq(req);
 }
 
-struct transformation_part *
-transformation_part_init(struct bio *part_bio,
-                         struct transformation_request *req,
-                         struct dm_context *dm_ctx,
-                         enum transformation_type type)
+struct trn_p_rq *
+trn_p_rq_init(struct bio *part_bio,
+              struct trn_rq *req,
+              struct dm_context *dm_ctx,
+              enum trn_p_type type)
 {
-    struct transformation_part *part;
+    struct trn_p_rq *part;
 
     part = kzalloc(sizeof(*part), GFP_NOIO);
     if (!part)
@@ -86,7 +86,7 @@ transformation_part_init(struct bio *part_bio,
         break;
     }
 
-    part->meta = transformation_meta_init(part, req, dm_ctx);
+    part->meta = trn_mw_rq_init(part, req, dm_ctx);
     if (!part->meta)
     {
         switch (part->type)
@@ -102,19 +102,19 @@ transformation_part_init(struct bio *part_bio,
     part->lock = locker_get_lock(dm_ctx->locker, part->index);
     if (!part->lock)
     {
-        complete_meta(part->meta);
+        complete_trn_mw_rq(part->meta);
         kfree(part);
         return NULL;
     }
 
     INIT_WORK(&part->submit_work, submit_work);
-    INIT_WORK(&part->metadata_work, metadata_work);
+    INIT_WORK(&part->metadata_work, trn_mw_rq_work);
     part->state = INITIALIZED;
 
     return part;
 }
 
-void complete_part(struct transformation_part *part)
+void complete_trn_p_rq(struct trn_p_rq *part)
 {
     if (part->state == LOCKED)
     {
@@ -131,6 +131,6 @@ void complete_part(struct transformation_part *part)
 
     locker_put_lock(part->req->dm_ctx->locker, part->index, part->lock);
     bio_put(part->bio);
-    complete_meta(part->meta);
+    complete_trn_mw_rq(part->meta);
     kfree(part);
 }

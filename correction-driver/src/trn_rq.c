@@ -1,6 +1,6 @@
-#include "transformation.h"
+#include "trn_rq.h"
 
-void complete_request(struct transformation_request *req)
+void complete_trn_rq(struct trn_rq *req)
 {
     req->orig_bio->bi_status = req->status;
     bio_endio(req->orig_bio);
@@ -8,12 +8,12 @@ void complete_request(struct transformation_request *req)
     kfree(req);
 }
 
-struct transformation_request *
-transformation_request_init(struct bio *orig_bio,
+struct trn_rq *
+trn_rq_init(struct bio *orig_bio,
                             struct dm_context *dm_ctx,
-                            enum transformation_type type)
+                            enum trn_p_type type)
 {
-    struct transformation_request *req;
+    struct trn_rq *req;
 
     req = kzalloc(sizeof(*req), GFP_KERNEL);
     if (!req)
@@ -48,7 +48,7 @@ transformation_request_init(struct bio *orig_bio,
         if (IS_ERR_OR_NULL(part_bio))
             goto error;
 
-        struct transformation_part *part = transformation_part_init(part_bio, req, dm_ctx, type);
+        struct trn_p_rq *part = trn_p_rq_init(part_bio, req, dm_ctx, type);
         if (!part)
             goto error;
 
@@ -77,25 +77,25 @@ transformation_request_init(struct bio *orig_bio,
 error:
     pr_info("transformation_create: error\n");
 
-    struct transformation_part *p;
-    struct transformation_part *tmp;
+    struct trn_p_rq *p;
+    struct trn_p_rq *tmp;
 
     list_for_each_entry_safe(p, tmp, &req->parts, list)
     {
         list_del(&p->list);
-        complete_part(p);
+        complete_trn_p_rq(p);
     }
 
     req->status = BLK_STS_IOERR;
-    complete_request(req);
+    complete_trn_rq(req);
 
     return NULL;
 }
 
-void transformation_request_submit(struct transformation_request *req)
+void trn_rq_submit(struct trn_rq *req)
 {
-    struct transformation_part *part;
-    struct transformation_part *tmp;
+    struct trn_p_rq *part;
+    struct trn_p_rq*tmp;
 
     list_for_each_entry_safe(part, tmp, &req->parts, list)
     {
@@ -106,8 +106,8 @@ void transformation_request_submit(struct transformation_request *req)
 
 void transformation_end_io(struct bio *bio)
 {
-    struct transformation_part *part = bio->bi_private;
-    struct transformation_request *req = part->req;
+    struct trn_p_rq *part = bio->bi_private;
+    struct trn_rq *req = part->req;
 
     if (bio->bi_status != BLK_STS_OK)
     {
@@ -116,8 +116,8 @@ void transformation_end_io(struct bio *bio)
     }
 
     if (atomic_dec_and_test(&part->pending))
-        complete_part(part);
+        complete_trn_p_rq(part);
 
     if (atomic_dec_and_test(&req->pending))
-        complete_request(req);
+        complete_trn_rq(req);
 }

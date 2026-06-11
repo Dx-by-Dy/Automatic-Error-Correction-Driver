@@ -1,6 +1,6 @@
 obj-m := correction_driver.o
 
-correction_driver-objs := src/correction-driver.o src/bio_helper.o src/transformation.o src/locker.o src/alignment.o src/transformation_part.o src/transformation_meta.o
+correction_driver-objs := src/correction-driver.o src/bio_helper.o src/trn_rq.o src/locker.o src/alignment.o src/trn_p_rq.o src/trn_mw_rq.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

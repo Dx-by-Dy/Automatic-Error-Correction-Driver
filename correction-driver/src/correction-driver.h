@@ -14,8 +14,8 @@
 
 #include "locker.h"
 #include "bio_helper.h"
-#include "transformation.h"
-#include "transformation_part.h"
+#include "trn_rq.h"
+#include "trn_p_rq.h"
 
 #define DM_MSG_PREFIX "correction_dm"
 

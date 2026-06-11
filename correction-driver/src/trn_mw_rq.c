@@ -1,8 +1,8 @@
-#include "transformation_meta.h"
-#include "transformation_part.h"
-#include "transformation.h"
+#include "trn_mw_rq.h"
+#include "trn_p_rq.h"
+#include "trn_rq.h"
 
-static void bio_crc_calc(struct transformation_meta *meta, struct bio *bio)
+static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 {
     struct chunk_metadata *md = page_address(meta->page);
     unsigned int sector_idx = meta->first_sector;
@@ -36,9 +36,9 @@ static void bio_crc_calc(struct transformation_meta *meta, struct bio *bio)
     }
 }
 
-struct transformation_meta *
-transformation_meta_init(struct transformation_part *part,
-                         struct transformation_request *req,
+struct trn_mw_rq *
+trn_mw_rq_init(struct trn_p_rq *part,
+                         struct trn_rq *req,
                          struct dm_context *dm_ctx)
 {
     switch (part->type)
@@ -49,7 +49,7 @@ transformation_meta_init(struct transformation_part *part,
     case TRANSFORM_WRITE:
         int r;
 
-        struct transformation_meta *meta;
+        struct trn_mw_rq *meta;
         meta = kzalloc(sizeof(*part->meta), GFP_NOIO);
         if (!meta)
         {
@@ -84,7 +84,7 @@ transformation_meta_init(struct transformation_part *part,
                 kfree(meta);
                 return NULL;
             }
-            meta->read_bio->bi_end_io = transformation_meta_read_end_io;
+            meta->read_bio->bi_end_io = trn_mw_rq_read_end_io;
         }
 
         r = metadata_bio_init(&meta->write_bio,
@@ -113,7 +113,7 @@ transformation_meta_init(struct transformation_part *part,
     return NULL;
 }
 
-void complete_meta(struct transformation_meta *meta)
+void complete_trn_mw_rq(struct trn_mw_rq *meta)
 {
     if (!meta)
         return;
@@ -125,10 +125,10 @@ void complete_meta(struct transformation_meta *meta)
     kfree(meta);
 }
 
-void transformation_meta_read_end_io(struct bio *bio)
+void trn_mw_rq_read_end_io(struct bio *bio)
 {
-    struct transformation_part *part = bio->bi_private;
-    struct transformation_request *req = part->req;
+    struct trn_p_rq *part = bio->bi_private;
+    struct trn_rq *req = part->req;
 
     if (bio->bi_status != BLK_STS_OK)
     {
@@ -136,10 +136,10 @@ void transformation_meta_read_end_io(struct bio *bio)
             req->status = bio->bi_status;
 
         if (atomic_dec_and_test(&part->pending))
-            complete_part(part);
+            complete_trn_p_rq(part);
 
         if (atomic_dec_and_test(&req->pending))
-            complete_request(req);
+            complete_trn_rq(req);
 
         return;
     }
@@ -147,10 +147,10 @@ void transformation_meta_read_end_io(struct bio *bio)
     queue_work(req->dm_ctx->transform_wq, &part->metadata_work);
 }
 
-void metadata_work(struct work_struct *work)
+void trn_mw_rq_work(struct work_struct *work)
 {
-    struct transformation_part *part = container_of(work, struct transformation_part, metadata_work);
-    struct transformation_meta *meta = part->meta;
+    struct trn_p_rq *part = container_of(work, struct trn_p_rq, metadata_work);
+    struct trn_mw_rq *meta = part->meta;
 
     struct chunk_metadata *new_md = page_address(meta->page);
     struct chunk_metadata *old_md = (struct chunk_metadata *)(page_address(meta->page) + METADATA_SIZE_SECTORS * SECTOR_SIZE);
