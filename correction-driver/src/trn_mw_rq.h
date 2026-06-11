@@ -28,6 +28,9 @@ struct trn_mw_rq
     /// @brief bio для записи обновленных метаданных чанка.
     struct bio *write_bio;
 
+    /// @brief Ссылка на структуру представления преобразования чанка
+    struct trn_p_rq *part;
+
     /// @brief Индекс первого сектора чанка запроса и количество секторов в запросе
     u8 first_sector;
     u8 nr_sectors;
@@ -42,7 +45,6 @@ struct trn_mw_rq
 
 struct trn_mw_rq *
 trn_mw_rq_init(struct trn_p_rq *part,
-               struct trn_rq *req,
                struct dm_context *dm_ctx);
 void complete_trn_mw_rq(struct trn_mw_rq *meta);
 void trn_mw_rq_read_end_io(struct bio *bio);

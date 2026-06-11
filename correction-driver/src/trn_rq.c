@@ -10,8 +10,8 @@ void complete_trn_rq(struct trn_rq *req)
 
 struct trn_rq *
 trn_rq_init(struct bio *orig_bio,
-                            struct dm_context *dm_ctx,
-                            enum trn_p_type type)
+            struct dm_context *dm_ctx,
+            enum trn_p_type type)
 {
     struct trn_rq *req;
 
@@ -54,22 +54,11 @@ trn_rq_init(struct bio *orig_bio,
 
         part_bio->bi_iter.bi_sector = align_data_sector(part_bio->bi_iter.bi_sector);
         part_bio->bi_private = part;
-        part_bio->bi_end_io = transformation_end_io;
+        part_bio->bi_end_io = trn_p_rq_end_io;
         bio_set_dev(part_bio, dm_ctx->dev->bdev);
 
         list_add_tail(&part->list, &req->parts);
-
-        // прибавляем 2, так как 2 bio - один для данных и один для метаданных
-        switch (part->type)
-        {
-        case TRANSFORM_READ:
-            atomic_inc(&req->pending);
-            break;
-        case TRANSFORM_WRITE:
-            atomic_inc(&req->pending);
-            atomic_inc(&req->pending);
-            break;
-        }
+        atomic_inc(&req->pending);
     }
 
     return req;
@@ -77,17 +66,21 @@ trn_rq_init(struct bio *orig_bio,
 error:
     pr_info("transformation_create: error\n");
 
+    if (!atomic_xchg(&req->failed, 1))
+        req->status = BLK_STS_IOERR;
+
+    if (!atomic_read(&req->pending))
+    {
+        complete_trn_rq(req);
+    }
+
     struct trn_p_rq *p;
     struct trn_p_rq *tmp;
-
     list_for_each_entry_safe(p, tmp, &req->parts, list)
     {
         list_del(&p->list);
         complete_trn_p_rq(p);
     }
-
-    req->status = BLK_STS_IOERR;
-    complete_trn_rq(req);
 
     return NULL;
 }
@@ -95,29 +88,11 @@ error:
 void trn_rq_submit(struct trn_rq *req)
 {
     struct trn_p_rq *part;
-    struct trn_p_rq*tmp;
+    struct trn_p_rq *tmp;
 
     list_for_each_entry_safe(part, tmp, &req->parts, list)
     {
         list_del(&part->list);
         queue_work(req->dm_ctx->transform_wq, &part->submit_work);
     }
-}
-
-void transformation_end_io(struct bio *bio)
-{
-    struct trn_p_rq *part = bio->bi_private;
-    struct trn_rq *req = part->req;
-
-    if (bio->bi_status != BLK_STS_OK)
-    {
-        if (!atomic_xchg(&req->failed, 1))
-            req->status = bio->bi_status;
-    }
-
-    if (atomic_dec_and_test(&part->pending))
-        complete_trn_p_rq(part);
-
-    if (atomic_dec_and_test(&req->pending))
-        complete_trn_rq(req);
 }

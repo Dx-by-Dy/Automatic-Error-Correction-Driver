@@ -9,6 +9,8 @@
 #include "correction-driver.h"
 #include "locker.h"
 #include "alignment.h"
+#include "trn_mw_rq.h"
+#include "trn_mr_rq.h"
 
 struct trn_rq;
 
@@ -24,6 +26,13 @@ enum trn_p_state
 {
     INITIALIZED,
     LOCKED,
+    CHECK_CRC
+};
+
+union trn_m_rq
+{
+    struct trn_mw_rq *write;
+    struct trn_mr_rq *read;
 };
 
 /// @brief Структура представления преобразования одного чанка
@@ -60,7 +69,7 @@ struct trn_p_rq
     enum trn_p_type type;
 
     /// @brief Структура представления преобразования метаданных чанка
-    struct trn_mw_rq *meta;
+    union trn_m_rq meta;
 };
 
 struct trn_p_rq *
@@ -69,5 +78,6 @@ trn_p_rq_init(struct bio *part_bio,
               struct dm_context *dm_ctx,
               enum trn_p_type type);
 void complete_trn_p_rq(struct trn_p_rq *part);
+void trn_p_rq_end_io(struct bio *bio);
 
 #endif

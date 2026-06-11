@@ -1,5 +1,4 @@
 #include "trn_p_rq.h"
-#include "trn_mw_rq.h"
 
 static void locked(struct trn_p_rq *part)
 {
@@ -27,24 +26,23 @@ static void submit_work(struct work_struct *work)
     locked(part);
 
     if (atomic_read(&req->failed))
-    {
-        complete_trn_p_rq(part);
         goto fail;
-    }
 
     switch (part->type)
     {
     case TRANSFORM_READ:
+        submit_bio(part->meta.read->read_bio);
         break;
     case TRANSFORM_WRITE:
-        if (part->meta->chunk_full)
-            submit_bio(part->meta->write_bio);
+        if (part->meta.write->chunk_full)
+            submit_bio(part->meta.write->write_bio);
         else
-            submit_bio(part->meta->read_bio);
+            submit_bio(part->meta.write->read_bio);
         break;
     }
 
     submit_bio(part->bio);
+
     return;
 
 fail:
@@ -52,6 +50,8 @@ fail:
 
     if (!atomic_xchg(&req->failed, 1))
         req->status = BLK_STS_IOERR;
+
+    complete_trn_p_rq(part);
 
     if (atomic_dec_and_test(&req->pending))
         complete_trn_rq(req);
@@ -75,40 +75,54 @@ trn_p_rq_init(struct bio *part_bio,
     part->req = req;
     part->bio = part_bio;
     part->type = type;
+    atomic_set(&part->pending, 2);
 
     switch (part->type)
     {
     case TRANSFORM_READ:
-        atomic_set(&part->pending, 1);
-        break;
-    case TRANSFORM_WRITE:
-        atomic_set(&part->pending, 2);
-        break;
-    }
-
-    part->meta = trn_mw_rq_init(part, req, dm_ctx);
-    if (!part->meta)
-    {
-        switch (part->type)
+        part->meta.read = trn_mr_rq_init(part, dm_ctx);
+        if (!part->meta.read)
         {
-        case TRANSFORM_READ:
-            break;
-        case TRANSFORM_WRITE:
             kfree(part);
             return NULL;
         }
+        break;
+    case TRANSFORM_WRITE:
+        part->meta.write = trn_mw_rq_init(part, dm_ctx);
+        if (!part->meta.write)
+        {
+            kfree(part);
+            return NULL;
+        }
+        break;
     }
 
     part->lock = locker_get_lock(dm_ctx->locker, part->index);
     if (!part->lock)
     {
-        complete_trn_mw_rq(part->meta);
+        switch (part->type)
+        {
+        case TRANSFORM_READ:
+            complete_trn_mr_rq(part->meta.read);
+            break;
+        case TRANSFORM_WRITE:
+            complete_trn_mw_rq(part->meta.write);
+            break;
+        }
         kfree(part);
         return NULL;
     }
 
     INIT_WORK(&part->submit_work, submit_work);
-    INIT_WORK(&part->metadata_work, trn_mw_rq_work);
+    switch (part->type)
+    {
+    case TRANSFORM_READ:
+        INIT_WORK(&part->metadata_work, trn_mr_rq_work);
+        break;
+    case TRANSFORM_WRITE:
+        INIT_WORK(&part->metadata_work, trn_mw_rq_work);
+        break;
+    }
     part->state = INITIALIZED;
 
     return part;
@@ -116,6 +130,8 @@ trn_p_rq_init(struct bio *part_bio,
 
 void complete_trn_p_rq(struct trn_p_rq *part)
 {
+    struct trn_rq *req = part->req;
+
     if (part->state == LOCKED)
     {
         switch (part->type)
@@ -129,8 +145,41 @@ void complete_trn_p_rq(struct trn_p_rq *part)
         }
     }
 
-    locker_put_lock(part->req->dm_ctx->locker, part->index, part->lock);
+    switch (part->type)
+    {
+    case TRANSFORM_READ:
+        if (part->state == LOCKED)
+        {
+            part->state = CHECK_CRC;
+            queue_work(req->dm_ctx->transform_wq, &part->metadata_work);
+            return;
+        }
+        complete_trn_mr_rq(part->meta.read);
+        break;
+    case TRANSFORM_WRITE:
+        complete_trn_mw_rq(part->meta.write);
+        break;
+    }
+
+    locker_put_lock(req->dm_ctx->locker, part->index, part->lock);
     bio_put(part->bio);
-    complete_trn_mw_rq(part->meta);
     kfree(part);
+
+    if (atomic_dec_and_test(&req->pending))
+        complete_trn_rq(req);
+}
+
+void trn_p_rq_end_io(struct bio *bio)
+{
+    struct trn_p_rq *part = bio->bi_private;
+    struct trn_rq *req = part->req;
+
+    if (bio->bi_status != BLK_STS_OK)
+    {
+        if (!atomic_xchg(&req->failed, 1))
+            req->status = bio->bi_status;
+    }
+
+    if (atomic_dec_and_test(&part->pending))
+        complete_trn_p_rq(part);
 }

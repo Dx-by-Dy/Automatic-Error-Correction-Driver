@@ -42,6 +42,5 @@ trn_rq_init(struct bio *bio,
             enum trn_p_type type);
 void complete_trn_rq(struct trn_rq *req);
 void trn_rq_submit(struct trn_rq *req);
-void transformation_end_io(struct bio *bio);
 
 #endif
