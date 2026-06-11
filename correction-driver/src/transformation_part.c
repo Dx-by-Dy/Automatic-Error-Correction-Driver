@@ -16,9 +16,9 @@ static void locked(struct transformation_part *part)
     part->state = LOCKED;
 }
 
-static void transformation_part_work(struct work_struct *work)
+static void submit_work(struct work_struct *work)
 {
-    struct transformation_part *part = container_of(work, struct transformation_part, work);
+    struct transformation_part *part = container_of(work, struct transformation_part, submit_work);
     struct transformation_request *req = part->req;
 
     if (atomic_read(&req->failed))
@@ -107,7 +107,8 @@ transformation_part_init(struct bio *part_bio,
         return NULL;
     }
 
-    INIT_WORK(&part->work, transformation_part_work);
+    INIT_WORK(&part->submit_work, submit_work);
+    INIT_WORK(&part->metadata_work, metadata_work);
     part->state = INITIALIZED;
 
     return part;

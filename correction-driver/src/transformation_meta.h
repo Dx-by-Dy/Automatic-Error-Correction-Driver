@@ -36,5 +36,6 @@ transformation_meta_init(struct transformation_part *part,
                          struct dm_context *dm_ctx);
 void complete_meta(struct transformation_meta *meta);
 void transformation_meta_read_end_io(struct bio *bio);
+void metadata_work(struct work_struct *work);
 
 #endif

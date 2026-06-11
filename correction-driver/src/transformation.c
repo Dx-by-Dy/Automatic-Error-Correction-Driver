@@ -100,7 +100,7 @@ void transformation_request_submit(struct transformation_request *req)
     list_for_each_entry_safe(part, tmp, &req->parts, list)
     {
         list_del(&part->list);
-        queue_work(req->dm_ctx->transform_wq, &part->work);
+        queue_work(req->dm_ctx->transform_wq, &part->submit_work);
     }
 }
 

@@ -72,7 +72,7 @@ transformation_meta_init(struct transformation_part *part,
             meta->chunk_full = false;
             r = metadata_bio_init(&meta->read_bio,
                                   meta->page,
-                                  SECTOR_SIZE,
+                                  METADATA_SIZE_SECTORS * SECTOR_SIZE,
                                   dm_ctx,
                                   part,
                                   start_metadata_sector(part->bio->bi_iter.bi_sector),
@@ -129,7 +129,6 @@ void transformation_meta_read_end_io(struct bio *bio)
 {
     struct transformation_part *part = bio->bi_private;
     struct transformation_request *req = part->req;
-    struct transformation_meta *meta = part->meta;
 
     if (bio->bi_status != BLK_STS_OK)
     {
@@ -145,8 +144,16 @@ void transformation_meta_read_end_io(struct bio *bio)
         return;
     }
 
+    queue_work(req->dm_ctx->transform_wq, &part->metadata_work);
+}
+
+void metadata_work(struct work_struct *work)
+{
+    struct transformation_part *part = container_of(work, struct transformation_part, metadata_work);
+    struct transformation_meta *meta = part->meta;
+
     struct chunk_metadata *new_md = page_address(meta->page);
-    struct chunk_metadata *old_md = (struct chunk_metadata *)(page_address(meta->page) + SECTOR_SIZE);
+    struct chunk_metadata *old_md = (struct chunk_metadata *)(page_address(meta->page) + METADATA_SIZE_SECTORS * SECTOR_SIZE);
 
     for (int i = 0; i < DATA_SIZE_SECTORS; i++)
     {
