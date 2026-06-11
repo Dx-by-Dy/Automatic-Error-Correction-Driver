@@ -34,7 +34,7 @@ trn_rq_init(struct bio *orig_bio,
         struct bio *part_bio;
         unsigned int len;
 
-        len = min(misalign_data_sector(orig_bio->bi_iter.bi_sector), bio_sectors(orig_bio));
+        len = min(sectors_until_datachunk_end(orig_bio->bi_iter.bi_sector), bio_sectors(orig_bio));
         if (len == bio_sectors(orig_bio))
         {
             splitting = 0;

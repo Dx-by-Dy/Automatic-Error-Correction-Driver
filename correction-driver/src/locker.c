@@ -1,12 +1,27 @@
 #include "locker.h"
+#include "macros.h"
 
+/// @brief Инициализирует таблицу блокировок
+/// @details
+/// Выполняет инициализацию XArray, используемого для хранения lock-объектов.
+///
+/// @param locker Указатель на структуру таблицы блокировок
 void locker_init(struct locker *locker)
 {
+    DM_DEBUG("locker_exit: locker=%p\n", locker);
+
     xa_init(&locker->table);
 }
 
+/// @brief Освобождает все ресурсы таблицы блокировок
+/// @details
+/// Проходит по всем элементам XArray и удаляет их через kfree_rcu.
+///
+/// @param locker Указатель на таблицу блокировок
 void locker_exit(struct locker *locker)
 {
+    DM_DEBUG("locker_exit: locker=%p\n", locker);
+
     struct lock *lock;
     unsigned long index;
 
@@ -20,17 +35,21 @@ void locker_exit(struct locker *locker)
 }
 
 /// @brief Безопасное получение лока из таблицы блокировок
+/// @details
+/// Функция пытается получить существующий lock из XArray под RCU.
+/// Если lock отсутствует, создаёт новый экземпляр и пытается атомарно
+/// вставить его через xa_cmpxchg.
+///
 /// @param locker Таблица блокировок
 /// @param index Индекс лока
-/// @return Лок - если все успешно, NULL - если произошла ошибка xa_cmpxchg
+/// @return Указатель на lock при успехе, NULL при ошибке выделения памяти
 struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 {
+    DM_DEBUG("locker_get_lock: locker=%p, index=%lu\n", locker, index);
+
     struct lock *lock;
     struct lock *old;
 
-retry:
-
-    // Пытаемся получить существующий лок под rcu
     rcu_read_lock();
     old = xa_load(&locker->table, index);
     if (old)
@@ -43,51 +62,48 @@ retry:
     }
     rcu_read_unlock();
 
-    // Создаем новый лок
     lock = kzalloc(sizeof(*lock), GFP_NOIO);
     if (!lock)
+    {
+        DM_ERR("locker_get_lock: kzalloc failed\n");
         return NULL;
+    }
     init_rwsem(&lock->sem);
     refcount_set(&lock->refcnt, 1);
 
-    // Пробуем атомарную вставку если нет лока
     xa_lock_bh(&locker->table);
     old = __xa_cmpxchg(&locker->table,
                        index,
                        NULL,
                        lock,
                        GFP_NOIO);
+
+    if (!xa_is_err(old) && old)
+        refcount_inc(&old->refcnt);
     xa_unlock_bh(&locker->table);
 
-    // Если ошибка, то возвращаем NULL
     if (xa_is_err(old))
     {
+        DM_ERR("locker_get_lock: xa_cmpxchg failed\n");
         kfree(lock);
         return NULL;
     }
 
-    // Успешная вставка
-    if (!old)
-        return lock;
-
-    // Вставка не удалась, удаляем лок
-    kfree(lock);
-
-    // На нашем месте существует живой лок
-    rcu_read_lock();
-    if (refcount_inc_not_zero(&old->refcnt))
+    if (old)
     {
-        rcu_read_unlock();
+        kfree(lock);
         return old;
     }
-    rcu_read_unlock();
 
-    // На нашем месте есть не живой лок, который сейчас удаляется,
-    // поэтому пробуем еще раз
-    goto retry;
+    return lock;
 }
 
 /// @brief Безопасное освобождение лока из таблицы блокировок
+/// @details
+/// Уменьшает refcount лока. Если это последний владелец,
+/// объект удаляется из XArray и освобождается через RCU.
+///
+/// Гарантирует безопасное удаление даже при конкурентном доступе.
 /// @param locker Таблица блокировок
 /// @param index Индекс лока
 /// @param lock Лок
@@ -95,15 +111,17 @@ void locker_put_lock(struct locker *locker,
                      unsigned long index,
                      struct lock *lock)
 {
-    WARN_ON(refcount_read(&lock->refcnt) == 0);
+    DM_DEBUG("locker_put_lock: locker=%p, index=%lu, lock=%p\n", locker, index, lock);
 
-    // Полученный лок все еще живой
+    xa_lock_bh(&locker->table);
     if (!refcount_dec_and_test(&lock->refcnt))
+    {
+        xa_unlock_bh(&locker->table);
         return;
+    }
 
-    // Удаляем лок из таблицы
-    xa_erase(&locker->table, index);
+    __xa_erase(&locker->table, index);
+    xa_unlock_bh(&locker->table);
 
-    // Удаляем лок, когда это безопасно
     kfree_rcu(lock, rcu);
 }

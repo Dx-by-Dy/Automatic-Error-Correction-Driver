@@ -17,8 +17,6 @@
 #include "trn_rq.h"
 #include "trn_p_rq.h"
 
-#define DM_MSG_PREFIX "correction_dm"
-
 struct dm_context
 {
     struct dm_dev *dev;

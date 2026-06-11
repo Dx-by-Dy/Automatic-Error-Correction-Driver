@@ -1,4 +1,5 @@
 #include "correction-driver.h"
+#include "macros.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alexey Smirnov");

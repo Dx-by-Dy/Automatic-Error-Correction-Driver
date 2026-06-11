@@ -1,8 +1,13 @@
 #include "bio_helper.h"
 #include "correction-driver.h"
+#include "macros.h"
 
-/// @brief Функция вывода структуры bio
-/// @param bio Структура bio
+/// @brief Выводит содержимое структуры bio в журнал ядра
+/// @details
+/// Используется для отладки запросов блочного ввода-вывода.
+/// Выводит основные поля bio, а также информацию обо всех
+/// сегментах данных, если запрос содержит полезную нагрузку.
+/// @param bio Структура bio для вывода
 void print_bio(struct bio *bio)
 {
     pr_info("BIO %p\n", bio);
@@ -30,6 +35,24 @@ void print_bio(struct bio *bio)
     }
 }
 
+/// @brief Инициализирует bio для работы с метаданными чанка
+/// @details
+/// Создает новый bio из bioset драйвера, привязывает его к
+/// указанному сектору устройства и добавляет страницу с
+/// метаданными в качестве единственного сегмента данных.
+///
+/// Добавляет в bio единственный сегмент длиной SECTOR_SIZE,
+/// начинающийся со смещения offset внутри страницы.
+///
+/// При возникновении ошибки освобождает все выделенные ресурсы.
+/// @param bio Адрес указателя для сохранения созданного bio
+/// @param page Страница памяти, для привязки к bio
+/// @param offset Смещение внутри страницы
+/// @param dm_ctx Контекст драйвера
+/// @param private_data Пользовательские данные для bi_private
+/// @param sector Сектор метаданных для привязки к bio
+/// @param opf Тип операции и дополнительные флаги используемые для bio
+/// @return 0 при успехе, отрицательный код ошибки при неудаче
 int metadata_bio_init(struct bio **bio,
                       struct page *page,
                       unsigned int offset,
@@ -38,19 +61,31 @@ int metadata_bio_init(struct bio **bio,
                       sector_t sector,
                       blk_opf_t opf)
 {
+    DM_DEBUG("metadata_bio_init: page=%p offset=%u sector=%llu opf=0x%x\n",
+             page,
+             offset,
+             (unsigned long long)sector,
+             opf);
+
     *bio = bio_alloc_bioset(dm_ctx->dev->bdev, 1, opf, GFP_NOIO, dm_ctx->transform_bs);
-    if (!(*bio))
+    if (!*bio)
+    {
+        DM_ERR("metadata_bio_init: bio_alloc_bioset failed\n");
         return -ENOMEM;
+    }
 
     (*bio)->bi_iter.bi_sector = sector;
     (*bio)->bi_private = private_data;
 
     if (bio_add_page(*bio, page, SECTOR_SIZE, offset) != SECTOR_SIZE)
     {
+        DM_ERR("metadata_bio_init: bio_add_page failed\n");
         bio_put(*bio);
         *bio = NULL;
         return -ENOMEM;
     }
+
+    DM_DEBUG("metadata_bio_init: bio=%p\n", *bio);
 
     return 0;
 }
