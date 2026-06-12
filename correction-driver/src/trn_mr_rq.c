@@ -5,8 +5,8 @@
 
 /// @brief Инициализирует struct trn_mr_rq
 /// @details
-/// Выделяет память под trn_mr_rq, страницу для хранения метаданных
-/// и создаёт bio для чтения метаданных чанка с диска.
+/// Выделяет память под trn_mr_rq, страницу для хранения метаданных,
+/// итератор для bio чтения данных и создаёт bio чтения метаданных чанка с диска.
 ///
 /// При ошибке на любом этапе освобождает все выделенные ресурсы.
 /// @param part Родительская struct trn_p_rq преобразования чанка
@@ -32,8 +32,8 @@ trn_mr_rq_init(struct trn_p_rq *part,
     meta->nr_sectors = bio_sectors(part->bio);
     meta->part = part;
 
-    meta->page = alloc_page(GFP_NOIO);
-    if (!meta->page)
+    meta->metadata_page = alloc_page(GFP_NOIO);
+    if (!meta->metadata_page)
     {
         DM_ERR("alloc_page failed\n");
         kfree(meta);
@@ -41,7 +41,7 @@ trn_mr_rq_init(struct trn_p_rq *part,
     }
 
     r = metadata_bio_init(&meta->read_bio,
-                          meta->page,
+                          meta->metadata_page,
                           0,
                           dm_ctx,
                           part,
@@ -50,7 +50,7 @@ trn_mr_rq_init(struct trn_p_rq *part,
     if (r)
     {
         DM_ERR("metadata_bio_init for read_bio failed, err=%d\n", r);
-        __free_page(meta->page);
+        __free_page(meta->metadata_page);
         kfree(meta);
         return NULL;
     }
@@ -72,7 +72,7 @@ void complete_trn_mr_rq(struct trn_mr_rq *meta)
              meta, meta->read_bio, meta->first_sector, meta->nr_sectors);
 
     bio_put(meta->read_bio);
-    __free_page(meta->page);
+    __free_page(meta->metadata_page);
     kfree(meta);
 }
 
@@ -81,7 +81,7 @@ void complete_trn_mr_rq(struct trn_mr_rq *meta)
 /// Запускается как work в очереди transform_wq после успешного завершения
 /// bio чтения данных и метаданных чанка (оба завершились через trn_p_rq_end_io).
 ///
-/// Вычисляет CRC64 побайтово по каждому сектору данных bio,
+/// Вычисляет CRC64 по каждому сектору данных bio,
 /// сравнивая результат с соответствующей записью на диске.
 /// При несовпадении CRC устанавливает флаг ошибки в родительском struct trn_rq
 /// и выводит ошибку в журнал.
@@ -97,19 +97,19 @@ void trn_mr_rq_work(struct work_struct *work)
     DM_DEBUG("part=%p req=%p first_sector=%u nr_sectors=%u\n",
              part, req, meta->first_sector, meta->nr_sectors);
 
-    struct chunk_metadata *md = page_address(meta->page);
+    if (atomic_read(&req->failed))
+        goto request_failed;
+
+    struct chunk_metadata *md = kmap_local_page(meta->metadata_page);
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
     unsigned int in_sector_pos = 0;
+    bool crc_error = false;
+    struct bvec_iter iter = meta->saved_iter;
 
-    struct bio_vec bvec;
-    struct bvec_iter iter;
-
-    if (atomic_read(&req->failed))
-        goto out;
-
-    bio_for_each_segment(bvec, part->bio, iter)
+    while (iter.bi_size)
     {
+        struct bio_vec bvec = bio_iter_iovec(part->bio, iter);
         void *addr = kmap_local_page(bvec.bv_page);
         unsigned int bvec_pos = 0;
 
@@ -123,10 +123,17 @@ void trn_mr_rq_work(struct work_struct *work)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
+                DM_DEBUG("sector=%llu, sector_idx=%u, on_disk_crc=0x%llx computed_crc=0x%llx\n",
+                         (unsigned long long)(meta->part->index + sector_idx),
+                         sector_idx,
+                         (unsigned long long)le64_to_cpu(md->crc[sector_idx]),
+                         (unsigned long long)current_crc);
+
                 if (md->crc[sector_idx++] != cpu_to_le64(current_crc))
                 {
+                    crc_error = true;
                     kunmap_local(addr);
-                    goto error;
+                    goto out;
                 }
                 current_crc = 0;
                 in_sector_pos = 0;
@@ -134,20 +141,26 @@ void trn_mr_rq_work(struct work_struct *work)
         }
 
         kunmap_local(addr);
+        bio_advance_iter_single(part->bio, &iter, bvec.bv_len);
     }
 
-    goto out;
-
-error:
-    DM_ERR("CRC mismatch at sector %u: on_disk=0x%llx computed=0x%llx\n",
-           sector_idx - 1,
-           (unsigned long long)le64_to_cpu(md->crc[sector_idx - 1]),
-           (unsigned long long)current_crc);
-
-    if (!atomic_xchg(&req->failed, 1))
-        req->status = BLK_STS_IOERR;
-
-    // Точка входа для восстановления после CRC mismatch
 out:
+    kunmap_local((void *)md);
+    flush_dcache_page(meta->metadata_page);
+
+    if (crc_error)
+    {
+        DM_ERR("CRC mismatch at sector %u: on_disk=0x%llx computed=0x%llx\n",
+               sector_idx - 1,
+               (unsigned long long)le64_to_cpu(md->crc[sector_idx - 1]),
+               (unsigned long long)current_crc);
+
+        if (!atomic_xchg(&req->failed, 1))
+            req->status = BLK_STS_IOERR;
+
+        // Точка входа для восстановления после CRC mismatch
+    }
+
+request_failed:
     complete_trn_p_rq(part);
 }

@@ -49,7 +49,7 @@ trn_rq_init(struct bio *orig_bio,
 
     struct trn_rq *req;
 
-    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    req = kzalloc(sizeof(*req), GFP_NOIO);
     if (!req)
     {
         DM_ERR("kzalloc failed\n");

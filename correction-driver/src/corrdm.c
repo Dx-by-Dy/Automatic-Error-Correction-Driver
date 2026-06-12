@@ -33,13 +33,28 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 
     switch (bio_op(bio))
     {
+    case REQ_OP_FLUSH:
+        flush_workqueue(dm_ctx->transform_wq);
+        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+        bio_set_dev(bio, dm_ctx->dev->bdev);
+        return DM_MAPIO_REMAPPED;
+
+    case REQ_OP_DISCARD:
+        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+        bio_set_dev(bio, dm_ctx->dev->bdev);
+        return DM_MAPIO_REMAPPED;
+
     case REQ_OP_READ:
         type = TRANSFORM_READ;
         break;
+
     case REQ_OP_WRITE:
         type = TRANSFORM_WRITE;
         break;
+
     default:
+        DM_ERR("unsupported bio op=%u\n", bio_op(bio));
+        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
         bio_set_dev(bio, dm_ctx->dev->bdev);
         return DM_MAPIO_REMAPPED;
     }

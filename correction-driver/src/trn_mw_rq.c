@@ -16,7 +16,7 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->first_sector, meta->nr_sectors);
 
-    struct chunk_metadata *md = page_address(meta->page);
+    struct chunk_metadata *md = kmap_local_page(meta->page);
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
     unsigned int in_sector_pos = 0;
@@ -49,6 +49,9 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 
         kunmap_local(addr);
     }
+
+    kunmap_local((void *)md);
+    flush_dcache_page(meta->page);
 }
 
 /// @brief Инициализирует struct trn_mw_rq

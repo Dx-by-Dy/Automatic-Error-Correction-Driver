@@ -22,7 +22,7 @@ struct trn_mr_rq
     /// @brief bio для чтения метаданных чанка с диска.
     struct bio *read_bio;
 
-    /// @brief Ссылка на родительскую структуру представления преобразования чанка
+    /// @brief Ссылка на родительскую struct trn_p_rq преобразования чанка
     struct trn_p_rq *part;
 
     /// @brief Индекс первого сектора данных чанка, с которого начинается trn_p_rq.
@@ -35,7 +35,13 @@ struct trn_mr_rq
 
     /// @brief Страница памяти для хранения прочитанных метаданных чанка
     /// @details Используется как буфер для read_bio.
-    struct page *page;
+    struct page *metadata_page;
+
+    /// @brief Сохраненный iter для bio из struct trn_p_rq
+    /// @details Используется для извлечения данных из bio после его возвращения
+    /// из нижнего уровня и для дальшего анализа данных и сверки CRC из metadata_page.
+    /// Инициализируется родительской struct trn_p_rq при его инициализации.
+    struct bvec_iter saved_iter;
 };
 
 struct trn_mr_rq *

@@ -88,9 +88,10 @@ fail:
 /// Получает лок чанка через locker_get_lock по индексу начала
 /// области данных чанка.
 ///
-/// При ошибке освобождает все ресурсы.
+/// Инициализирует save_iter поля meta для TRANSFORM_READ.
 ///
 /// Счётчик pending инициализируется в 2: data bio + metadata bio.
+/// При ошибке освобождает все ресурсы.
 /// @param part_bio bio с данными чанка
 /// @param req      Родительский struct trn_rq
 /// @param dm_ctx   Контекст драйвера
@@ -129,6 +130,7 @@ trn_p_rq_init(struct bio *part_bio,
             kfree(part);
             return NULL;
         }
+        part->meta.read->saved_iter = part_bio->bi_iter;
         break;
     case TRANSFORM_WRITE:
         part->meta.write = trn_mw_rq_init(part, dm_ctx);
