@@ -6,7 +6,7 @@
 #include <linux/list.h>
 #include <linux/refcount.h>
 
-#include "correction-driver.h"
+#include "corrdm.h"
 #include "locker.h"
 #include "alignment.h"
 #include "trn_mw_rq.h"
@@ -14,61 +14,91 @@
 
 struct trn_rq;
 
-/// @brief Тип преобразования
+/// @brief Тип преобразования чанка
+/// @details Определяет направление операции ввода-вывода:
+/// чтение данных с последующей проверкой CRC или
+/// запись данных с обновлением метаданных.
 enum trn_p_type
 {
     TRANSFORM_READ,
     TRANSFORM_WRITE,
 };
 
-/// @brief Состояние transformation_part
+/// @brief Состояние жизненного цикла trn_p_rq
 enum trn_p_state
 {
+    /// @brief Структура создана, bio ещё не отправлены.
     INITIALIZED,
+
+    /// @brief Захвачен лок чанка, bio отправлены, ожидается завершение.
     LOCKED,
+
+    /// @brief (только при TRANSFORM_READ) Лок освобождён, выполняется
+    /// проверка CRC в trn_mr_rq_work.
     CHECK_CRC
 };
 
+/// @brief Объединение указателей на структуры метаданных чтения и записи
+/// @details Тип активного поля определяется полем type в trn_p_rq.
 union trn_m_rq
 {
     struct trn_mw_rq *write;
     struct trn_mr_rq *read;
 };
 
-/// @brief Структура представления преобразования одного чанка
+/// @brief Структура преобразования одного чанка
+/// @details
+/// Представляет единицу обработки одного чанка в рамках родительского
+/// trn_rq. Каждый trn_p_rq охватывает ровно один чанк данных.
+///
+/// Жизненный цикл:
+///   1. trn_p_rq_init         — выделение ресурсов, инициализация bio и метаданных
+///   2. submit_work           — захват лока чанка, отправка bio на устройство
+///   3. trn_p_rq_end_io       — обработчик завершения bio данных и метаданных
+///   4. complete_trn_p_rq     — освобождение лока, ресурсов (для TRANSFORM_READ запуск CHECK_CRC)
+///   5. metadata_work         — в очереди transform_wq проверка CRC (для TRANSFORM_READ)
+///                              или слияние CRC и отправка write_bio (для TRANSFORM_WRITE)
+///
+/// Счётчик pending отслеживает количество незавершённых bio:
+/// при инициализации устанавливается в 2 (data bio + metadata bio).
+/// Когда оба завершаются через trn_p_rq_end_io, вызывается complete_trn_p_rq.
 struct trn_p_rq
 {
-    /// @brief Работа по отправке данных на устройство ниже
+    // @brief Work для захвата лока и отправки bio на устройство ниже
     struct work_struct submit_work;
 
-    /// @brief Список всех transformation_part.
-    /// Валиден только при state == INITIALIZED
+    /// @brief Узел списка всех trn_p_rq в родительском trn_rq
+    /// @details Валиден только до вызова trn_rq_submit.
     struct list_head list;
 
-    /// @brief Работа по обновлению метаданных и отправке на устройство ниже
+    /// @brief Work для обработки метаданных после завершения bio
+    /// @details Для TRANSFORM_READ запускает проверку CRC (trn_mr_rq_work).
+    ///          Для TRANSFORM_WRITE запускает слияние CRC и отправку write_bio (trn_mw_rq_work).
     struct work_struct metadata_work;
 
-    /// @brief Ссылка на соответствующий trn_rq
+    /// @brief Указатель на родительский struct trn_rq
     struct trn_rq *req;
 
-    /// @brief Bio преобразования данных (без метаданных) в чанке
+    /// @brief bio с данными чанка (без метаданных)
     struct bio *bio;
 
-    /// @brief Индекс чанка и соответствующий lock
+    /// @brief Индекс чанка (физический сектор начала области данных чанка)
     unsigned long index;
+
+    /// @brief Блокировка чанка, захватываемая перед отправкой bio
     struct lock *lock;
 
-    /// @brief Средство синхронизации bio данных и метаданных чанка
+    /// @brief Счётчик незавершённых bio: data bio + metadata bio
+    /// @details Инициализируется в 2. При достижении 0 вызывается complete_trn_p_rq.
     atomic_t pending;
 
-    /// @brief Состояние transformation_part.
-    /// Используется для правильного завершения transformation_part.
+    /// @brief Текущее состояние жизненного цикла
     enum trn_p_state state;
 
-    /// @brief Тип преобразования
+    /// @brief Тип преобразования: чтение или запись
     enum trn_p_type type;
 
-    /// @brief Структура представления преобразования метаданных чанка
+    /// @brief Структура метаданных чанка (read или write в зависимости от type)
     union trn_m_rq meta;
 };
 

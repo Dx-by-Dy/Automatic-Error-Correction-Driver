@@ -45,7 +45,7 @@ void locker_exit(struct locker *locker)
 /// @return Указатель на lock при успехе, NULL при ошибке выделения памяти
 struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 {
-    DM_DEBUG("locker_get_lock: locker=%p, index=%lu\n", locker, index);
+    DM_DEBUG("locker=%p, index=%lu\n", locker, index);
 
     struct lock *lock;
     struct lock *old;
@@ -65,7 +65,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
     lock = kzalloc(sizeof(*lock), GFP_NOIO);
     if (!lock)
     {
-        DM_ERR("locker_get_lock: kzalloc failed\n");
+        DM_ERR("kzalloc failed\n");
         return NULL;
     }
     init_rwsem(&lock->sem);
@@ -84,7 +84,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 
     if (xa_is_err(old))
     {
-        DM_ERR("locker_get_lock: xa_cmpxchg failed\n");
+        DM_ERR("xa_cmpxchg failed\n");
         kfree(lock);
         return NULL;
     }
@@ -111,7 +111,7 @@ void locker_put_lock(struct locker *locker,
                      unsigned long index,
                      struct lock *lock)
 {
-    DM_DEBUG("locker_put_lock: locker=%p, index=%lu, lock=%p\n", locker, index, lock);
+    DM_DEBUG("locker=%p, index=%lu, lock=%p\n", locker, index, lock);
 
     xa_lock_bh(&locker->table);
     if (!refcount_dec_and_test(&lock->refcnt))

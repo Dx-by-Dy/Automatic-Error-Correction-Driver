@@ -1,5 +1,5 @@
 #include "bio_helper.h"
-#include "correction-driver.h"
+#include "corrdm.h"
 #include "macros.h"
 
 /// @brief Выводит содержимое структуры bio в журнал ядра
@@ -61,7 +61,7 @@ int metadata_bio_init(struct bio **bio,
                       sector_t sector,
                       blk_opf_t opf)
 {
-    DM_DEBUG("metadata_bio_init: page=%p offset=%u sector=%llu opf=0x%x\n",
+    DM_DEBUG("page=%p offset=%u sector=%llu opf=0x%x\n",
              page,
              offset,
              (unsigned long long)sector,
@@ -70,7 +70,7 @@ int metadata_bio_init(struct bio **bio,
     *bio = bio_alloc_bioset(dm_ctx->dev->bdev, 1, opf, GFP_NOIO, dm_ctx->transform_bs);
     if (!*bio)
     {
-        DM_ERR("metadata_bio_init: bio_alloc_bioset failed\n");
+        DM_ERR("bio_alloc_bioset failed\n");
         return -ENOMEM;
     }
 
@@ -79,13 +79,14 @@ int metadata_bio_init(struct bio **bio,
 
     if (bio_add_page(*bio, page, SECTOR_SIZE, offset) != SECTOR_SIZE)
     {
-        DM_ERR("metadata_bio_init: bio_add_page failed\n");
+        DM_ERR("bio_add_page failed\n");
+
         bio_put(*bio);
         *bio = NULL;
         return -ENOMEM;
     }
 
-    DM_DEBUG("metadata_bio_init: bio=%p\n", *bio);
+    DM_DEBUG("bio=%p\n", *bio);
 
     return 0;
 }
