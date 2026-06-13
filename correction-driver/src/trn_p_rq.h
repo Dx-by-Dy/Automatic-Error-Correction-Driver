@@ -33,9 +33,9 @@ enum trn_p_state
     /// @brief Захвачен лок чанка, bio отправлены, ожидается завершение.
     LOCKED,
 
-    /// @brief (только при TRANSFORM_READ) Лок освобождён, выполняется
-    /// проверка CRC в trn_mr_rq_work.
-    CHECK_CRC
+    /// @brief (только при TRANSFORM_WRITE) meta.write->read_bio завершился,
+    /// выполняется обновление CRC локально в meta.write->page и на диске через meta.write->write_bio.
+    CRC_UPDATE,
 };
 
 /// @brief Объединение указателей на структуры метаданных чтения и записи
@@ -54,14 +54,11 @@ union trn_m_rq
 /// Жизненный цикл:
 ///   1. trn_p_rq_init         — выделение ресурсов, инициализация bio и метаданных
 ///   2. submit_work           — захват лока чанка, отправка bio на устройство
-///   3. trn_p_rq_end_io       — обработчик завершения bio данных и метаданных
-///   4. complete_trn_p_rq     — освобождение лока, ресурсов (для TRANSFORM_READ запуск CHECK_CRC)
-///   5. metadata_work         — в очереди transform_wq проверка CRC (для TRANSFORM_READ)
-///                              или слияние CRC и отправка write_bio (для TRANSFORM_WRITE)
+///   4. complete_work         — см. details поля complete_work
 ///
 /// Счётчик pending отслеживает количество незавершённых bio:
 /// при инициализации устанавливается в 2 (data bio + metadata bio).
-/// Когда оба завершаются через trn_p_rq_end_io, вызывается complete_trn_p_rq.
+/// Когда оба завершаются через trn_p_rq_end_io, вызывается complete_work.
 struct trn_p_rq
 {
     // @brief Work для захвата лока и отправки bio на устройство ниже
@@ -71,10 +68,11 @@ struct trn_p_rq
     /// @details Валиден только до вызова trn_rq_submit.
     struct list_head list;
 
-    /// @brief Work для обработки метаданных после завершения bio
-    /// @details Для TRANSFORM_READ запускает проверку CRC (trn_mr_rq_work).
-    ///          Для TRANSFORM_WRITE запускает слияние CRC и отправку write_bio (trn_mw_rq_work).
-    struct work_struct metadata_work;
+    /// @brief Work для продвижения конечного автомата и, в конечном итоге, завершения жизенного цикла структуры
+    /// @details Для TRANSFORM_READ освобждает лок и запускает проверку CRC (check_crc) с последующим освобождением ресурсов.
+    ///          Для TRANSFORM_WRITE (read_bio) запускает обновление CRC (update_crc_local) и отправку write_bio.
+    ///          Для TRANSFORM_WRITE (write_bio) запускает освобождение лока и ресурсов.
+    struct work_struct complete_work;
 
     /// @brief Указатель на родительский struct trn_rq
     struct trn_rq *req;
@@ -89,7 +87,9 @@ struct trn_p_rq
     struct lock *lock;
 
     /// @brief Счётчик незавершённых bio: data bio + metadata bio
-    /// @details Инициализируется в 2. При достижении 0 вызывается complete_trn_p_rq.
+    /// @details Инициализируется в 2. При достижении 0 вызывается complete_work.
+    /// Может быть увеличен с 0 до 1 после успешного read_bio при TRANSFORM_WRITE
+    /// для повторного вызова complete_work после write_bio.
     atomic_t pending;
 
     /// @brief Текущее состояние жизненного цикла
@@ -107,7 +107,6 @@ trn_p_rq_init(struct bio *part_bio,
               struct trn_rq *req,
               struct dm_context *dm_ctx,
               enum trn_p_type type);
-void complete_trn_p_rq(struct trn_p_rq *part);
 void trn_p_rq_end_io(struct bio *bio);
 
 #endif

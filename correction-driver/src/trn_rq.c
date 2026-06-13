@@ -5,7 +5,11 @@
 /// @details
 /// Устанавливает итоговый статус в оригинальный bio, сигнализирует
 /// о завершении через bio_endio и освобождает захваченную ссылку
-/// через bio_put. Вызывается когда req->pending достигает 0.
+/// через bio_put.
+///
+/// Вызывается когда req->pending достигает 0.
+///
+/// Ожидаемый контекст работы - process.
 /// @param req Структура запроса
 void complete_trn_rq(struct trn_rq *req)
 {
@@ -28,10 +32,11 @@ void complete_trn_rq(struct trn_rq *req)
 ///
 /// При ошибке на любом этапе:
 ///   - устанавливает флаг failed
-///   - завершает все уже созданные части через complete_trn_p_rq
+///   - завершает все уже созданные части через complete_work
 ///   - если ни одна часть не была создана (pending == 0) —
 ///     освобождает req напрямую через complete_trn_rq
 ///
+/// Ожидаемый контекст работы - process.
 /// @param orig_bio Оригинальный bio запроса
 /// @param dm_ctx   Контекст драйвера
 /// @param type     Тип преобразования (TRANSFORM_READ или TRANSFORM_WRITE)
@@ -125,7 +130,7 @@ error:
         list_for_each_entry_safe(p, tmp, &req->parts, list)
         {
             list_del(&p->list);
-            complete_trn_p_rq(p);
+            queue_work(req->dm_ctx->transform_wq, &p->complete_work);
         }
     }
 
@@ -137,6 +142,8 @@ error:
 /// Обходит список parts, удаляет каждый элемент из списка и ставит
 /// его submit_work в очередь transform_wq. После вызова список parts
 /// становится пустым.
+///
+/// Ожидаемый контекст работы - process.
 /// @param req Структура запроса
 void trn_rq_submit(struct trn_rq *req)
 {

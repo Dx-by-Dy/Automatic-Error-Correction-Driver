@@ -9,6 +9,8 @@
 /// для каждого сектора данных. По завершении каждого сектора записывает
 /// итоговый CRC в соответствующее место meta->page, определяемый
 /// индексом meta->first_sector.
+///
+/// Ожидаемый контекст работы - process.
 /// @param meta Структура преобразования метаданных записи
 /// @param bio  bio с данными для вычисления CRC
 static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
@@ -71,6 +73,8 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 /// В обоих случаях вызывает bio_crc_calc для вычисления новых CRC
 /// по данным из part->bio.
 ///
+/// Ожидаемый контекст работы - process.
+///
 /// При ошибке на любом этапе освобождает все ранее выделенные ресурсы.
 /// @param part   Родительская struct trn_p_rq
 /// @param dm_ctx Контекст драйвера
@@ -120,7 +124,7 @@ trn_mw_rq_init(struct trn_p_rq *part,
             kfree(meta);
             return NULL;
         }
-        meta->read_bio->bi_end_io = trn_mw_rq_read_end_io;
+        meta->read_bio->bi_end_io = trn_p_rq_end_io;
 
         DM_DEBUG("meta=%p read_bio=%p\n", meta, meta->read_bio);
         DM_DEBUG_BIO(meta->read_bio);
@@ -161,6 +165,8 @@ trn_mw_rq_init(struct trn_p_rq *part,
 /// @details
 /// Освобождает read_bio (только при chunk_full == false), write_bio,
 /// страницу памяти и саму структуру.
+///
+/// Ожидаемый контекст работы - process.
 /// @param meta Структура преобразования метаданных
 void complete_trn_mw_rq(struct trn_mw_rq *meta)
 {
@@ -176,59 +182,21 @@ void complete_trn_mw_rq(struct trn_mw_rq *meta)
     kfree(meta);
 }
 
-/// @brief Обработчик завершения bio (meta->read_bio) чтения старых метаданных чанка
+/// @brief Сливает старые и новые CRC
 /// @details
-/// Вызывается из контекста softirq по завершении read_bio.
-///
-/// При успехе запускает trn_mw_rq_work через очередь transform_wq
-/// для слияния старых и новых CRC и последующей отправки write_bio.
-///
-/// При ошибке устанавливает флаг failed в родительском struct trn_rq
-/// и декрементирует pending за write_bio, который уже не будет отправлен.
-/// Если pending достигает нуля — вызывает complete_trn_p_rq.
-/// @param bio Завершённый bio чтения метаданных
-void trn_mw_rq_read_end_io(struct bio *bio)
-{
-    DM_DEBUG("bio=%p, sector=%llu\n", bio, (unsigned long long)bio->bi_iter.bi_sector);
-
-    struct trn_p_rq *part = bio->bi_private;
-    struct trn_rq *req = part->req;
-
-    if (bio->bi_status != BLK_STS_OK)
-    {
-        DM_ERR("read_bio failed, bio=%p, status=%d\n", bio, bio->bi_status);
-
-        if (!atomic_xchg(&req->failed, 1))
-            req->status = bio->bi_status;
-
-        if (atomic_dec_and_test(&part->pending))
-            complete_trn_p_rq(part);
-
-        return;
-    }
-
-    queue_work(req->dm_ctx->transform_wq, &part->metadata_work);
-}
-
-/// @brief Сливает старые и новые CRC, затем отправляет write_bio для записи на диск
-/// @details
-/// Запускается как work в очереди transform_wq после успешного чтения
-/// старых метаданных через read_bio.
+/// Запускается  после успешного чтения старых метаданных через read_bio.
 ///
 /// Копирует CRC секторов, не затронутых текущим запросом записи,
 /// из старых метаданных (вторая часть страницы) в новые
 /// (первая часть страницы). CRC затронутых секторов уже были
 /// вычислены в bio_crc_calc при инициализации.
 ///
-/// После слияния отправляет write_bio для записи обновлённых метаданных на диск.
-/// @param work Указатель на work_struct, вложенный в trn_p_rq.metadata_work
-void trn_mw_rq_work(struct work_struct *work)
+/// Ожидаемый контекст работы - process.
+/// @param meta Структура преобразования метаданных
+void update_crc_local(struct trn_mw_rq *meta)
 {
-    struct trn_p_rq *part = container_of(work, struct trn_p_rq, metadata_work);
-    struct trn_mw_rq *meta = part->meta.write;
-
-    DM_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
-             part, meta->first_sector, meta->nr_sectors);
+    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+             meta, meta->first_sector, meta->nr_sectors);
 
     struct chunk_metadata *new_md = page_address(meta->page);
     struct chunk_metadata *old_md = (struct chunk_metadata *)(page_address(meta->page) + METADATA_SIZE_SECTORS * SECTOR_SIZE);
@@ -238,6 +206,4 @@ void trn_mw_rq_work(struct work_struct *work)
         if (i < meta->first_sector || i >= meta->first_sector + meta->nr_sectors)
             new_md->crc[i] = old_md->crc[i];
     }
-
-    submit_bio(meta->write_bio);
 }

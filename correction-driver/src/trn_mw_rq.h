@@ -71,7 +71,6 @@ struct trn_mw_rq *
 trn_mw_rq_init(struct trn_p_rq *part,
                struct dm_context *dm_ctx);
 void complete_trn_mw_rq(struct trn_mw_rq *meta);
-void trn_mw_rq_read_end_io(struct bio *bio);
-void trn_mw_rq_work(struct work_struct *work);
+void update_crc_local(struct trn_mw_rq *meta);
 
 #endif

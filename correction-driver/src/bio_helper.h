@@ -4,11 +4,8 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 
-#include "locker.h"
-
 struct dm_context;
 
-void print_bio(struct bio *bio);
 int metadata_bio_init(struct bio **bio,
                       struct page *page,
                       unsigned int offset,

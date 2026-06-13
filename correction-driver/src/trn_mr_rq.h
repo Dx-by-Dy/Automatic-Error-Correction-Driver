@@ -48,6 +48,6 @@ struct trn_mr_rq *
 trn_mr_rq_init(struct trn_p_rq *part,
                struct dm_context *dm_ctx);
 void complete_trn_mr_rq(struct trn_mr_rq *meta);
-void trn_mr_rq_work(struct work_struct *work);
+void check_crc(struct trn_mr_rq *meta);
 
 #endif

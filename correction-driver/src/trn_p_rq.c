@@ -6,6 +6,8 @@
 /// Для TRANSFORM_READ захватывает разделяемую блокировку (down_read),
 /// для TRANSFORM_WRITE — эксклюзивную (down_write).
 /// После захвата устанавливает состояние part->state = LOCKED.
+///
+/// Ожидаемый контекст работы - process.
 /// @param part Структура преобразования чанка
 static void lock(struct trn_p_rq *part)
 {
@@ -24,11 +26,38 @@ static void lock(struct trn_p_rq *part)
     part->state = LOCKED;
 }
 
+/// @brief Отпускает лок чанка в зависимости от типа преобразования и состояния
+/// @details
+/// Отпускает блокировку только если состояние part->state == LOCKED или part->state == CRC_UPDATE.
+///
+/// Для TRANSFORM_READ отпускает разделяемую блокировку (up_read),
+/// для TRANSFORM_WRITE — эксклюзивную (up_write).
+///
+/// Ожидаемый контекст работы - process.
+/// @param part Структура преобразования чанка
+static void unlock(struct trn_p_rq *part)
+{
+    DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
+
+    if (part->state == LOCKED || part->state == CRC_UPDATE)
+    {
+        switch (part->type)
+        {
+        case TRANSFORM_READ:
+            up_read(&part->lock->sem);
+            break;
+        case TRANSFORM_WRITE:
+            up_write(&part->lock->sem);
+            break;
+        }
+    }
+}
+
 /// @brief Work-обработчик: захватывает лок чанка и отправляет bio на устройство
 /// @details
 /// Запускается из очереди transform_wq для каждого trn_p_rq.
 ///
-/// Перед захватом лока и после него проверяет флаг failed родительского
+/// Перед захватом лока проверяет флаг failed родительского
 /// trn_rq — если другой чанк уже завершился с ошибкой, немедленно
 /// переходит к завершению без отправки bio.
 ///
@@ -36,8 +65,8 @@ static void lock(struct trn_p_rq *part)
 ///   - TRANSFORM_READ:  read_bio метаданных
 ///   - TRANSFORM_WRITE: write_bio (chunk_full) или read_bio (частичная запись)
 ///
-/// При ошибке вызывает complete_trn_p_rq.
-/// @param work Указатель на work_struct, вложенный в trn_p_rq.submit_work
+/// Ожидаемый контекст работы - process.
+/// @param work Указатель на work_struct, вложенный в part->submit_work
 static void submit_work(struct work_struct *work)
 {
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, submit_work);
@@ -49,9 +78,6 @@ static void submit_work(struct work_struct *work)
         goto fail;
 
     lock(part);
-
-    if (atomic_read(&req->failed))
-        goto fail;
 
     switch (part->type)
     {
@@ -76,7 +102,66 @@ fail:
     if (!atomic_xchg(&req->failed, 1))
         req->status = BLK_STS_IOERR;
 
-    complete_trn_p_rq(part);
+    queue_work(req->dm_ctx->transform_wq, &part->complete_work);
+}
+
+/// @brief Функция продвижения конечного автомата и завершения жизенного цикла структуры
+/// @details
+/// Вызывается когда part->pending достигает 0.
+///
+/// Логика завершения зависит от типа:
+///
+/// TRANSFORM_READ:
+///   Снимает read-лок и при успешном чтении запускает check_crc
+///   с последующим освобождением ресурсов.
+///
+/// TRANSFORM_WRITE:
+///   Если chunk_full == false — обновляет CRC локально и
+///   отправляет write_bio для обновления CRC на диск.
+///   Переводит state в CRC_UPDATE.
+///
+///   Если chunk_full == true — снимает write-лок и освобождает
+///   метаданные, bio, структуру и декрементирует req->pending.
+///
+/// Если req->pending достигает 0 — вызывает complete_trn_rq.
+///
+/// Ожидаемый контекст работы - process.
+/// @param work Указатель на work_struct, вложенный в part->complete_work
+static void complete_work(struct work_struct *work)
+{
+    struct trn_p_rq *part = container_of(work, struct trn_p_rq, complete_work);
+    struct trn_rq *req = part->req;
+
+    DM_DEBUG("part=%p, state=%d, type=%d, index=%lu\n", part, part->state, part->type, part->index);
+
+    switch (part->type)
+    {
+    case TRANSFORM_READ:
+        unlock(part);
+        if (part->state == LOCKED && !atomic_read(&req->failed))
+            check_crc(part->meta.read);
+        complete_trn_mr_rq(part->meta.read);
+        break;
+    case TRANSFORM_WRITE:
+        if (part->state == LOCKED && !part->meta.write->chunk_full && !atomic_read(&req->failed))
+        {
+            part->state = CRC_UPDATE;
+            update_crc_local(part->meta.write);
+            atomic_inc(&part->pending);
+            submit_bio(part->meta.write->write_bio);
+            return;
+        }
+        unlock(part);
+        complete_trn_mw_rq(part->meta.write);
+        break;
+    }
+
+    locker_put_lock(req->dm_ctx->locker, part->index, part->lock);
+    bio_put(part->bio);
+    kfree(part);
+
+    if (atomic_dec_and_test(&req->pending))
+        complete_trn_rq(req);
 }
 
 /// @brief Инициализирует struct trn_p_rq
@@ -91,6 +176,9 @@ fail:
 /// Инициализирует save_iter поля meta для TRANSFORM_READ.
 ///
 /// Счётчик pending инициализируется в 2: data bio + metadata bio.
+///
+/// Ожидаемый контекст работы - process.
+///
 /// При ошибке освобождает все ресурсы.
 /// @param part_bio bio с данными чанка
 /// @param req      Родительский struct trn_rq
@@ -161,15 +249,7 @@ trn_p_rq_init(struct bio *part_bio,
     }
 
     INIT_WORK(&part->submit_work, submit_work);
-    switch (part->type)
-    {
-    case TRANSFORM_READ:
-        INIT_WORK(&part->metadata_work, trn_mr_rq_work);
-        break;
-    case TRANSFORM_WRITE:
-        INIT_WORK(&part->metadata_work, trn_mw_rq_work);
-        break;
-    }
+    INIT_WORK(&part->complete_work, complete_work);
     part->state = INITIALIZED;
 
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
@@ -177,79 +257,16 @@ trn_p_rq_init(struct bio *part_bio,
     return part;
 }
 
-/// @brief Завершает обработку чанка и освобождает все ресурсы
-/// @details
-/// Вызывается когда оба bio (data + metadata) завершились, либо
-/// при ошибке до отправки bio.
-///
-/// Логика завершения зависит от состояния и типа:
-///
-/// LOCKED + TRANSFORM_READ:
-///   Снимает read-лок, переводит состояние в CHECK_CRC и запускает
-///   trn_mr_rq_work для проверки CRC. Функция возвращается — ресурсы
-///   будут освобождены после завершения work.
-///
-/// LOCKED + TRANSFORM_WRITE:
-///   Снимает write-лок, освобождает метаданные, bio, структуру
-///   и декрементирует req->pending.
-///
-/// INITIALIZED / CHECK_CRC (любой тип):
-///   Освобождает метаданные, bio, структуру и декрементирует req->pending.
-///
-/// Если req->pending достигает 0 — вызывает complete_trn_rq.
-/// @param part Структура преобразования чанка
-void complete_trn_p_rq(struct trn_p_rq *part)
-{
-    DM_DEBUG("part=%p, state=%d, type=%d, index=%lu\n", part, part->state, part->type, part->index);
-
-    struct trn_rq *req = part->req;
-
-    if (part->state == LOCKED)
-    {
-        switch (part->type)
-        {
-        case TRANSFORM_READ:
-            up_read(&part->lock->sem);
-            break;
-        case TRANSFORM_WRITE:
-            up_write(&part->lock->sem);
-            break;
-        }
-    }
-
-    switch (part->type)
-    {
-    case TRANSFORM_READ:
-        if (part->state == LOCKED)
-        {
-            part->state = CHECK_CRC;
-            queue_work(req->dm_ctx->transform_wq, &part->metadata_work);
-            return;
-        }
-        complete_trn_mr_rq(part->meta.read);
-        break;
-    case TRANSFORM_WRITE:
-        complete_trn_mw_rq(part->meta.write);
-        break;
-    }
-
-    locker_put_lock(req->dm_ctx->locker, part->index, part->lock);
-    bio_put(part->bio);
-    kfree(part);
-
-    if (atomic_dec_and_test(&req->pending))
-        complete_trn_rq(req);
-}
-
 /// @brief Обработчик завершения bio данных и bio метаданных
 /// @details
-/// Вызывается из softirq-контекста при завершении part->bio (data)
-/// или write_bio (для TRANSFORM_TWRITE) / read_bio (для TRANSFORM_READ) метаданных.
+/// Вызывается при завершении любого bio данных или bio метаданных.
 ///
 /// При ошибке bio фиксирует статус в родительском struct trn_rq.
 ///
-/// Декрементирует счётчик pending. Когда оба bio завершены (pending == 0),
-/// вызывает complete_trn_p_rq для продвижения конечного автомата.
+/// Декрементирует счётчик part->pending запроса преобразования чанка.
+/// Когда pending == 0, начинает complete_work для продвижения конечного автомата запроса.
+///
+/// Ожидаемый контекст работы - softirq.
 /// @param bio Завершённый bio
 void trn_p_rq_end_io(struct bio *bio)
 {
@@ -267,5 +284,5 @@ void trn_p_rq_end_io(struct bio *bio)
     }
 
     if (atomic_dec_and_test(&part->pending))
-        complete_trn_p_rq(part);
+        queue_work(req->dm_ctx->transform_wq, &part->complete_work);
 }

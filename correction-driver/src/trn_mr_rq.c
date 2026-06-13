@@ -8,6 +8,8 @@
 /// Выделяет память под trn_mr_rq, страницу для хранения метаданных,
 /// итератор для bio чтения данных и создаёт bio чтения метаданных чанка с диска.
 ///
+/// Ожидаемый контекст работы - process.
+///
 /// При ошибке на любом этапе освобождает все выделенные ресурсы.
 /// @param part Родительская struct trn_p_rq преобразования чанка
 /// @param dm_ctx Контекст драйвера
@@ -66,6 +68,8 @@ trn_mr_rq_init(struct trn_p_rq *part,
 /// @brief Освобождает все ресурсы struct trn_mr_rq
 /// @details
 /// Освобождает bio чтения метаданных, страницу памяти и саму структуру.
+///
+/// Ожидаемый контекст работы - process.
 /// @param meta Структура преобразования метаданных
 void complete_trn_mr_rq(struct trn_mr_rq *meta)
 {
@@ -87,19 +91,15 @@ void complete_trn_mr_rq(struct trn_mr_rq *meta)
 /// При несовпадении CRC устанавливает флаг ошибки в родительском struct trn_rq
 /// и выводит ошибку в журнал.
 ///
-/// По завершению всегда вызывает complete_trn_p_rq.
-/// @param work Указатель на work_struct, вложенный в trn_p_rq.metadata_work
-void trn_mr_rq_work(struct work_struct *work)
+/// Ожидаемый контекст работы - process.
+/// @param meta Структура преобразования метаданных
+void check_crc(struct trn_mr_rq *meta)
 {
-    struct trn_p_rq *part = container_of(work, struct trn_p_rq, metadata_work);
+    struct trn_p_rq *part = meta->part;
     struct trn_rq *req = part->req;
-    struct trn_mr_rq *meta = part->meta.read;
 
     DM_DEBUG("part=%p req=%p first_sector=%u nr_sectors=%u\n",
              part, req, meta->first_sector, meta->nr_sectors);
-
-    if (atomic_read(&req->failed))
-        goto request_failed;
 
     struct chunk_metadata *md = kmap_local_page(meta->metadata_page);
     unsigned int sector_idx = meta->first_sector;
@@ -161,7 +161,4 @@ out:
 
         // Точка входа для восстановления после CRC mismatch
     }
-
-request_failed:
-    complete_trn_p_rq(part);
 }
