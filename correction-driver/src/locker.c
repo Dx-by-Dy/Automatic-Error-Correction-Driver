@@ -71,7 +71,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
     init_rwsem(&lock->sem);
     refcount_set(&lock->refcnt, 1);
 
-    xa_lock_bh(&locker->table);
+    xa_lock(&locker->table);
     old = __xa_cmpxchg(&locker->table,
                        index,
                        NULL,
@@ -80,7 +80,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 
     if (!xa_is_err(old) && old)
         refcount_inc(&old->refcnt);
-    xa_unlock_bh(&locker->table);
+    xa_unlock(&locker->table);
 
     if (xa_is_err(old))
     {
@@ -113,15 +113,15 @@ void locker_put_lock(struct locker *locker,
 {
     DM_DEBUG("locker=%p, index=%lu, lock=%p\n", locker, index, lock);
 
-    xa_lock_bh(&locker->table);
+    xa_lock(&locker->table);
     if (!refcount_dec_and_test(&lock->refcnt))
     {
-        xa_unlock_bh(&locker->table);
+        xa_unlock(&locker->table);
         return;
     }
 
     __xa_erase(&locker->table, index);
-    xa_unlock_bh(&locker->table);
+    xa_unlock(&locker->table);
 
     kfree_rcu(lock, rcu);
 }

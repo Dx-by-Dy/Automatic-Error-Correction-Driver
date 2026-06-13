@@ -12,5 +12,5 @@ fi
 
 insmod correction_driver.ko
 
-dd if=/dev/zero of=vdb bs=1G count=1
+dd if=/dev/zero of=/dev/vdb bs=1G count=1
 echo "0 $(blockdev --getsz /dev/vdb) corrdm /dev/vdb" | dmsetup create corrdm
