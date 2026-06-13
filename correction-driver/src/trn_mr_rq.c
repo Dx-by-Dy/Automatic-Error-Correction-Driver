@@ -58,6 +58,7 @@ trn_mr_rq_init(struct trn_p_rq *part,
 
     DM_DEBUG("meta=%p read_bio=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->read_bio, meta->first_sector, meta->nr_sectors);
+    DM_DEBUG_BIO(meta->read_bio);
 
     return meta;
 }
@@ -123,7 +124,7 @@ void trn_mr_rq_work(struct work_struct *work)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
-                DM_DEBUG("sector=%llu, sector_idx=%u, on_disk_crc=0x%llx computed_crc=0x%llx\n",
+                DM_DEBUG("sector=%llu, sector_idx=%u, expected_crc=%llu, computed_crc=%llu\n",
                          (unsigned long long)(meta->part->index + sector_idx),
                          sector_idx,
                          (unsigned long long)le64_to_cpu(md->crc[sector_idx]),
@@ -146,11 +147,11 @@ void trn_mr_rq_work(struct work_struct *work)
 
 out:
     kunmap_local((void *)md);
-    flush_dcache_page(meta->metadata_page);
 
     if (crc_error)
     {
-        DM_ERR("CRC mismatch at sector %u: on_disk=0x%llx computed=0x%llx\n",
+        DM_ERR("CRC mismatch at sector %llu (+%u on chunk): expected_crc=%llu, computed_crc=%llu\n",
+               (unsigned long long)(meta->part->index + sector_idx - 1),
                sector_idx - 1,
                (unsigned long long)le64_to_cpu(md->crc[sector_idx - 1]),
                (unsigned long long)current_crc);

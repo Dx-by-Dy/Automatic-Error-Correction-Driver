@@ -38,8 +38,10 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
-                DM_DEBUG("sector=%llu, sector_idx=%u, crc=%llx\n",
-                         (unsigned long long)(meta->part->index + sector_idx), sector_idx, current_crc);
+                DM_DEBUG("sector=%llu (+%u on chunk), computed_crc=%llu\n",
+                         (unsigned long long)(meta->part->index + sector_idx),
+                         sector_idx,
+                         current_crc);
 
                 md->crc[sector_idx++] = cpu_to_le64(current_crc);
                 current_crc = 0;
@@ -119,6 +121,9 @@ trn_mw_rq_init(struct trn_p_rq *part,
             return NULL;
         }
         meta->read_bio->bi_end_io = trn_mw_rq_read_end_io;
+
+        DM_DEBUG("meta=%p read_bio=%p\n", meta, meta->read_bio);
+        DM_DEBUG_BIO(meta->read_bio);
     }
 
     r = metadata_bio_init(&meta->write_bio,
@@ -141,10 +146,13 @@ trn_mw_rq_init(struct trn_p_rq *part,
     meta->write_bio->bi_end_io = trn_p_rq_end_io;
     bio_crc_calc(meta, part->bio);
 
-    DM_DEBUG("meta=%p write_bio=%p chunk_full=%d "
-             "first_sector=%u nr_sectors=%u\n",
-             meta, meta->write_bio, meta->chunk_full,
-             meta->first_sector, meta->nr_sectors);
+    DM_DEBUG("meta=%p, write_bio=%p, chunk_full=%d, first_sector=%u, nr_sectors=%u\n",
+             meta,
+             meta->write_bio,
+             meta->chunk_full,
+             meta->first_sector,
+             meta->nr_sectors);
+    DM_DEBUG_BIO(meta->write_bio);
 
     return meta;
 }

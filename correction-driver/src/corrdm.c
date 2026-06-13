@@ -156,8 +156,9 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     ti->private = dm_ctx;
     ti->len = device_new_capacity(get_capacity(dm_ctx->dev->bdev->bd_disk));
 
-    pr_info(DM_MSG_PREFIX ": loaded dev=%s capacity=%llu\n",
+    DM_INFO("mapped on dev=%s, disk capacity=%llu sec, available capacity=%llu sec\n",
             argv[0],
+            (unsigned long long)get_capacity(dm_ctx->dev->bdev->bd_disk),
             (unsigned long long)ti->len);
 
     return 0;
@@ -218,7 +219,7 @@ static int __init dm_init(void)
     if (r)
         DM_ERR("dm_register_target failed, err=%d\n", r);
     else
-        pr_info(DM_MSG_PREFIX ": module loaded\n");
+        DM_INFO("module loaded\n");
 
     return r;
 }
@@ -227,10 +228,8 @@ static int __init dm_init(void)
 static void __exit dm_exit(void)
 {
     DM_DEBUG("unloading\n");
-
     dm_unregister_target(&target);
-
-    pr_info(DM_MSG_PREFIX ": module unloaded\n");
+    DM_INFO("module unloaded\n");
 }
 
 module_init(dm_init);

@@ -97,6 +97,9 @@ trn_rq_init(struct bio *orig_bio,
         part_bio->bi_end_io = trn_p_rq_end_io;
         bio_set_dev(part_bio, dm_ctx->dev->bdev);
 
+        DM_DEBUG("part=%p\n", part);
+        DM_DEBUG_BIO(part_bio);
+
         list_add_tail(&part->list, &req->parts);
         atomic_inc(&req->pending);
 
