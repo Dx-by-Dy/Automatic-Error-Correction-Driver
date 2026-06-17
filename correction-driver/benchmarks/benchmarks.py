@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
-
+REPEATS = 10
 SSD_LABEL = "SSD"
 
 DEVICES = {
@@ -19,12 +20,28 @@ DEVICES = {
 
 TESTS = [
     {
+        "name": "seq_write_512",
+        "rw": "write",
+        "bs": "512",
+        "iodepth": 32,
+        "numjobs": 8,
+        "runtime": 30,
+    },
+    {
         "name": "seq_write_16k",
         "rw": "write",
         "bs": "16k",
         "iodepth": 32,
         "numjobs": 8,
-        "runtime": 60,
+        "runtime": 30,
+    },
+    {
+        "name": "seq_read_512",
+        "rw": "read",
+        "bs": "512",
+        "iodepth": 32,
+        "numjobs": 8,
+        "runtime": 30,
     },
     {
         "name": "seq_read_16k",
@@ -32,31 +49,31 @@ TESTS = [
         "bs": "16k",
         "iodepth": 32,
         "numjobs": 8,
-        "runtime": 60,
+        "runtime": 30,
     },
-    {
-        "name": "rand_write_4k",
-        "rw": "randwrite",
-        "bs": "4k",
-        "iodepth": 32,
-        "numjobs": 8,
-        "runtime": 60,
-    },
-    {
-        "name": "rand_read_4k",
-        "rw": "randread",
-        "bs": "4k",
-        "iodepth": 32,
-        "numjobs": 8,
-        "runtime": 60,
-    },
+    # {
+    #     "name": "rand_write_4k",
+    #     "rw": "randwrite",
+    #     "bs": "4k",
+    #     "iodepth": 32,
+    #     "numjobs": 8,
+    #     "runtime": 60,
+    # },
+    # {
+    #     "name": "rand_read_4k",
+    #     "rw": "randread",
+    #     "bs": "4k",
+    #     "iodepth": 32,
+    #     "numjobs": 8,
+    #     "runtime": 60,
+    # },
 ]
 
-def run_fio(device_name, device_path, test):
-    print(f"{device_name}: {test['name']}")
+def run_fio(device_name, device_path, test, run_id):
+    print(f"{device_name}: {test['name']} [{run_id + 1}/{REPEATS}]")
 
-    out = f"results/{device_name}_{test['name']}.json"
-
+    out = f"results/{device_name}_{test['name']}_{run_id}.json"
+    
     cmd = [
         "fio",
         f"--name={test['name']}",
@@ -102,106 +119,172 @@ def collect():
 
     for dev_name, dev_path in DEVICES.items():
         for test in TESTS:
+            for run_id in range(REPEATS):
 
-            result_file = run_fio(
-                dev_name,
-                dev_path,
-                test
-            )
+                result_file = run_fio(
+                    dev_name,
+                    dev_path,
+                    test,
+                    run_id
+                )
 
-            metrics = parse_result(result_file)
+                metrics = parse_result(result_file)
 
-            rows.append({
-                "device": dev_name,
-                "test": test["name"],
-                **metrics
-            })
+                rows.append({
+                    "device": dev_name,
+                    "test": test["name"],
+                    "run": run_id,
+                    **metrics
+                })
 
     return pd.DataFrame(rows)
 
-def plot_bw(df):
-    plt.figure(figsize=(12, 6))
-
-    pivot = df.pivot(
-        index="test",
-        columns="device",
-        values="bw_mib"
+def summarize(df):
+    agg = (
+        df.groupby(["device", "test"])
+          .agg({
+              "bw_mib": ["mean", "std"],
+              "iops": ["mean", "std"],
+              "lat_avg_us": ["mean", "std"],
+              "lat_p99_us": ["mean", "std"],
+          })
     )
 
-    pivot.plot(kind="bar")
+    agg.columns = [
+        "_".join(col)
+        for col in agg.columns
+    ]
 
-    plt.ylabel("MiB/s")
-    plt.title(f"Bandwidth Comparison ({SSD_LABEL})")
+    agg = agg.reset_index()
+
+    for metric in [
+        "bw_mib",
+        "iops",
+        "lat_avg_us",
+        "lat_p99_us"
+    ]:
+        agg[f"{metric}_se"] = (
+            agg[f"{metric}_std"] / np.sqrt(REPEATS)
+        )
+
+    return agg
+
+def add_labels(ax, pivot_mean, pivot_se):
+    n_tests = len(pivot_mean.index)
+    n_devices = len(pivot_mean.columns)
+
+    bars = ax.patches
+
+    bar_idx = 0
+
+    for device_idx, device in enumerate(pivot_mean.columns):
+        for test_idx in range(n_tests):
+
+            bar = bars[bar_idx]
+            bar_idx += 1
+
+            value = bar.get_height()
+            se = pivot_se.iloc[test_idx][device]
+
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                value + se,
+                f"{value:.2f}±{se:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+def plot_metric(
+    summary,
+    metric,
+    se_metric,
+    ylabel,
+    title,
+    filename
+):
+    pivot_mean = summary.pivot(
+        index="test",
+        columns="device",
+        values=metric
+    )
+
+    pivot_se = summary.pivot(
+        index="test",
+        columns="device",
+        values=se_metric
+    )
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    pivot_mean.plot(
+        kind="bar",
+        yerr=pivot_se,
+        capsize=5,
+        ax=ax
+    )
+
+    add_labels(ax, pivot_mean, pivot_se)
+
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+
     plt.tight_layout()
 
     Path("figures").mkdir(exist_ok=True)
-    plt.savefig("figures/bandwidth_ssd.png")
 
-def plot_iops(df):
-    plt.figure(figsize=(12, 6))
-
-    pivot = df.pivot(
-        index="test",
-        columns="device",
-        values="iops"
+    plt.savefig(
+        f"figures/{filename}",
+        dpi=300
     )
-
-    pivot.plot(kind="bar")
-
-    plt.ylabel("IOPS")
-    plt.title(f"IOPS Comparison ({SSD_LABEL})")
-    plt.tight_layout()
-
-    Path("figures").mkdir(exist_ok=True)
-    plt.savefig("figures/iops_ssd.png")
-
-def plot_latency(df):
-    plt.figure(figsize=(12, 6))
-
-    pivot = df.pivot(
-        index="test",
-        columns="device",
-        values="lat_avg_us"
-    )
-
-    pivot.plot(kind="bar")
-
-    plt.ylabel("Latency (us)")
-    plt.title(f"Average Latency ({SSD_LABEL})")
-    plt.tight_layout()
-
-    Path("figures").mkdir(exist_ok=True)
-    plt.savefig("figures/latency_avg.png")
-
-def plot_p99(df):
-    plt.figure(figsize=(12, 6))
-
-    pivot = df.pivot(
-        index="test",
-        columns="device",
-        values="lat_p99_us"
-    )
-
-    pivot.plot(kind="bar")
-
-    plt.ylabel("Latency (us)")
-    plt.title(f"P99 Latency ({SSD_LABEL})")
-    plt.tight_layout()
-
-    Path("figures").mkdir(exist_ok=True)
-    plt.savefig("figures/latency_p99_ssd.png")
 
 def main():
-    df = collect()
+    raw_df = collect()
 
-    print(df)
+    summary = summarize(raw_df)
 
-    plot_bw(df)
-    plot_iops(df)
-    plot_latency(df)
-    plot_p99(df)
+    summary.to_csv(
+        "results/summary.csv",
+        index=False
+    )
 
-    print("\nDone.")
+    plot_metric(
+        summary,
+        "bw_mib_mean",
+        "bw_mib_se",
+        "MiB/s",
+        f"Bandwidth Comparison ({SSD_LABEL})",
+        "bandwidth_ssd.png"
+    )
+
+    plot_metric(
+        summary,
+        "iops_mean",
+        "iops_se",
+        "IOPS",
+        f"IOPS Comparison ({SSD_LABEL})",
+        "iops_ssd.png"
+    )
+
+    plot_metric(
+        summary,
+        "lat_avg_us_mean",
+        "lat_avg_us_se",
+        "Latency (us)",
+        f"Average Latency ({SSD_LABEL})",
+        "latency_avg_ssd.png"
+    )
+
+    plot_metric(
+        summary,
+        "lat_p99_us_mean",
+        "lat_p99_us_se",
+        "Latency (us)",
+        f"P99 Latency ({SSD_LABEL})",
+        "latency_p99_ssd.png"
+    )
+
+    print(summary)
 
 
 if __name__ == "__main__":

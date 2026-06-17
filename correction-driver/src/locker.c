@@ -8,7 +8,7 @@
 /// @param locker Указатель на структуру таблицы блокировок
 void locker_init(struct locker *locker)
 {
-    DM_DEBUG("locker_exit: locker=%p\n", locker);
+    DM_DEBUG("locker=%p\n", locker);
 
     xa_init(&locker->table);
 }
@@ -20,7 +20,7 @@ void locker_init(struct locker *locker)
 /// @param locker Указатель на таблицу блокировок
 void locker_exit(struct locker *locker)
 {
-    DM_DEBUG("locker_exit: locker=%p\n", locker);
+    DM_DEBUG("locker=%p\n", locker);
 
     struct lock *lock;
     unsigned long index;
