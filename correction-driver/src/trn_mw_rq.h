@@ -12,58 +12,58 @@ struct trn_p_rq;
 struct trn_rq;
 struct dm_context;
 
-/// @brief Представление метаданных одного чанка, хранимые на диске
+/// @brief Representation of one chunk's metadata stored on disk
 /// @details
-/// Располагается в секторе метаданных сразу после DATA_SIZE_SECTORS
-/// секторов данных чанка. Содержит CRC64 каждого сектора данных,
-/// вычисленные в порядке возрастания индекса сектора.
+/// Located in the metadata sector immediately after DATA_SIZE_SECTORS
+/// data sectors of the chunk. Contains CRC64 for each data sector,
+/// computed in order of increasing sector index.
 struct chunk_metadata
 {
-    /// @brief CRC64 для каждого сектора данных чанка
+    /// @brief CRC64 for each data sector of the chunk
     __le64 crc[DATA_SIZE_SECTORS];
 };
 
-/// @brief Структура преобразования метаданных чанка при записи
+/// @brief Structure representing chunk metadata transformation on write
 /// @details
-/// Создаётся при инициализации trn_p_rq при операции записи.
+/// Created during initialization of trn_p_rq for write operations.
 ///
-/// При частичной записи (chunk_full == false) перед записью новых
-/// метаданных необходимо прочитать старые, чтобы обновить CRC только нужных
-/// секторов. Для этого страница разделена на две части:
-///   - [0, METADATA_SIZE_SECTORS * SECTOR_SIZE)                                                — новые метаданные (write_bio)
-///   - [METADATA_SIZE_SECTORS * SECTOR_SIZE, 2 * METADATA_SIZE_SECTORS * SECTOR_SIZE)          — старые метаданные (read_bio)
+/// For partial write (chunk_full == false) before writing new
+/// metadata, it's necessary to read the old metadata to update CRC only for the
+/// needed sectors. For this, the page is divided into two parts:
+///   - [0, METADATA_SIZE_SECTORS * SECTOR_SIZE)                                                — new metadata (write_bio)
+///   - [METADATA_SIZE_SECTORS * SECTOR_SIZE, 2 * METADATA_SIZE_SECTORS * SECTOR_SIZE)          — old metadata (read_bio)
 ///
-/// При полной записи (chunk_full == true) read_bio не создаётся,
-/// так как все CRC чанка вычисляются заново и write_bio отправляется напрямую.
+/// For full write (chunk_full == true) read_bio is not created,
+/// as all CRCs of the chunk are recalculated and write_bio is sent directly.
 struct trn_mw_rq
 {
-    /// @brief bio для чтения старых метаданных чанка с диска
-    /// @details Существует только при chunk_full == false.
+    /// @brief Bio for reading old chunk metadata from disk
+    /// @details Exists only when chunk_full == false.
     struct bio *read_bio;
-
-    /// @brief bio для записи обновлённых метаданных чанка на диск
+ 
+    /// @brief Bio for writing updated chunk metadata to disk
     struct bio *write_bio;
-
-    /// @brief Ссылка на родительскую struct trn_p_rq преобразования чанка
+ 
+    /// @brief Reference to the parent struct trn_p_rq for chunk transformation
     struct trn_p_rq *part;
-
-    /// @brief Индекс первого сектора данных чанка, с которого начинается trn_p_rq.
-    /// Используется для вычисления соответсвующих метаданных запросу.
+ 
+    /// @brief Index of the first data sector of the chunk from which trn_p_rq starts.
+    /// Used to compute corresponding metadata for the request.
     u8 first_sector;
-
-    /// @brief Количество секторов данных в trn_p_rq.
-    /// Используется для вычисления соответсвующих метаданных запросу.
+ 
+    /// @brief Number of data sectors in trn_p_rq.
+    /// Used to compute corresponding metadata for the request.
     u8 nr_sectors;
-
-    /// @brief Страница памяти для хранения метаданных чанка
-    /// @details При chunk_full == false страница разделена на две части:
-    /// первая — новые метаданные для записи,
-    /// вторая — старые метаданные прочитанные с диска.
+ 
+    /// @brief Memory page to store chunk metadata
+    /// @details When chunk_full == false the page is divided into two parts:
+    /// first — new metadata for writing,
+    /// second — old metadata read from disk.
     struct page *page;
-
-    /// @brief Флаг полной записи чанка
-    /// @details Если true — запрос покрывает все DATA_SIZE_SECTORS секторов чанка,
-    /// иначе — false.
+ 
+    /// @brief Flag indicating full chunk write
+    /// @details If true — request covers all DATA_SIZE_SECTORS sectors of the chunk,
+    /// otherwise — false.
     bool chunk_full;
 };
 

@@ -17,23 +17,23 @@
 #include "trn_rq.h"
 #include "trn_p_rq.h"
 
-/// @brief Контекст DM-таргета
+/// @brief DM target context
 /// @details
-/// Создаётся в dm_ctr и хранится в ti->private.
-/// Содержит все ресурсы, необходимые для обработки запросов:
-/// устройство нижнего уровня, очередь работ, bioset и таблицу блокировок.
+/// Created in dm_ctr and stored in ti->private.
+/// Contains all resources necessary for request processing:
+/// lower-level device, work queue, bioset, and chunk lock table.
 struct dm_context
 {
-    /// @brief Устройство нижнего уровня
+    /// @brief Lower-level device
     struct dm_dev *dev;
-
-    /// @brief Очередь работ для асинхронной обработки bio
+ 
+    /// @brief Work queue for asynchronous bio processing
     struct workqueue_struct *transform_wq;
-
-    /// @brief Пул для выделения bio
+ 
+    /// @brief Bio pool for allocation
     struct bio_set *transform_bs;
-
-    /// @brief Таблица блокировок чанков
+ 
+    /// @brief Chunk lock table
     struct locker *locker;
 };
 

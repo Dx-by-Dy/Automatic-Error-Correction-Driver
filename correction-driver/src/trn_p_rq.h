@@ -14,91 +14,91 @@
 
 struct trn_rq;
 
-/// @brief Тип преобразования чанка
-/// @details Определяет направление операции ввода-вывода:
-/// чтение данных с последующей проверкой CRC или
-/// запись данных с обновлением метаданных.
+/// @brief Chunk transformation type
+/// @details Defines the direction of the I/O operation:
+/// reading data followed by CRC verification, or
+/// writing data with metadata updates.
 enum trn_p_type
 {
     TRANSFORM_READ,
     TRANSFORM_WRITE,
 };
 
-/// @brief Состояние жизненного цикла trn_p_rq
+/// @brief Lifecycle state of trn_p_rq
 enum trn_p_state
 {
-    /// @brief Структура создана, bio ещё не отправлены.
+    /// @brief Structure is created, bios are not yet submitted.
     INITIALIZED,
 
-    /// @brief Захвачен лок чанка, bio отправлены, ожидается завершение.
+    /// @brief Chunk lock is acquired, bios are submitted, waiting for completion.
     LOCKED,
 
-    /// @brief (только при TRANSFORM_WRITE) meta.write->read_bio завершился,
-    /// выполняется обновление CRC локально в meta.write->page и на диске через meta.write->write_bio.
+    /// @brief (TRANSFORM_WRITE only) meta.write->read_bio has completed;
+    /// local CRC is being updated in meta.write->page and on disk via meta.write->write_bio.
     CRC_UPDATE,
 };
 
-/// @brief Объединение указателей на структуры метаданных чтения и записи
-/// @details Тип активного поля определяется полем type в trn_p_rq.
+/// @brief Union of pointers to read and write metadata structures
+/// @details The active field type is determined by the type field in trn_p_rq.
 union trn_m_rq
 {
     struct trn_mw_rq *write;
     struct trn_mr_rq *read;
 };
 
-/// @brief Структура преобразования одного чанка
+/// @brief Structure for single chunk transformation
 /// @details
-/// Представляет единицу обработки одного чанка в рамках родительского
-/// trn_rq. Каждый trn_p_rq охватывает ровно один чанк данных.
+/// Represents a processing unit for a single chunk within the parent
+/// trn_rq. Each trn_p_rq covers exactly one data chunk.
 ///
-/// Жизненный цикл:
-///   1. trn_p_rq_init         — выделение ресурсов, инициализация bio и метаданных
-///   2. submit_work           — захват лока чанка, отправка bio на устройство
-///   4. complete_work         — см. details поля complete_work
+/// Lifecycle:
+///   1. trn_p_rq_init         — resource allocation, bio and metadata initialization
+///   2. submit_work           — acquiring chunk lock, submitting bios to the underlying device
+///   3. complete_work         — see details of the complete_work field
 ///
-/// Счётчик pending отслеживает количество незавершённых bio:
-/// при инициализации устанавливается в 2 (data bio + metadata bio).
-/// Когда оба завершаются через trn_p_rq_end_io, вызывается complete_work.
+/// The pending counter tracks the number of outstanding bios:
+/// initialized to 2 during initialization (data bio + metadata bio).
+/// When both complete via trn_p_rq_end_io, complete_work is invoked.
 struct trn_p_rq
 {
-    // @brief Work для захвата лока и отправки bio на устройство ниже
+    /// @brief Work item for acquiring the lock and submitting bios to the underlying device
     struct work_struct submit_work;
 
-    /// @brief Узел списка всех trn_p_rq в родительском trn_rq
-    /// @details Валиден только до вызова trn_rq_submit.
+    /// @brief List node for all trn_p_rq instances in the parent trn_rq
+    /// @details Valid only until trn_rq_submit is called.
     struct list_head list;
 
-    /// @brief Work для продвижения конечного автомата и, в конечном итоге, завершения жизенного цикла структуры
-    /// @details Для TRANSFORM_READ освобждает лок и запускает проверку CRC (check_crc) с последующим освобождением ресурсов.
-    ///          Для TRANSFORM_WRITE (read_bio) запускает обновление CRC (update_crc_local) и отправку write_bio.
-    ///          Для TRANSFORM_WRITE (write_bio) запускает освобождение лока и ресурсов.
+    /// @brief Work item for advancing the state machine and eventually finalizing the structure lifecycle
+    /// @details For TRANSFORM_READ: releases the lock and triggers CRC verification (check_crc), followed by resource cleanup.
+    ///          For TRANSFORM_WRITE (read_bio): triggers local CRC update (update_crc_local) and submits write_bio.
+    ///          For TRANSFORM_WRITE (write_bio): triggers lock release and resource cleanup.
     struct work_struct complete_work;
 
-    /// @brief Указатель на родительский struct trn_rq
+    /// @brief Pointer to the parent struct trn_rq
     struct trn_rq *req;
 
-    /// @brief bio с данными чанка (без метаданных)
+    /// @brief bio containing chunk data (excluding metadata)
     struct bio *bio;
 
-    /// @brief Индекс чанка (физический сектор начала области данных чанка)
+    /// @brief Chunk index (physical sector of the start of the chunk data area)
     unsigned long index;
 
-    /// @brief Блокировка чанка, захватываемая перед отправкой bio
+    /// @brief Chunk lock acquired before submitting bios
     struct lock *lock;
 
-    /// @brief Счётчик незавершённых bio: data bio + metadata bio
-    /// @details Инициализируется в 2. При достижении 0 вызывается complete_work.
-    /// Может быть увеличен с 0 до 1 после успешного read_bio при TRANSFORM_WRITE
-    /// для повторного вызова complete_work после write_bio.
+    /// @brief Counter of outstanding bios: data bio + metadata bio
+    /// @details Initialized to 2. When it reaches 0, complete_work is invoked.
+    /// Can be incremented from 0 to 1 after a successful read_bio during TRANSFORM_WRITE
+    /// to re-invoke complete_work after write_bio completes.
     atomic_t pending;
 
-    /// @brief Текущее состояние жизненного цикла
+    /// @brief Current lifecycle state
     enum trn_p_state state;
 
-    /// @brief Тип преобразования: чтение или запись
+    /// @brief Transformation type: read or write
     enum trn_p_type type;
 
-    /// @brief Структура метаданных чанка (read или write в зависимости от type)
+    /// @brief Chunk metadata structure (read or write depending on type)
     union trn_m_rq meta;
 };
 

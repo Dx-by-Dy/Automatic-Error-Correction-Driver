@@ -1,16 +1,16 @@
 #include "trn_rq.h"
 #include "macros.h"
 
-/// @brief Завершает обработку запроса и освобождает все ресурсы
+/// @brief Completes request processing and frees all resources
 /// @details
-/// Устанавливает итоговый статус в оригинальный bio, сигнализирует
-/// о завершении через bio_endio и освобождает захваченную ссылку
-/// через bio_put.
+/// Sets the final status to the original bio, signals
+/// completion via bio_endio, and releases the captured reference
+/// via bio_put.
 ///
-/// Вызывается когда req->pending достигает 0.
+/// Called when req->pending reaches 0.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param req Структура запроса
+/// Expected execution context - process.
+/// @param req Request structure
 void complete_trn_rq(struct trn_rq *req)
 {
     DM_DEBUG("req=%p status=%d\n", req, req->status);
@@ -21,26 +21,26 @@ void complete_trn_rq(struct trn_rq *req)
     kfree(req);
 }
 
-/// @brief Инициализирует struct trn_rq
+/// @brief Initializes struct trn_rq
 /// @details
-/// Захватывает ссылку на orig_bio через bio_get. Итеративно разбивает
-/// bio по границам чанков: если остаток bio умещается в текущий чанк —
-/// клонирует его, иначе отщепляет часть через bio_split.
+/// Captures reference to orig_bio via bio_get. Iteratively splits
+/// bio by chunk boundaries: if the remainder of bio fits in the current chunk —
+/// clones it, otherwise splits a part via bio_split.
 ///
-/// Для каждой части создаёт trn_p_rq, настраивает part_bio (физический
-/// сектор, bi_private, bi_end_io, устройство) и добавляет в список parts.
+/// For each part creates trn_p_rq, configures part_bio (physical
+/// sector, bi_private, bi_end_io, device) and adds to parts list.
 ///
-/// При ошибке на любом этапе:
-///   - устанавливает флаг failed
-///   - завершает все уже созданные части через complete_work
-///   - если ни одна часть не была создана (pending == 0) —
-///     освобождает req напрямую через complete_trn_rq
+/// On error at any stage:
+///   - sets the failed flag
+///   - completes all already created parts via complete_work
+///   - if no part was created (pending == 0) —
+///     frees req directly via complete_trn_rq
 ///
-/// Ожидаемый контекст работы - process.
-/// @param orig_bio Оригинальный bio запроса
-/// @param dm_ctx   Контекст драйвера
-/// @param type     Тип преобразования (TRANSFORM_READ или TRANSFORM_WRITE)
-/// @return Указатель на trn_rq при успехе, NULL при ошибке
+/// Expected execution context - process.
+/// @param orig_bio Original request bio
+/// @param dm_ctx   Driver context
+/// @param type     Transformation type (TRANSFORM_READ or TRANSFORM_WRITE)
+/// @return Pointer to trn_rq on success, NULL on error
 struct trn_rq *
 trn_rq_init(struct bio *orig_bio,
             struct dm_context *dm_ctx,
@@ -137,14 +137,14 @@ error:
     return NULL;
 }
 
-/// @brief Ставит все trn_p_rq в очередь transform_wq для обработки
+/// @brief Queues all trn_p_rq in transform_wq for processing
 /// @details
-/// Обходит список parts, удаляет каждый элемент из списка и ставит
-/// его submit_work в очередь transform_wq. После вызова список parts
-/// становится пустым.
+/// Traverses parts list, removes each element and queues
+/// its submit_work in transform_wq. After the call, the parts list
+/// becomes empty.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param req Структура запроса
+/// Expected execution context - process.
+/// @param req Request structure
 void trn_rq_submit(struct trn_rq *req)
 {
     DM_DEBUG("req=%p, parts=%d\n", req, atomic_read(&req->pending));

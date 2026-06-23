@@ -9,17 +9,17 @@
 #define DM_INFO(fmt, ...) \
     pr_info("[INFO] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 
-/// @brief Полное включение/выключение встраивания DEBUG сообщений
+/// @brief Full enable/disable of DEBUG message embedding
 #ifdef DM_DEBUG_ENABLED
 #define DM_DEBUG(fmt, ...) \
     pr_debug("[DEBUG] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 
-/// @brief Выводит содержимое структуры bio в журнал ядра
+/// @brief Outputs the contents of a bio structure to the kernel log
 /// @details
-/// Используется для отладки запросов блочного ввода-вывода.
-/// Выводит основные поля bio, а также информацию обо всех
-/// сегментах данных, если запрос содержит полезную нагрузку.
-/// @param bio Структура bio для вывода
+/// Used for debugging block I/O requests.
+/// Outputs main bio fields and information about all
+/// data segments if the request contains payload.
+/// @param bio Structure bio to output
 #define DM_DEBUG_BIO(bio)                                                              \
     do                                                                                 \
     {                                                                                  \

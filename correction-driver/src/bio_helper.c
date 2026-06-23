@@ -2,26 +2,26 @@
 #include "corrdm.h"
 #include "macros.h"
 
-/// @brief Инициализирует bio для работы с метаданными чанка
+/// @brief Initializes bio for working with chunk metadata
 /// @details
-/// Создает новый bio из bioset драйвера, привязывает его к
-/// указанному сектору устройства и добавляет страницу с
-/// метаданными в качестве единственного сегмента данных.
+/// Creates a new bio from the driver's bioset, binds it to
+/// the specified device sector, and adds a page with metadata
+/// as the only data segment.
 ///
-/// Добавляет в bio единственный сегмент длиной SECTOR_SIZE,
-/// начинающийся со смещения offset внутри страницы.
+/// Adds a single segment of length SECTOR_SIZE to the bio,
+/// starting at offset within the page.
 ///
-/// При возникновении ошибки освобождает все выделенные ресурсы.
+/// If an error occurs, frees all allocated resources.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param bio Адрес указателя для сохранения созданного bio
-/// @param page Страница памяти, для привязки к bio
-/// @param offset Смещение внутри страницы
-/// @param dm_ctx Контекст драйвера
-/// @param private_data Пользовательские данные для bi_private
-/// @param sector Сектор метаданных для привязки к bio
-/// @param opf Тип операции и дополнительные флаги используемые для bio
-/// @return 0 при успехе, отрицательный код ошибки при неудаче
+/// Expected execution context - process.
+/// @param bio Pointer to store the created bio
+/// @param page Memory page to bind to bio
+/// @param offset Offset within the page
+/// @param dm_ctx Driver context
+/// @param private_data User data for bi_private
+/// @param sector Metadata sector to bind to bio
+/// @param opf Operation type and additional flags for bio
+/// @return 0 on success, negative error code on failure
 int metadata_bio_init(struct bio **bio,
                       struct page *page,
                       unsigned int offset,

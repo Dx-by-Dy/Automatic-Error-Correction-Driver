@@ -1,11 +1,11 @@
 #include "locker.h"
 #include "macros.h"
 
-/// @brief Инициализирует таблицу блокировок
+/// @brief Initializes the lock table
 /// @details
-/// Выполняет инициализацию XArray, используемого для хранения lock-объектов.
+/// Performs initialization of the XArray used to store lock objects.
 ///
-/// @param locker Указатель на структуру таблицы блокировок
+/// @param locker Pointer to the lock table structure
 void locker_init(struct locker *locker)
 {
     DM_DEBUG("locker=%p\n", locker);
@@ -13,11 +13,11 @@ void locker_init(struct locker *locker)
     xa_init(&locker->table);
 }
 
-/// @brief Освобождает все ресурсы таблицы блокировок
+/// @brief Frees all resources of the lock table
 /// @details
-/// Проходит по всем элементам XArray и удаляет их через kfree_rcu.
+/// Iterates over all XArray elements and removes them via kfree_rcu.
 ///
-/// @param locker Указатель на таблицу блокировок
+/// @param locker Pointer to the lock table
 void locker_exit(struct locker *locker)
 {
     DM_DEBUG("locker=%p\n", locker);
@@ -34,15 +34,15 @@ void locker_exit(struct locker *locker)
     xa_destroy(&locker->table);
 }
 
-/// @brief Безопасное получение лока из таблицы блокировок
+/// @brief Safely obtains a lock from the lock table
 /// @details
-/// Функция пытается получить существующий lock из XArray под RCU.
-/// Если lock отсутствует, создаёт новый экземпляр и пытается атомарно
-/// вставить его через xa_cmpxchg.
+/// The function attempts to obtain an existing lock from the XArray under RCU.
+/// If the lock is absent, creates a new instance and attempts to atomically
+/// insert it via xa_cmpxchg.
 ///
-/// @param locker Таблица блокировок
-/// @param index Индекс лока
-/// @return Указатель на lock при успехе, NULL при ошибке выделения памяти
+/// @param locker Lock table
+/// @param index Lock index
+/// @return Pointer to lock on success, NULL on memory allocation error
 struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 {
     DM_DEBUG("locker=%p, index=%lu\n", locker, index);
@@ -98,15 +98,15 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
     return lock;
 }
 
-/// @brief Безопасное освобождение лока из таблицы блокировок
+/// @brief Safely releases a lock from the lock table
 /// @details
-/// Уменьшает refcount лока. Если это последний владелец,
-/// объект удаляется из XArray и освобождается через RCU.
+/// Decrements the lock's refcount. If this is the last owner,
+/// the object is removed from the XArray and freed via RCU.
 ///
-/// Гарантирует безопасное удаление даже при конкурентном доступе.
-/// @param locker Таблица блокировок
-/// @param index Индекс лока
-/// @param lock Лок
+/// Guarantees safe deletion even with concurrent access.
+/// @param locker Lock table
+/// @param index Lock index
+/// @param lock Lock
 void locker_put_lock(struct locker *locker,
                      unsigned long index,
                      struct lock *lock)

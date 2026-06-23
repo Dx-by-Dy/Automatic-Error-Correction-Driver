@@ -3,17 +3,18 @@
 #include "trn_rq.h"
 #include "macros.h"
 
-/// @brief Инициализирует struct trn_mr_rq
+/// @brief Initializes struct trn_mr_rq
 /// @details
-/// Выделяет память под trn_mr_rq, страницу для хранения метаданных,
-/// итератор для bio чтения данных и создаёт bio чтения метаданных чанка с диска.
+/// Allocates memory for trn_mr_rq, a page for storing metadata,
+/// iterator for bio reading data, and creates bio for reading
+/// chunk metadata from disk.
 ///
-/// Ожидаемый контекст работы - process.
+/// Expected execution context - process.
 ///
-/// При ошибке на любом этапе освобождает все выделенные ресурсы.
-/// @param part Родительская struct trn_p_rq преобразования чанка
-/// @param dm_ctx Контекст драйвера
-/// @return Указатель на trn_mr_rq при успехе, NULL при ошибке
+/// On error at any stage, frees all allocated resources.
+/// @param part Parent struct trn_p_rq for chunk transformation
+/// @param dm_ctx Driver context
+/// @return Pointer to trn_mr_rq on success, NULL on error
 struct trn_mr_rq *
 trn_mr_rq_init(struct trn_p_rq *part,
                struct dm_context *dm_ctx)
@@ -65,12 +66,12 @@ trn_mr_rq_init(struct trn_p_rq *part,
     return meta;
 }
 
-/// @brief Освобождает все ресурсы struct trn_mr_rq
+/// @brief Frees all resources of struct trn_mr_rq
 /// @details
-/// Освобождает bio чтения метаданных, страницу памяти и саму структуру.
+/// Frees metadata reading bio, memory page, and the structure itself.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param meta Структура преобразования метаданных
+/// Expected execution context - process.
+/// @param meta Metadata transformation structure
 void complete_trn_mr_rq(struct trn_mr_rq *meta)
 {
     DM_DEBUG("meta=%p read_bio=%p first_sector=%u nr_sectors=%u\n",
@@ -81,18 +82,18 @@ void complete_trn_mr_rq(struct trn_mr_rq *meta)
     kfree(meta);
 }
 
-/// @brief Проверяет CRC прочитанных данных относительно метаданных чанка
+/// @brief Verifies CRC of read data against chunk metadata
 /// @details
-/// Запускается как work в очереди transform_wq после успешного завершения
-/// bio чтения данных и метаданных чанка (оба завершились через trn_p_rq_end_io).
+/// Runs as work in the transform_wq after successful completion
+/// of bio reading data and chunk metadata (both completed via trn_p_rq_end_io).
 ///
-/// Вычисляет CRC64 по каждому сектору данных bio,
-/// сравнивая результат с соответствующей записью на диске.
-/// При несовпадении CRC устанавливает флаг ошибки в родительском struct trn_rq
-/// и выводит ошибку в журнал.
+/// Computes CRC64 for each data sector of bio,
+/// comparing the result with the corresponding record on disk.
+/// On CRC mismatch, sets error flag in parent struct trn_rq
+/// and outputs error to the log.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param meta Структура преобразования метаданных
+/// Expected execution context - process.
+/// @param meta Metadata transformation structure
 void check_crc(struct trn_mr_rq *meta)
 {
     struct trn_p_rq *part = meta->part;
@@ -159,6 +160,6 @@ out:
         if (!atomic_xchg(&req->failed, 1))
             req->status = BLK_STS_IOERR;
 
-        // Точка входа для восстановления после CRC mismatch
+        // Entry point for recovery after CRC mismatch
     }
 }

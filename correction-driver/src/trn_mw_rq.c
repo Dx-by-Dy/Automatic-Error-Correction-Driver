@@ -3,16 +3,16 @@
 #include "trn_rq.h"
 #include "macros.h"
 
-/// @brief Вычисляет CRC64 для каждого сектора bio и записывает результаты в meta->page
+/// @brief Calculates CRC64 for each bio sector and writes results to meta->page
 /// @details
-/// Обходит все сегменты bio побайтово, накапливая CRC64 (big-endian)
-/// для каждого сектора данных. По завершении каждого сектора записывает
-/// итоговый CRC в соответствующее место meta->page, определяемый
-/// индексом meta->first_sector.
+/// Traverses all bio segments byte-by-byte, accumulating CRC64 (big-endian)
+/// for each data sector. Upon completion of each sector, writes
+/// the final CRC to the corresponding place in meta->page, determined
+/// by the index meta->first_sector.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param meta Структура преобразования метаданных записи
-/// @param bio  bio с данными для вычисления CRC
+/// Expected execution context - process.
+/// @param meta Metadata transformation structure for write
+/// @param bio  Bio with data for CRC calculation
 static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 {
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
@@ -58,27 +58,27 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
     flush_dcache_page(meta->page);
 }
 
-/// @brief Инициализирует struct trn_mw_rq
+/// @brief Initializes struct trn_mw_rq
 /// @details
-/// Выделяет память под trn_mw_rq, страницу для метаданных и необходимые bio.
+/// Allocates memory for trn_mw_rq, a page for metadata, and necessary bios.
 ///
-/// При частичной записи (chunk_full == false) создаёт read_bio для чтения
-/// старых метаданных во вторую часть страницы, чтобы впоследствии
-/// сохранить CRC незатронутых секторов. Затем создаёт write_bio для записи
-/// обновлённых метаданных из первой половины страницы.
+/// For partial write (chunk_full == false) creates read_bio to read
+/// old metadata into the second half of the page, to later
+/// preserve CRC for unmodified sectors. Then creates write_bio to write
+/// updated metadata from the first half of the page.
 ///
-/// При полной записи (chunk_full == true) read_bio не создаётся —
-/// все CRC секторов пересчитываются и сразу записываются.
+/// For full write (chunk_full == true) read_bio is not created —
+/// all sector CRCs are recalculated and immediately written.
 ///
-/// В обоих случаях вызывает bio_crc_calc для вычисления новых CRC
-/// по данным из part->bio.
+/// In both cases, calls bio_crc_calc to calculate new CRCs
+/// from data in part->bio.
 ///
-/// Ожидаемый контекст работы - process.
+/// Expected execution context - process.
 ///
-/// При ошибке на любом этапе освобождает все ранее выделенные ресурсы.
-/// @param part   Родительская struct trn_p_rq
-/// @param dm_ctx Контекст драйвера
-/// @return Указатель на trn_mw_rq при успехе, NULL при ошибке
+/// On error at any stage, frees all previously allocated resources.
+/// @param part   Parent struct trn_p_rq
+/// @param dm_ctx Driver context
+/// @return Pointer to trn_mw_rq on success, NULL on error
 struct trn_mw_rq *
 trn_mw_rq_init(struct trn_p_rq *part,
                struct dm_context *dm_ctx)
@@ -161,13 +161,13 @@ trn_mw_rq_init(struct trn_p_rq *part,
     return meta;
 }
 
-/// @brief Освобождает все ресурсы struct trn_mw_rq
+/// @brief Frees all resources of struct trn_mw_rq
 /// @details
-/// Освобождает read_bio (только при chunk_full == false), write_bio,
-/// страницу памяти и саму структуру.
+/// Frees read_bio (only when chunk_full == false), write_bio,
+/// memory page, and the structure itself.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param meta Структура преобразования метаданных
+/// Expected execution context - process.
+/// @param meta Metadata transformation structure
 void complete_trn_mw_rq(struct trn_mw_rq *meta)
 {
     DM_DEBUG("meta=%p write_bio=%p chunk_full=%d "
@@ -182,17 +182,17 @@ void complete_trn_mw_rq(struct trn_mw_rq *meta)
     kfree(meta);
 }
 
-/// @brief Сливает старые и новые CRC
+/// @brief Merges old and new CRCs
 /// @details
-/// Запускается  после успешного чтения старых метаданных через read_bio.
+/// Runs after successful old metadata read via read_bio.
 ///
-/// Копирует CRC секторов, не затронутых текущим запросом записи,
-/// из старых метаданных (вторая часть страницы) в новые
-/// (первая часть страницы). CRC затронутых секторов уже были
-/// вычислены в bio_crc_calc при инициализации.
+/// Copies CRCs for sectors unaffected by the current write request
+/// from old metadata (second half of page) to new
+/// (first half of page). CRCs for affected sectors were already
+/// calculated in bio_crc_calc during initialization.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param meta Структура преобразования метаданных
+/// Expected execution context - process.
+/// @param meta Metadata transformation structureых
 void update_crc_local(struct trn_mw_rq *meta)
 {
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",

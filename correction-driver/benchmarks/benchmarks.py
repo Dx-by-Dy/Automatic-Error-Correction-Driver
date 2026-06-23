@@ -18,61 +18,79 @@ DEVICES = {
     "vdb": "/dev/vdb",
 }
 
+COMPETITIVENESS = "uncompetitively"
+
 TESTS = [
+    # {
+    #     "name": "seq_write_512",
+    #     "rw": "write",
+    #     "bs": "512",
+    #     "iodepth": 32,
+    #     "numjobs": 8,
+    #     "runtime": 30,
+    # },
+    # {
+    #     "name": "seq_write_16k",
+    #     "rw": "write",
+    #     "bs": "16k",
+    #     "iodepth": 32,
+    #     "numjobs": 8,
+    #     "runtime": 30,
+    # },
+    # {
+    #     "name": "seq_read_512",
+    #     "rw": "read",
+    #     "bs": "512",
+    #     "iodepth": 32,
+    #     "numjobs": 8,
+    #     "runtime": 30,
+    # },
+    # {
+    #     "name": "seq_read_16k",
+    #     "rw": "read",
+    #     "bs": "16k",
+    #     "iodepth": 32,
+    #     "numjobs": 8,
+    #     "runtime": 30,
+    # },
     {
         "name": "seq_write_512",
         "rw": "write",
         "bs": "512",
-        "iodepth": 32,
-        "numjobs": 8,
+        "iodepth": 1,
+        "numjobs": 1,
         "runtime": 30,
     },
     {
         "name": "seq_write_16k",
         "rw": "write",
         "bs": "16k",
-        "iodepth": 32,
-        "numjobs": 8,
+        "iodepth": 1,
+        "numjobs": 1,
         "runtime": 30,
     },
     {
         "name": "seq_read_512",
         "rw": "read",
         "bs": "512",
-        "iodepth": 32,
-        "numjobs": 8,
+        "iodepth": 1,
+        "numjobs": 1,
         "runtime": 30,
     },
     {
         "name": "seq_read_16k",
         "rw": "read",
         "bs": "16k",
-        "iodepth": 32,
-        "numjobs": 8,
+        "iodepth": 1,
+        "numjobs": 1,
         "runtime": 30,
     },
-    # {
-    #     "name": "rand_write_4k",
-    #     "rw": "randwrite",
-    #     "bs": "4k",
-    #     "iodepth": 32,
-    #     "numjobs": 8,
-    #     "runtime": 60,
-    # },
-    # {
-    #     "name": "rand_read_4k",
-    #     "rw": "randread",
-    #     "bs": "4k",
-    #     "iodepth": 32,
-    #     "numjobs": 8,
-    #     "runtime": 60,
-    # },
 ]
 
 def run_fio(device_name, device_path, test, run_id):
     print(f"{device_name}: {test['name']} [{run_id + 1}/{REPEATS}]")
 
-    out = f"results/{device_name}_{test['name']}_{run_id}.json"
+    out = f"results/{COMPETITIVENESS}_{device_name}_{test['name']}_{run_id}.json"
     
     cmd = [
         "fio",
@@ -223,6 +241,7 @@ def plot_metric(
         capsize=5,
         ax=ax
     )
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='center')
 
     add_labels(ax, pivot_mean, pivot_se)
 
@@ -253,8 +272,8 @@ def main():
         "bw_mib_mean",
         "bw_mib_se",
         "MiB/s",
-        f"Bandwidth Comparison ({SSD_LABEL})",
-        "bandwidth_ssd.png"
+        f"Bandwidth Comparison ({COMPETITIVENESS}, {SSD_LABEL})",
+        f"{COMPETITIVENESS}_bandwidth_ssd.png"
     )
 
     plot_metric(
@@ -262,8 +281,8 @@ def main():
         "iops_mean",
         "iops_se",
         "IOPS",
-        f"IOPS Comparison ({SSD_LABEL})",
-        "iops_ssd.png"
+        f"IOPS Comparison ({COMPETITIVENESS}, {SSD_LABEL})",
+        f"{COMPETITIVENESS}_iops_ssd.png"
     )
 
     plot_metric(
@@ -271,8 +290,8 @@ def main():
         "lat_avg_us_mean",
         "lat_avg_us_se",
         "Latency (us)",
-        f"Average Latency ({SSD_LABEL})",
-        "latency_avg_ssd.png"
+        f"Average Latency ({COMPETITIVENESS}, {SSD_LABEL})",
+        f"{COMPETITIVENESS}_latency_avg_ssd.png"
     )
 
     plot_metric(
@@ -280,8 +299,8 @@ def main():
         "lat_p99_us_mean",
         "lat_p99_us_se",
         "Latency (us)",
-        f"P99 Latency ({SSD_LABEL})",
-        "latency_p99_ssd.png"
+        f"P99 Latency ({COMPETITIVENESS}, {SSD_LABEL})",
+        f"{COMPETITIVENESS}_latency_p99_ssd.png"
     )
 
     print(summary)

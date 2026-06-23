@@ -7,59 +7,59 @@
 #define METADATA_SIZE_SECTORS 1
 #define CHUNK_SIZE_SECTORS (DATA_SIZE_SECTORS + METADATA_SIZE_SECTORS)
 
-/// @brief Преобразует логический сектор устройства в физический сектор
+/// @brief Converts logical device sector to physical sector
 /// @details
-/// После каждых DATA_SIZE_SECTORS секторов данных
-/// на устройстве размещается METADATA_SIZE_SECTORS секторов метаданных.
-/// Функция вычисляет физический сектор данных,
-/// соответствующий логическому сектору.
-/// @param sector Логический сектор
-/// @return Физический сектор
+/// After every DATA_SIZE_SECTORS data sectors,
+/// METADATA_SIZE_SECTORS metadata sectors are placed on the device.
+/// The function calculates the physical data sector
+/// corresponding to a logical sector.
+/// @param sector Logical sector
+/// @return Physical sector
 static inline sector_t align_data_sector(sector_t sector)
 {
     return (sector / DATA_SIZE_SECTORS) * (CHUNK_SIZE_SECTORS) + (sector % DATA_SIZE_SECTORS);
 }
 
-/// @brief Вычисляет количество секторов до конца текущего чанка данных (без метаданных)
+/// @brief Calculates the number of sectors until the end of the current data chunk (without metadata)
 /// @details
-/// Используется при разбиении bio на части таким образом,
-/// чтобы каждая часть не пересекала границу чанка.
-/// @param sector Логический сектор
-/// @return Количество секторов до конца текущего чанка данных
+/// Used when splitting bio into parts such that
+/// each part does not cross chunk boundaries.
+/// @param sector Logical sector
+/// @return Number of sectors until the end of the current data chunk
 static inline sector_t sectors_until_datachunk_end(sector_t sector)
 {
     return DATA_SIZE_SECTORS - (sector % DATA_SIZE_SECTORS);
 }
 
-/// @brief Вычисляет начало области данных чанка
+/// @brief Calculates the start of the data area of a chunk
 /// @details
-/// Для указанного логического сектора определяет физический сектор,
-/// с которого начинается область данных соответствующего чанка.
-/// @param sector Логический сектор
-/// @return Физический сектор начала области данных чанка
+/// For a given logical sector, determines the physical sector
+/// from which the data area of the corresponding chunk starts.
+/// @param sector Logical sector
+/// @return Physical sector at the start of the chunk's data area
 static inline sector_t start_data_sector(sector_t sector)
 {
     sector_t align_sector = align_data_sector(sector);
     return align_sector - (align_sector % CHUNK_SIZE_SECTORS);
 }
 
-/// @brief Вычисляет начало области метаданных чанка
+/// @brief Calculates the start of the metadata area of a chunk
 /// @details
-/// Для указанного логического сектора определяет физический сектор,
-/// в котором располагаются метаданные соответствующего чанка.
-/// @param sector Логический сектор
-/// @return Физический сектор начала области метаданных чанка
+/// For a given logical sector, determines the physical sector
+/// in which the metadata of the corresponding chunk is located.
+/// @param sector Logical sector
+/// @return Physical sector at the start of the chunk's metadata area
 static inline sector_t start_metadata_sector(sector_t sector)
 {
     return start_data_sector(sector) + DATA_SIZE_SECTORS;
 }
 
-/// @brief Рассчитывает доступную емкость устройства
+/// @brief Calculates available device capacity
 /// @details
-/// Исключает из расчета сектора метаданных,
-/// размещаемые после каждого чанка данных.
-/// @param sector Полная емкость нижележащего устройства
-/// @return Доступная логическая емкость устройства
+/// Excludes metadata sectors from the calculation,
+/// placed after each data chunk.
+/// @param sector Full capacity of the underlying device
+/// @return Available logical device capacity
 static inline sector_t device_new_capacity(sector_t sector)
 {
     return sector / CHUNK_SIZE_SECTORS * DATA_SIZE_SECTORS;

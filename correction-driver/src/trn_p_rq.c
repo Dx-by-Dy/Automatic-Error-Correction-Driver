@@ -1,14 +1,14 @@
 #include "trn_p_rq.h"
 #include "macros.h"
 
-/// @brief Захватывает лок чанка в зависимости от типа преобразования
+/// @brief Acquires chunk lock depending on transformation type
 /// @details
-/// Для TRANSFORM_READ захватывает разделяемую блокировку (down_read),
-/// для TRANSFORM_WRITE — эксклюзивную (down_write).
-/// После захвата устанавливает состояние part->state = LOCKED.
+/// For TRANSFORM_READ acquires shared lock (down_read),
+/// for TRANSFORM_WRITE — exclusive lock (down_write).
+/// After acquisition, sets part->state = LOCKED.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param part Структура преобразования чанка
+/// Expected execution context - process.
+/// @param part Chunk transformation structure
 static void lock(struct trn_p_rq *part)
 {
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
@@ -26,15 +26,15 @@ static void lock(struct trn_p_rq *part)
     part->state = LOCKED;
 }
 
-/// @brief Отпускает лок чанка в зависимости от типа преобразования и состояния
+/// @brief Releases chunk lock depending on transformation type and state
 /// @details
-/// Отпускает блокировку только если состояние part->state == LOCKED или part->state == CRC_UPDATE.
+/// Releases lock only if part->state == LOCKED or part->state == CRC_UPDATE.
 ///
-/// Для TRANSFORM_READ отпускает разделяемую блокировку (up_read),
-/// для TRANSFORM_WRITE — эксклюзивную (up_write).
+/// For TRANSFORM_READ releases shared lock (up_read),
+/// for TRANSFORM_WRITE — exclusive lock (up_write).
 ///
-/// Ожидаемый контекст работы - process.
-/// @param part Структура преобразования чанка
+/// Expected execution context - process.
+/// @param part Chunk transformation structure
 static void unlock(struct trn_p_rq *part)
 {
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
@@ -53,20 +53,20 @@ static void unlock(struct trn_p_rq *part)
     }
 }
 
-/// @brief Work-обработчик: захватывает лок чанка и отправляет bio на устройство
+/// @brief Work handler: acquires chunk lock and submits bio to device
 /// @details
-/// Запускается из очереди transform_wq для каждого trn_p_rq.
+/// Runs from transform_wq for each trn_p_rq.
 ///
-/// Перед захватом лока проверяет флаг failed родительского
-/// trn_rq — если другой чанк уже завершился с ошибкой, немедленно
-/// переходит к завершению без отправки bio.
+/// Before acquiring lock, checks the failed flag of parent
+/// trn_rq — if another chunk has already completed with error, immediately
+/// transitions to completion without sending bio.
 ///
-/// При успехе отправляет data bio и метаданные чанка в зависимости от типа преобразования:
-///   - TRANSFORM_READ:  read_bio метаданных
-///   - TRANSFORM_WRITE: write_bio (chunk_full) или read_bio (частичная запись)
+/// On success, submits data bio and chunk metadata depending on transformation type:
+///   - TRANSFORM_READ:  metadata reading bio
+///   - TRANSFORM_WRITE: write_bio (chunk_full) or read_bio (partial write)
 ///
-/// Ожидаемый контекст работы - process.
-/// @param work Указатель на work_struct, вложенный в part->submit_work
+/// Expected execution context - process.
+/// @param work Pointer to work_struct embedded in part->submit_wor
 static void submit_work(struct work_struct *work)
 {
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, submit_work);
@@ -105,28 +105,28 @@ fail:
     queue_work(req->dm_ctx->transform_wq, &part->complete_work);
 }
 
-/// @brief Функция продвижения конечного автомата и завершения жизенного цикла структуры
+/// @brief Function advancing state machine and completing structure lifecycle
 /// @details
-/// Вызывается когда part->pending достигает 0.
+/// Called when part->pending reaches 0.
 ///
-/// Логика завершения зависит от типа:
+/// Completion logic depends on type:
 ///
 /// TRANSFORM_READ:
-///   Снимает read-лок и при успешном чтении запускает check_crc
-///   с последующим освобождением ресурсов.
+///   Releases read lock and on successful read launches check_crc
+///   with subsequent resource cleanup.
 ///
 /// TRANSFORM_WRITE:
-///   Если chunk_full == false — обновляет CRC локально и
-///   отправляет write_bio для обновления CRC на диск.
-///   Переводит state в CRC_UPDATE.
+///   If chunk_full == false — updates CRC locally and
+///   submits write_bio to update CRC on disk.
+///   Transitions state to CRC_UPDATE.
 ///
-///   Если chunk_full == true — снимает write-лок и освобождает
-///   метаданные, bio, структуру и декрементирует req->pending.
+///   If chunk_full == true — releases write lock and frees
+///   metadata, bio, structure, and decrements req->pending.
 ///
-/// Если req->pending достигает 0 — вызывает complete_trn_rq.
+/// If req->pending reaches 0 — calls complete_trn_rq.
 ///
-/// Ожидаемый контекст работы - process.
-/// @param work Указатель на work_struct, вложенный в part->complete_work
+/// Expected execution context - process.
+/// @param work Pointer to work_struct embedded in part->complete_work
 static void complete_work(struct work_struct *work)
 {
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, complete_work);
@@ -164,27 +164,27 @@ static void complete_work(struct work_struct *work)
         complete_trn_rq(req);
 }
 
-/// @brief Инициализирует struct trn_p_rq
+/// @brief Initializes struct trn_p_rq
 /// @details
-/// Выделяет память под trn_p_rq, инициализирует поля и создаёт
-/// структуру метаданных (trn_mr_rq или trn_mw_rq) в зависимости
-/// от типа преобразования.
+/// Allocates memory for trn_p_rq, initializes fields, and creates
+/// metadata structure (trn_mr_rq or trn_mw_rq) depending
+/// on transformation type.
 ///
-/// Получает лок чанка через locker_get_lock по индексу начала
-/// области данных чанка.
+/// Obtains chunk lock via locker_get_lock by the index of
+/// the start of the chunk's data area.
 ///
-/// Инициализирует save_iter поля meta для TRANSFORM_READ.
+/// Initializes save_iter field of meta for TRANSFORM_READ.
 ///
-/// Счётчик pending инициализируется в 2: data bio + metadata bio.
+/// Pending counter is initialized to 2: data bio + metadata bio.
 ///
-/// Ожидаемый контекст работы - process.
+/// Expected execution context - process.
 ///
-/// При ошибке освобождает все ресурсы.
-/// @param part_bio bio с данными чанка
-/// @param req      Родительский struct trn_rq
-/// @param dm_ctx   Контекст драйвера
-/// @param type     Тип преобразования (TRANSFORM_READ или TRANSFORM_WRITE)
-/// @return Указатель на trn_p_rq при успехе, NULL при ошибке
+/// On error, frees all resources.
+/// @param part_bio Bio with chunk data
+/// @param req      Parent struct trn_rq
+/// @param dm_ctx   Driver context
+/// @param type     Transformation type (TRANSFORM_READ or TRANSFORM_WRITE)
+/// @return Pointer to trn_p_rq on success, NULL on error
 struct trn_p_rq *
 trn_p_rq_init(struct bio *part_bio,
               struct trn_rq *req,
@@ -257,17 +257,17 @@ trn_p_rq_init(struct bio *part_bio,
     return part;
 }
 
-/// @brief Обработчик завершения bio данных и bio метаданных
+/// @brief Handler for completion of data and metadata bios
 /// @details
-/// Вызывается при завершении любого bio данных или bio метаданных.
+/// Called upon completion of any data bio or metadata bio.
 ///
-/// При ошибке bio фиксирует статус в родительском struct trn_rq.
+/// On bio error, captures status in parent struct trn_rq.
 ///
-/// Декрементирует счётчик part->pending запроса преобразования чанка.
-/// Когда pending == 0, начинает complete_work для продвижения конечного автомата запроса.
+/// Decrements part->pending counter of the chunk transformation request.
+/// When pending == 0, starts complete_work to advance the state machine.
 ///
-/// Ожидаемый контекст работы - softirq.
-/// @param bio Завершённый bio
+/// Expected execution context - softirq.
+/// @param bio Completed bio
 void trn_p_rq_end_io(struct bio *bio)
 {
     struct trn_p_rq *part = bio->bi_private;

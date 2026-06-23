@@ -5,20 +5,20 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alexey Smirnov");
 MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 
-/// @brief Обрабатывает входящий bio-запрос
+/// @brief Handles incoming bio requests
 /// @details
-/// Вызывается DM-подсистемой для каждого входящего bio.
-/// Для операций чтения и записи создаёт trn_rq, который разбивает bio
-/// на части по границам чанков и асинхронно обрабатывает каждую.
+/// Called by the DM subsystem for each incoming bio.
+/// For read and write operations, creates a trn_rq, which splits the bio
+/// by chunk boundaries and asynchronously processes each part.
 ///
-/// Для остальных операций (FLUSH, DISCARD и т.д.) переадресует bio
-/// напрямую на устройство нижнего уровня.
+/// For other operations (FLUSH, DISCARD, etc.) forwards the bio
+/// directly to the lower-level device.
 ///
-/// При ошибке инициализации trn_rq входящий bio уже завершен с BLK_STS_IOERR.
-/// @param ti  Таргет DM
-/// @param bio Входящий bio-запрос
-/// @return DM_MAPIO_SUBMITTED для READ, WRITE.
-///         DM_MAPIO_REMAPPED для FLUSH, DISCARD и т.д.
+/// On trn_rq initialization error, the incoming bio is already completed with BLK_STS_IOERR.
+/// @param ti  DM target
+/// @param bio Incoming bio request
+/// @return DM_MAPIO_SUBMITTED for READ, WRITE.
+///         DM_MAPIO_REMAPPED for FLUSH, DISCARD, etc.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
     DM_DEBUG("bio=%p op=%u sector=%llu size=%u\n",
@@ -73,19 +73,19 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
     return DM_MAPIO_SUBMITTED;
 }
 
-/// @brief Инициализирует DM-таргет при его создании
+/// @brief Initializes the DM target on creation
 /// @details
-/// Ожидает единственный аргумент argv[0] — путь к устройству нижнего уровня.
+/// Expects a single argument argv[0] — path to the lower-level device.
 ///
-/// Последовательно выделяет и инициализирует все ресурсы:
-/// таблицу блокировок, очередь работ, bioset и устройство нижнего уровня.
+/// Sequentially allocates and initializes all resources:
+/// lock table, work queue, bioset, and lower-level device.
 ///
-/// При ошибке на любом этапе освобождает все ранее выделенные ресурсы
-/// в порядке, обратном выделению.
-/// @param ti   Таргет DM
-/// @param argc Количество аргументов
-/// @param argv Аргументы: argv[0] — путь к устройству нижнего уровня
-/// @return 0 при успехе, отрицательный код ошибки при неудаче
+/// On error at any stage, frees all previously allocated resources
+/// in reverse order of allocation.
+/// @param ti   DM target
+/// @param argc Argument count
+/// @param argv Arguments: argv[0] — path to lower-level device
+/// @return 0 on success, negative error code on failure
 static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
     if (argc != 1)
@@ -119,7 +119,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
     locker_init(dm_ctx->locker);
 
-    dm_ctx->transform_wq = alloc_workqueue("transformation_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1024);
+    dm_ctx->transform_wq = alloc_workqueue("transformation_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!dm_ctx->transform_wq)
     {
         ti->error = "alloc_workqueue failed";
@@ -177,12 +177,12 @@ error_locker_alloc:
     return r;
 }
 
-/// @brief Уничтожает DM-таргет и освобождает все ресурсы
+/// @brief Destroys the DM target and frees all resources
 /// @details
-/// Перед уничтожением очереди работ ожидает завершения всех
-/// текущих работ через flush_workqueue, чтобы гарантировать
-/// отсутствие обращений к ресурсам после их освобождения.
-/// @param ti Таргет DM
+/// Before destroying the work queue, waits for completion of all
+/// current work via flush_workqueue to ensure no resource access
+/// after their release.
+/// @param ti DM target
 static void dm_dtr(struct dm_target *ti)
 {
     struct dm_context *dm_ctx = ti->private;
@@ -208,8 +208,8 @@ static struct target_type target = {
     .map = dm_map,
 };
 
-/// @brief Регистрирует DM-таргет при загрузке модуля
-/// @return 0 при успехе, отрицательный код ошибки при неудаче
+/// @brief Registers the DM target on module load
+/// @return 0 on success, negative error code on failure
 static int __init dm_init(void)
 {
     DM_DEBUG("loading\n");
@@ -224,7 +224,7 @@ static int __init dm_init(void)
     return r;
 }
 
-/// @brief Точка выхода DM-таргета при выгрузке модуля
+/// @brief Exit point for the DM target on module unload
 static void __exit dm_exit(void)
 {
     DM_DEBUG("unloading\n");

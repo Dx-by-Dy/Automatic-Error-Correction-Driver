@@ -12,42 +12,42 @@
 struct trn_p_rq;
 enum trn_p_type;
 
-/// @brief Структура представления обработки одного bio-запроса
+/// @brief Structure representing the processing of a single bio request
 /// @details
-/// Создаётся в dm_map для каждого входящего bio. Разбивает исходный
-/// bio на части (trn_p_rq) по границам чанков и управляет их
-/// жизненным циклом.
+/// Created in dm_map for each incoming bio. Splits the original
+/// bio into parts (trn_p_rq) along chunk boundaries and manages
+/// their lifecycle.
 ///
-/// Жизненный цикл:
-///   1. trn_rq_init    — разбивка bio на части, инициализация всех trn_p_rq
-///   2. trn_rq_submit  — постановка всех trn_p_rq в очередь transform_wq
-///   3. complete_trn_rq — вызывается когда pending достигает 0,
-///                        завершает оригинальный bio и освобождает ресурсы
+/// Lifecycle:
+///   1. trn_rq_init     — splitting bio into parts, initializing all trn_p_rq instances
+///   2. trn_rq_submit   — queuing all trn_p_rq instances into transform_wq
+///   3. complete_trn_rq — invoked when pending reaches 0,
+///                        completes the original bio and releases resources
 struct trn_rq
 {
-    /// @brief Контекст драйвера
+    /// @brief Driver context
     struct dm_context *dm_ctx;
 
-    /// @brief Оригинальный bio запроса
-    /// @details Захватывается через bio_get в trn_rq_init,
-    /// освобождается через bio_put и завершается в complete_trn_rq.
+    /// @brief Original request bio
+    /// @details Acquired via bio_get in trn_rq_init,
+    /// released via bio_put and completed in complete_trn_rq.
     struct bio *orig_bio;
 
-    /// @brief Счётчик незавершённых trn_p_rq
-    /// @details Инкрементируется при добавлении каждого trn_p_rq.
-    /// При достижении 0 вызывается complete_trn_rq.
+    /// @brief Counter of outstanding trn_p_rq instances
+    /// @details Incremented when adding each trn_p_rq.
+    /// When it reaches 0, complete_trn_rq is invoked.
     atomic_t pending;
 
-    /// @brief Флаг наличия ошибки в любом из trn_p_rq
-    /// @details Устанавливается атомарно через atomic_xchg — только
-    /// первая ошибка записывается в поле status.
+    /// @brief Flag indicating if an error occurred in any trn_p_rq
+    /// @details Set atomically via atomic_xchg — only
+    /// the first encountered error is recorded into the status field.
     atomic_t failed;
 
-    /// @brief Итоговый статус запроса, возвращаемый в orig_bio
+    /// @brief Final status of the request returned to orig_bio
     blk_status_t status;
 
-    /// @brief Список всех trn_p_rq данного запроса
-    /// @details Валиден только до вызова trn_rq_submit.
+    /// @brief List of all trn_p_rq instances for this request
+    /// @details Valid only until trn_rq_submit is called.
     struct list_head parts;
 };
 
