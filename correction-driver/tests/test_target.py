@@ -3,7 +3,7 @@
 import pytest
 
 from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
-from harness import capacity, run
+from harness import DATA_SECTORS, BlockDevice, capacity, pattern, run
 
 
 @pytest.fixture
@@ -47,3 +47,20 @@ def test_table_shows_the_lower_device(lower):
     assert create(f"0 {capacity(sectors)} corrdm {path}").returncode == 0
     fields = run("dmsetup", "table", UPPER_NAME).stdout.split()
     assert len(fields) == 4, fields
+
+
+@pytest.mark.xfail(strict=True, reason="TODO.md: A target that does not start at sector 0 uses wrong sectors")
+def test_target_may_start_after_sector_0(lower):
+    path, sectors = lower
+    start = DATA_SECTORS * 8
+    table = f"0 {start} zero\n{start} {capacity(sectors)} corrdm {path}"
+    assert create(table).returncode == 0
+    data = pattern(1, DATA_SECTORS)
+    upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+    below = BlockDevice(path)
+    try:
+        upper.write(start, data)
+        assert below.read(0, DATA_SECTORS) == data
+    finally:
+        upper.close()
+        below.close()

@@ -2,28 +2,14 @@
 
 import pytest
 
-from harness import SECTOR_SIZE, run
+from harness import SECTOR_SIZE, fio
 
 LOWER_MIB = 512
 BLOCK_SIZES = ["512", "4k", "16k", "32k", "64k", "128k", "1m"]
 
-FIO_SECONDS = 300
 OVERLAP_MIB = 64
 OVERLAP_RUNTIME = 20
 OVERLAP_IODEPTH = 32
-
-
-def fio(path, timeout=FIO_SECONDS, **options):
-    defaults = {
-        "name": "load",
-        "filename": path,
-        "direct": 1,
-        "ioengine": "libaio",
-        "group_reporting": 1,
-    }
-    arguments = [f"--{key}={value}" for key, value in (defaults | options).items()]
-    result = run("fio", *arguments, timeout=timeout, check=False)
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def fio_verify(path, **options):

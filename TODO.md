@@ -12,21 +12,26 @@ in a run, **From reading** means it was only found in the code.
 
 ## Memory and locking
 
-- **A failed allocation of `req` loses the bio.** From reading: when `kzalloc` fails at the start of
-  `trn_rq_init`, it returns NULL without ending the bio, and `dm_map` returns `DM_MAPIO_SUBMITTED`,
-  so the I/O never completes. The comment on `dm_map` says the bio is already completed. The other
-  `kzalloc` and `alloc_page` calls on the I/O path have no mempool, so under memory pressure they
-  either give `BLK_STS_IOERR` or stall in reclaim. Fix: `per_io_data_size` and mempools.
-- **No limit on requests in flight.** From reading: `dm_map` allocates everything for every chunk
-  and returns, and a bio-based DM device has no request queue with tags, so only the submitters
-  limit the load (`iodepth`, the dirty page limit). Each chunk takes a whole page for metadata plus
-  structures and 2-3 bios, so writes of 4 KiB need more memory than the data they carry. Flushing
-  1 GiB of dirty pages can need over 1 GiB, just when memory is short. Fix: a limit on parts in flight, where `dm_map` waits, together with the mempools.
-- **Several bios from one bioset in one context.** From reading: `trn_rq_init` allocates 2-3
-  bios per chunk from `transform_bs` (128 reserved) in `dm_map`, before submitting any.
-  A 1 MiB request needs over 500. Under memory pressure this can wait for bios that are
-  never freed, because they are not submitted yet. Fix: allocate in the worker, or
-  one bioset per kind of bio.
+- **A failed allocation of `req` loses the bio.** Confirmed with `failslab`: when `kzalloc` fails at
+  the start of `trn_rq_init`, it returns NULL without ending the bio, and `dm_map` returns
+  `DM_MAPIO_SUBMITTED`, so the I/O never completes and the task stays in state D. The comment on
+  `dm_map` says the bio is already completed. Confirmed with `failslab` and `fail_page_alloc`: the other
+  `kzalloc` and `alloc_page` calls on the I/O path have no mempool, so a failed one gives
+  `BLK_STS_IOERR`. The device stays consistent and KASAN is silent. From reading: small `GFP_NOIO`
+  allocations may stall in reclaim rather than fail. Fix: `per_io_data_size` and mempools.
+- **No limit on requests in flight.** Confirmed: `fio` with `bs=1m`, `numjobs=8`, `iodepth=128` takes
+  1179 MiB of available memory on the lower device and 2475 MiB through the driver, on the debug
+  kernel. `dm_map` allocates everything for every chunk and returns, and a bio-based DM device has no
+  request queue with tags, so only the submitters limit the load. Each chunk takes a whole page for
+  metadata plus structures and 2-3 bios, so writes of 4 KiB need more memory than the data they carry.
+  Fix: a limit on parts in flight, where `dm_map` waits, together with the mempools. The wait must be
+  in `dm_map`: workers sleeping on it would block the `complete_work` that releases it.
+- **Several bios from one bioset in one context.** Confirmed with `failslab` on `bio_alloc_bioset`:
+  `trn_rq_init` allocates 2-3 bios per chunk from `transform_bs` (128 reserved) in `dm_map`, before
+  submitting any, so a write of 1 MiB uses up the reserve and waits in `mempool_alloc` for bios it holds
+  itself. It goes on when allocations succeed again, so this is a stall for as long as memory is short,
+  and a deadlock only if memory cannot be freed without this I/O. Fix: let DM split the requests, and
+  embed the metadata bio in the part.
 - **`dm_map` reads `bio` after it may have completed.** From reading: when `trn_rq_init` returns
   NULL, the bio may already have been ended, and `DM_ERR` then reads its fields.
 - **`check_crc` reads `md` after `kunmap_local`.** From reading: the `DM_ERR` on a mismatch
@@ -74,6 +79,9 @@ in a run, **From reading** means it was only found in the code.
 - **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 corrdm` with no
   arguments, as there is no `.status`, so the table cannot be saved and reloaded. `.status` is
   also the natural place for counters such as CRC mismatches, which do not exist today.
+- **A target that does not start at sector 0 uses wrong sectors.** Confirmed: with a table that puts
+  `corrdm` at sector 2048, a write to its first sector lands on sector 2304 of the lower device, not 0.
+  `dm_map` uses `bi_sector` as it is, without `dm_target_offset`. Fix along with DM splitting the requests.
 - **The table length is ignored.** Confirmed: `dm_ctr` overwrites `ti->len` (16777216 requested,
   14913080 used). Fix: require a correct length, return an error otherwise, and print the
   right value with a helper command.
@@ -110,8 +118,7 @@ Carried over from the previous list.
 - **Tests that do not exist yet:**
   - lower device errors, through `dm-flakey` and `dm-dust`;
   - lifecycle: removal under load, unloading the module, leaks through kmemleak;
-  - crash consistency: `dm-log-writes`;
-  - memory pressure: buffered writes larger than the memory of the VM, once the hang is fixed.
+  - crash consistency: `dm-log-writes`.
 - **`sparse` does not run.** The kernel requires `__typeof_unqual__`, which sparse 0.6.4 from
   Fedora does not support, so `make check` prints a warning and skips it. It takes a build from
   upstream sources.
@@ -136,8 +143,9 @@ Carried over from the previous list.
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
    lifecycle, `sparse`.
 2. **Memory and locking.** Clean up the rest of [Memory and locking](#memory-and-locking): the bioset,
-   the mempools and the limit on requests in flight, the remaining use of freed data. Done when that
-   section is empty and the memory pressure test passes.
+   the mempools and the limit on requests in flight, the remaining use of freed data. DM splits the
+   requests and `trn_rq` goes away; the planned cache will replace pairing upper and lower bios, so keep
+   this simple. Done when that section is empty and the tests in `test_memory.py` pass.
 3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.
 4. **Device Mapper integration and docs.** `.status` with counters, table length, queue limits,

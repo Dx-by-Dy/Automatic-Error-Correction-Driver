@@ -1,6 +1,6 @@
 # Driver tests
 
-144 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+164 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [CLAUDE.md](../../CLAUDE.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,10 +8,11 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all but known_hang: 144 tests, about 16 minutes
-deploy/vm.sh test -m "not slow"                       # the fast ones: 113 tests, about 1 minute
+deploy/vm.sh test                                     # all but known_hang: 163 tests, about 18 minutes
+deploy/vm.sh test -m "not slow"                       # the fast ones: 130 tests, about 2 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
+deploy/vm.sh test -m known_hang                       # hangs the guest on purpose
 ```
 
 `deploy/vm.sh test` copies the working tree to the VM, rebuilds and reloads the driver, then runs
@@ -105,7 +106,7 @@ Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace even
 | `test_fsync_on_the_lower_device_flushes` | 1 | Control: this way of counting does see flushes |
 | `test_fsync_on_the_device_flushes` | 1 | **xfail**: fsync does not reach the lower device |
 
-### `test_target.py`: arguments and table of the target (6 tests)
+### `test_target.py`: arguments and table of the target (7 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
@@ -113,6 +114,7 @@ Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace even
 | `test_device_takes_the_usable_length` | 1 | A table with the correct length gives a device of that size |
 | `test_too_long_a_device_is_rejected` | 1 | **xfail**: The table length is ignored |
 | `test_table_shows_the_lower_device` | 1 | **xfail**: `dmsetup table` does not show the device |
+| `test_target_may_start_after_sector_0` | 1 | **xfail**: A target that does not start at sector 0 uses wrong sectors |
 
 ### `test_filesystem.py`: files survive on a filesystem (2 tests, `slow`)
 
@@ -129,6 +131,19 @@ Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace even
 | `test_jobs_competing_within_the_worker_limit` | 6 | 20 seconds of `write` and `randwrite` on a shared area, `bs`/`numjobs` of `4k/8`, `16k/8`, `4k/32`; then the whole area must read without a CRC error |
 | `test_reads_and_writes_competing` | 3 | The same with `randrw`, `bs` of `512`, `4k`, `32k`, 8 jobs: a read that meets a write in a chunk must not get a CRC error |
 | `test_jobs_competing_beyond_the_worker_limit` | 6 | The same as the first with `32k/8`, `16k/32`, `1m/8`: more items than the workqueue runs at a time, which hangs if a worker ever sleeps on a chunk |
+
+### `test_memory.py`: I/O when memory is short (20 tests)
+
+Failures come from the kernel's fault injection (`failslab`, `fail_page_alloc`), limited to one thread and to
+allocations whose stack passes through given code. See "Memory and locking" in `TODO.md`.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_failed_first_allocation_keeps_the_bio` | 1 | **known_hang**: a read goes on when the allocation of `req` fails. Today the bio is lost |
+| `test_failed_allocation_does_not_fail_the_io` | 4 | **xfail**: `read`, `write` with `failslab`, `fail_page_alloc` on one allocation in `trn_p_rq_init`: no error and correct data |
+| `test_failed_allocation_leaves_the_device_usable` | 12 | One failure at a varying place, which must have happened: the request is correct or reports an error, and the device reads without a CRC error |
+| `test_write_goes_on_with_only_the_bio_reserve` | 1 | **xfail**, `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
+| `test_memory_of_requests_in_flight_is_limited` | 1 | **xfail**, `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device |
 
 ## What is not tested yet
 

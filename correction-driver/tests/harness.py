@@ -8,6 +8,7 @@ import subprocess
 HANG_FILE = "/run/corrdm-tests.hung"
 HANG_EXIT_CODE = 3
 KILL_GRACE_SECONDS = 20
+FIO_SECONDS = 300
 
 SECTOR_SIZE = 512
 DATA_SECTORS = 8
@@ -84,6 +85,19 @@ def run(*cmd, timeout=120, check=True, stdin=None):
     if check:
         result.check_returncode()
     return result
+
+
+def fio(path, timeout=FIO_SECONDS, **options):
+    defaults = {
+        "name": "load",
+        "filename": path,
+        "direct": 1,
+        "ioengine": "libaio",
+        "group_reporting": 1,
+    }
+    arguments = [f"--{key}={value}" for key, value in (defaults | options).items()]
+    result = run("fio", *arguments, timeout=timeout, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class BlockDevice:
