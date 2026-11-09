@@ -12,14 +12,14 @@ CPUS=${CORRDM_CPUS:-6}
 MEMORY=${CORRDM_MEMORY:-8G}
 ROOT_SIZE=${CORRDM_ROOT_SIZE:-40G}
 TEST_DISK_SIZE=${CORRDM_TEST_DISK_SIZE:-8G}
-TEST_TIMEOUT=${CORRDM_TEST_TIMEOUT:-600}
+TEST_TIMEOUT=${CORRDM_TEST_TIMEOUT:-1800}
+REINIT_TIMEOUT=300
 
 GUEST_USER=$(id -un)
 SSH_CONFIG=$VM_DIR/ssh_config
 PID_FILE=$VM_DIR/vm.pid
 RELEASES_URL=https://fedoraproject.org/releases.json
-KERNEL_ARGS="console=ttyS0,115200 kmemleak=on kasan_multi_shot"
-KERNEL_REPORTS='BUG:|WARNING:|Oops|UBSAN:|blocked for more than|Kernel panic|possible circular locking'
+KERNEL_ARGS="console=ttyS0,115200 kmemleak=on kasan_multi_shot log_buf_len=16M"
 
 log() { echo "==> $*"; }
 die() { echo "error: $*" >&2; exit 1; }
@@ -32,17 +32,19 @@ Usage: deploy/vm.sh COMMAND
   provision     Update the guest and boot its newest debug kernel (safe to repeat)
   start         Start the VM and wait for SSH
   stop          Shut the VM down, forcing it off if it does not respond
+  reset         Power the VM off at once and start it again, for a stuck kernel
   status        Show the state of the VM and the driver
   ssh [CMD]     Open a shell in the VM or run CMD there
   sync          Copy the working tree to ~/corrdm in the VM
   reinit [-d]   Sync, rebuild and reload the driver, recreate the device (-d: debug build)
-  test          Reinit, run the tests, fail on kernel reports; logs go to VM_DIR/logs
+  test [ARGS]   Reinit and run the tests, with optional pytest ARGS; logs go to VM_DIR/logs
+  check         Sync and run the static checks of the driver
   destroy --yes Stop the VM and delete VM_DIR
 
 Environment (defaults in brackets):
   CORRDM_VM_DIR [$HOME/vms/corrdm]  CORRDM_SSH_PORT [2225]  CORRDM_CPUS [6]
   CORRDM_MEMORY [8G]  CORRDM_ROOT_SIZE [40G]  CORRDM_TEST_DISK_SIZE [8G]
-  CORRDM_TEST_TIMEOUT [600]
+  CORRDM_TEST_TIMEOUT [1800]
 EOF
 }
 
@@ -69,6 +71,8 @@ Host corrdm
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
   LogLevel ERROR
+  ServerAliveInterval 15
+  ServerAliveCountMax 4
 EOF
 }
 
@@ -158,7 +162,7 @@ cmd_provision() {
     log "Updating the guest and installing the debug kernel (several minutes)"
     gssh "sudo dnf -y -q upgrade --refresh && sudo dnf -y -q install kernel-debug kernel-debug-devel \
         gcc make fio device-mapper e2fsprogs xfsprogs rsync python3 dwarves elfutils-libelf-devel \
-        strace trace-cmd sysstat tmux"
+        strace trace-cmd sysstat tmux python3-pytest"
     gssh "kernel=\$(ls /boot/vmlinuz-*+debug | sort -V | tail -1) &&
         sudo grubby --set-default \"\$kernel\" &&
         sudo grubby --update-kernel \"\$kernel\" --args='$KERNEL_ARGS'"
@@ -209,6 +213,16 @@ cmd_stop() {
     kill "$(cat "$PID_FILE")"
 }
 
+cmd_reset() {
+    require_vm
+    if vm_running; then
+        log "Powering the VM off"
+        kill -9 "$(cat "$PID_FILE")"
+        while vm_running; do sleep 1; done
+    fi
+    cmd_start
+}
+
 cmd_status() {
     require_vm
     if ! vm_running; then echo "VM: stopped ($VM_DIR)"; return 0; fi
@@ -237,38 +251,42 @@ cmd_sync() {
 cmd_reinit() {
     cmd_sync
     log "Rebuilding the driver and recreating the device"
-    gssh "sudo corrdm/deploy/corrdm_reinit.sh $*"
+    timeout "$REINIT_TIMEOUT" ssh -F "$SSH_CONFIG" corrdm "sudo corrdm/deploy/corrdm_reinit.sh $*" \
+        || die "reinit failed; if the kernel is stuck after a hang, run: deploy/vm.sh reset"
 }
 
 cmd_test() {
     cmd_reinit
-    local stamp output kernel_log rc=0 reports
+    local stamp output kernel_log rc=0 arguments=""
     stamp=$(date +%Y%m%d-%H%M%S)
     mkdir -p "$VM_DIR/logs"
     output=$VM_DIR/logs/$stamp-tests.out
     kernel_log=$VM_DIR/logs/$stamp-dmesg.log
+    [ $# -eq 0 ] || arguments=$(printf ' %q' "$@")
 
     log "Running tests, timeout ${TEST_TIMEOUT}s"
     gssh 'sudo dmesg -C'
     timeout "$TEST_TIMEOUT" ssh -F "$SSH_CONFIG" corrdm \
-        'cd corrdm/correction-driver/tests && sudo python3 tests.py' 2>&1 | tee "$output" || rc=${PIPESTATUS[0]}
+        "sudo corrdm/deploy/run_tests.sh$arguments" \
+        2>&1 | tee "$output" || rc=${PIPESTATUS[0]}
     if [ "$rc" -eq 124 ]; then
         echo "error: tests did not finish in ${TEST_TIMEOUT}s, the guest may be hung; see $VM_DIR/serial.log" >&2
     fi
 
     timeout 30 ssh -F "$SSH_CONFIG" -o ConnectTimeout=5 corrdm 'sudo dmesg' > "$kernel_log" \
         || echo "error: could not read the kernel log, see $VM_DIR/serial.log" >&2
-    reports=$(grep -E "$KERNEL_REPORTS" "$kernel_log" | sed -E 's/^\[[^]]*\] //; s/kworker[^ ]*//; s/CPU#[0-9]+//' \
-        | cut -c1-100 | sort | uniq -c | sort -rn || true)
-
     log "Logs: $output, $kernel_log"
-    if [ -n "$reports" ]; then
-        echo "Kernel reports during the tests:"
-        echo "$reports"
-        [ "$rc" -ne 0 ] || rc=1
+    if [ "$rc" -eq 3 ]; then
+        echo "The tests found a hang and left the VM as it is. Look around with deploy/vm.sh ssh," >&2
+        echo "the blocked tasks and busy workqueues are in the kernel log. Recover with deploy/vm.sh reset." >&2
     fi
     if [ "$rc" -eq 0 ]; then log "PASSED"; else log "FAILED"; fi
     exit "$rc"
+}
+
+cmd_check() {
+    cmd_sync
+    gssh 'cd corrdm/correction-driver && sudo make check'
 }
 
 cmd_destroy() {
@@ -287,11 +305,13 @@ case $command in
     provision) cmd_provision ;;
     start) cmd_start ;;
     stop) cmd_stop ;;
+    reset) cmd_reset ;;
     status) cmd_status ;;
     ssh) require_running; gssh "$@" ;;
     sync) cmd_sync ;;
     reinit) cmd_reinit "$@" ;;
-    test) cmd_test ;;
+    test) cmd_test "$@" ;;
+    check) cmd_check ;;
     destroy) cmd_destroy "$@" ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 2 ;;

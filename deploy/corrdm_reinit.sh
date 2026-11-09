@@ -10,9 +10,12 @@ fi
 
 cd "$(dirname "$(readlink -f "$0")")/../correction-driver"
 
-if dmsetup info corrdm >/dev/null 2>&1; then
-    dmsetup remove corrdm
-fi
+# The test devices stay behind when a test run was cut short.
+for device in corrdm corrdm-test corrdm-test-lower; do
+    if dmsetup info "$device" >/dev/null 2>&1; then
+        dmsetup remove "$device"
+    fi
+done
 if lsmod | grep -q '^correction_driver '; then
     rmmod correction_driver
 fi

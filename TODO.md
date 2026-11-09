@@ -1,7 +1,9 @@
 # TODO
 
 How the driver works is in [README.md](README.md) and `docs/`; how to build and
-run it is in [CLAUDE.md](CLAUDE.md). This file holds only what is not done yet.
+run it is in [CLAUDE.md](CLAUDE.md); the tests are described in
+[correction-driver/tests/README.md](correction-driver/tests/README.md). This file holds only what is
+not done yet.
 The order of work is in [Stages](#stages), at the end.
 
 Problems below were found at commit `086ef3c`, on Fedora 45 with kernel
@@ -23,12 +25,16 @@ in a run, **From reading** means it was only found in the code.
   An `rw_semaphore` is not meant for this; the kernel has no non-owner `up_write`. Fix: a chunk
   lock of our own (state and a list of waiting parts under a spinlock), where the part that
   releases the lock queues the next one.
-- **Workers can block the work that would release them.** From reading: `submit_work` sleeps
-  on the chunk lock in the same workqueue that runs `complete_work`, which releases it. If
-  all active workers wait on a lock whose owner's `complete_work` is still queued, I/O stops
-  for good. Many requests to one chunk should be enough. Not reproduced yet; the lock
-  above would fix this too. Worth a test first: a concurrent fio run on one chunk, more
-  in flight than `max_active`.
+- **Workers block the work that would release them.** Confirmed: this is the hang under load.
+  `submit_work` sleeps on the chunk lock in the same workqueue that runs `complete_work`, which
+  releases it. When all 1024 active workers (`WQ_DFL_ACTIVE`) wait on locks, the `complete_work`
+  items stay queued behind them and I/O stops for good, with nothing in flight on the lower
+  device. A request takes one item per 4 KiB chunk, so it takes more items than workers once
+  `numjobs * iodepth * chunks per request > 1024` on a shared area. With `numjobs=8` and
+  `iodepth=32`, `bs=16k` is exactly 1024 and passes, while `bs=32k` is 2048 and hangs. That is
+  why it appeared as `bs >= 32k`; `bs=16k` with `numjobs=32` hangs as well. Reproduce with
+  `deploy/vm.sh test -m known_hang -k "32k and write"`. Replacing the chunk lock as described
+  above fixes this too, as a worker then never sleeps on a chunk.
 - **Several bios from one bioset in one context.** From reading: `trn_rq_init` allocates 2-3
   bios per chunk from `transform_bs` (128 reserved) in `dm_map`, before submitting any.
   A 1 MiB request needs over 500. Under memory pressure this can wait for bios that are
@@ -54,9 +60,9 @@ in a run, **From reading** means it was only found in the code.
 - **A fresh device has to be zeroed by hand.** From reading: there is no superblock, format
   version or "never written" state. On a device with old contents every read fails, and
   `corrdm_reinit.sh` zeroes only the first 1 GiB.
-- **The CRC does not depend on the position.** From reading: the sector number is not part of
-  the CRC, so a misdirected write, or a chunk with its metadata copied elsewhere, passes the
-  check. Fix: mix the sector number into the seed.
+- **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
+  another chunk reads back without an error, as the sector number is not part of the CRC. A
+  misdirected write would pass the same way. Fix: mix the sector number into the seed.
 - **Data and CRC are not written atomically.** From reading: they are two independent bios, so
   after a power loss a chunk may have new data and an old CRC, and reads fail on data that
   is fine. It is the same when the metadata bio of a partial write fails after its data bio
@@ -105,9 +111,6 @@ The goal of the project; only detection exists today.
 
 Carried over from the previous list.
 
-- **Large blocks break invariants (`bs >= 32k`).** Not reproduced: fio verify with `randwrite`,
-  `iodepth=16`, `numjobs=1` and 128 MiB passes from 4k to 1m with no CRC mismatch. Which invariant
-  broke and under what load is not recorded; next, try `numjobs=8` and a filesystem.
 - **Benchmarks are not formalized.** `benchmarks.py` has hardcoded devices, test sets commented
   in and out by hand, and needs `pandas` and `matplotlib`. Numbers need a non-debug kernel.
 - **Move `first_sector` and `nr_sectors` into `struct trn_p_rq`.**
@@ -117,25 +120,16 @@ Carried over from the previous list.
 
 ## Tests and tooling
 
-- **`tests.py` cannot fail on undetected corruption.** From reading: when the read succeeds it
-  prints `ERROR: corruption not detected` and still exits 0. The output of fio is dropped as well.
-- **`tests.py` itself damages neighbouring sectors.** Confirmed: `corrupt_sector` uses a buffered
-  `dd` on `/dev/vdb`, while `clear_disk` has left zeros in the page cache. Zeroing sector 8 writes
-  the whole 4 KiB block back, wiping sectors 9-15, and untouched chunk 1 then fails to read.
-  Corruption must use `oflag=direct`.
-- **Tests that do not exist yet** (pytest, in the VM, one fixture per device):
-  - data: comparison with a reference copy, unaligned requests, chunk boundaries, end of the
-    device, sizes from 512 bytes to 1 MiB;
-  - corruption: every data and metadata sector, neighbouring chunks stay readable, a partial
-    write keeps the CRCs of its neighbours;
+- **Tests that do not exist yet:**
   - lower device errors, through `dm-flakey` and `dm-dust`;
-  - load: fio verify, and concurrent writes to one chunk;
-  - lifecycle: bad arguments, removal under load, unloading the module, leaks through kmemleak;
-  - filesystems: ext4 and xfs;
+  - lifecycle: removal under load, unloading the module, leaks through kmemleak;
   - crash consistency: `dm-log-writes`.
-- **No static checks.** A `make check` with `W=1`, `sparse` and `checkpatch`.
-- **`deploy/vm.sh test` fails today**, because of the kernel reports above. That is correct, and it
-  will not pass before the first items of [Memory and locking](#memory-and-locking) are fixed.
+- **`sparse` does not run.** The kernel requires `__typeof_unqual__`, which sparse 0.6.4 from
+  Fedora does not support, so `make check` prints a warning and skips it. It takes a build from
+  upstream sources.
+- **`make check` fails on 46 style findings from `checkpatch`.** Trailing whitespace, missing
+  newlines at the end of files, `sizeof` style and others; the indentation and brace style of the
+  project is excluded on purpose. `W=1` is clean.
 
 ## Documentation
 
@@ -153,11 +147,13 @@ Carried over from the previous list.
 
 ## Stages
 
-1. **Trustworthy tests.** Replace `tests.py` with the pytest suite, starting with data and corruption,
-   and add `make check`. Failures already known go in as `xfail` with a link to the item here.
-2. **Memory and locking.** Fix the use-after-free, replace the chunk lock so lockdep stays on, then
-   clean up the rest of [Memory and locking](#memory-and-locking). Done when `deploy/vm.sh test` is
-   clean under load, and the `bs >= 32k` question is answered.
+1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
+   are strict `xfail` or `known_hang`. What is left: lower device errors, lifecycle, `make check`
+   clean, `sparse`.
+2. **Memory and locking.** Fix the use-after-free, replace the chunk lock so lockdep stays on and the
+   hang is gone, then clean up the rest of [Memory and locking](#memory-and-locking). Done when
+   `KNOWN_KERNEL_REPORTS` in `tests/conftest.py` is empty and the `known_hang` tests pass as normal
+   tests.
 3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.
 4. **Device Mapper integration and docs.** `.status` with counters, table length, queue limits,
