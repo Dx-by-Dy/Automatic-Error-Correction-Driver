@@ -26,13 +26,13 @@ struct dm_context
 {
     /// @brief Lower-level device
     struct dm_dev *dev;
- 
+
     /// @brief Work queue for asynchronous bio processing
     struct workqueue_struct *transform_wq;
- 
+
     /// @brief Bio pool for allocation
     struct bio_set *transform_bs;
- 
+
     /// @brief Chunk lock table
     struct locker *locker;
 };

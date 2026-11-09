@@ -54,7 +54,7 @@ trn_rq_init(struct bio *orig_bio,
 
     struct trn_rq *req;
 
-    req = kzalloc(sizeof(*req), GFP_NOIO);
+    req = kzalloc_obj(*req, GFP_NOIO);
     if (!req)
     {
         DM_ERR("kzalloc failed\n");
@@ -70,6 +70,7 @@ trn_rq_init(struct bio *orig_bio,
     INIT_LIST_HEAD(&req->parts);
 
     bool last;
+
     do
     {
         struct bio *part_bio;
@@ -90,6 +91,7 @@ trn_rq_init(struct bio *orig_bio,
         }
 
         struct trn_p_rq *part = trn_p_rq_init(part_bio, req, dm_ctx, type);
+
         if (!part)
         {
             DM_ERR("trn_p_rq_init failed\n");
@@ -127,6 +129,7 @@ error:
     {
         struct trn_p_rq *p;
         struct trn_p_rq *tmp;
+
         list_for_each_entry_safe(p, tmp, &req->parts, list)
         {
             list_del(&p->list);

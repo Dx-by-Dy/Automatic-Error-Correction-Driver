@@ -24,7 +24,7 @@ trn_mr_rq_init(struct trn_p_rq *part,
     int r;
     struct trn_mr_rq *meta;
 
-    meta = kzalloc(sizeof(*meta), GFP_NOIO);
+    meta = kzalloc_obj(*meta, GFP_NOIO);
     if (!meta)
     {
         DM_ERR("kzalloc failed\n");
@@ -118,6 +118,7 @@ void check_crc(struct trn_mr_rq *meta)
         while (bvec_pos < bvec.bv_len)
         {
             unsigned int len = min(bvec.bv_len - bvec_pos, SECTOR_SIZE - in_sector_pos);
+
             current_crc = crc64_be(current_crc, addr + bvec.bv_offset + bvec_pos, len);
 
             bvec_pos += len;

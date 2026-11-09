@@ -195,7 +195,7 @@ trn_p_rq_init(struct bio *part_bio,
 
     struct trn_p_rq *part;
 
-    part = kzalloc(sizeof(*part), GFP_NOIO);
+    part = kzalloc_obj(*part, GFP_NOIO);
     if (!part)
     {
         DM_ERR("kzalloc failed\n");

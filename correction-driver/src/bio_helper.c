@@ -16,7 +16,7 @@
 /// Expected execution context - process.
 /// @param bio Pointer to store the created bio
 /// @param page Memory page to bind to bio
-/// @param offset Offset within the page
+/// @param offset Position within the page
 /// @param dm_ctx Driver context
 /// @param private_data User data for bi_private
 /// @param sector Metadata sector to bind to bio

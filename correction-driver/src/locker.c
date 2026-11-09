@@ -62,7 +62,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
     }
     rcu_read_unlock();
 
-    lock = kzalloc(sizeof(*lock), GFP_NOIO);
+    lock = kzalloc_obj(*lock, GFP_NOIO);
     if (!lock)
     {
         DM_ERR("kzalloc failed\n");
@@ -106,7 +106,7 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
 /// Guarantees safe deletion even with concurrent access.
 /// @param locker Lock table
 /// @param index Lock index
-/// @param lock Lock
+/// @param lock The lock to release a reference to
 void locker_put_lock(struct locker *locker,
                      unsigned long index,
                      struct lock *lock)

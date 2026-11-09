@@ -40,27 +40,27 @@ struct trn_mw_rq
     /// @brief Bio for reading old chunk metadata from disk
     /// @details Exists only when chunk_full == false.
     struct bio *read_bio;
- 
+
     /// @brief Bio for writing updated chunk metadata to disk
     struct bio *write_bio;
- 
+
     /// @brief Reference to the parent struct trn_p_rq for chunk transformation
     struct trn_p_rq *part;
- 
+
     /// @brief Index of the first data sector of the chunk from which trn_p_rq starts.
     /// Used to compute corresponding metadata for the request.
     u8 first_sector;
- 
+
     /// @brief Number of data sectors in trn_p_rq.
     /// Used to compute corresponding metadata for the request.
     u8 nr_sectors;
- 
+
     /// @brief Memory page to store chunk metadata
     /// @details When chunk_full == false the page is divided into two parts:
     /// first — new metadata for writing,
     /// second — old metadata read from disk.
     struct page *page;
- 
+
     /// @brief Flag indicating full chunk write
     /// @details If true — request covers all DATA_SIZE_SECTORS sectors of the chunk,
     /// otherwise — false.

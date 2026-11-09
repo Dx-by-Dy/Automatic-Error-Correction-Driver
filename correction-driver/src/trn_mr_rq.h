@@ -21,22 +21,22 @@ struct trn_mr_rq
 {
     /// @brief Bio for reading chunk metadata from disk.
     struct bio *read_bio;
- 
+
     /// @brief Reference to the parent struct trn_p_rq for chunk transformation
     struct trn_p_rq *part;
- 
+
     /// @brief Index of the first data sector of the chunk from which trn_p_rq starts.
     /// Used to compute corresponding metadata for the request.
     u8 first_sector;
- 
+
     /// @brief Number of data sectors in trn_p_rq.
     /// Used to compute corresponding metadata for the request.
     u8 nr_sectors;
- 
+
     /// @brief Memory page to store read chunk metadata
     /// @details Used as a buffer for read_bio.
     struct page *metadata_page;
- 
+
     /// @brief Saved iter for bio from struct trn_p_rq
     /// @details Used to extract data from bio after its return
     /// from the lower level and for further data analysis and CRC verification from metadata_page.

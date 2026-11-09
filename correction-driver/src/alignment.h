@@ -40,6 +40,7 @@ static inline sector_t sectors_until_datachunk_end(sector_t sector)
 static inline sector_t start_data_sector(sector_t sector)
 {
     sector_t align_sector = align_data_sector(sector);
+
     return align_sector - (align_sector % CHUNK_SIZE_SECTORS);
 }
 

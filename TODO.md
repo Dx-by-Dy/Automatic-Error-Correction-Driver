@@ -127,9 +127,6 @@ Carried over from the previous list.
 - **`sparse` does not run.** The kernel requires `__typeof_unqual__`, which sparse 0.6.4 from
   Fedora does not support, so `make check` prints a warning and skips it. It takes a build from
   upstream sources.
-- **`make check` fails on 46 style findings from `checkpatch`.** Trailing whitespace, missing
-  newlines at the end of files, `sizeof` style and others; the indentation and brace style of the
-  project is excluded on purpose. `W=1` is clean.
 
 ## Documentation
 
@@ -148,8 +145,8 @@ Carried over from the previous list.
 ## Stages
 
 1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
-   are strict `xfail` or `known_hang`. What is left: lower device errors, lifecycle, `make check`
-   clean, `sparse`.
+   are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
+   lifecycle, `sparse`.
 2. **Memory and locking.** Fix the use-after-free, replace the chunk lock so lockdep stays on and the
    hang is gone, then clean up the rest of [Memory and locking](#memory-and-locking). Done when
    `KNOWN_KERNEL_REPORTS` in `tests/conftest.py` is empty and the `known_hang` tests pass as normal

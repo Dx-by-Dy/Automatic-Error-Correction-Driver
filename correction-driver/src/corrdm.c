@@ -100,7 +100,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     struct dm_context *dm_ctx;
     int r;
 
-    dm_ctx = kzalloc(sizeof(*dm_ctx), GFP_KERNEL);
+    dm_ctx = kzalloc_obj(*dm_ctx, GFP_KERNEL);
     if (!dm_ctx)
     {
         ti->error = "dm_context alloc failed";
@@ -108,7 +108,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         return -ENOMEM;
     }
 
-    dm_ctx->locker = kzalloc(sizeof(*dm_ctx->locker), GFP_KERNEL);
+    dm_ctx->locker = kzalloc_obj(*dm_ctx->locker, GFP_KERNEL);
     if (!dm_ctx->locker)
     {
         ti->error = "locker alloc failed";
@@ -128,7 +128,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_alloc_workqueue;
     }
 
-    dm_ctx->transform_bs = kzalloc(sizeof(struct bio_set), GFP_KERNEL);
+    dm_ctx->transform_bs = kzalloc_obj(*dm_ctx->transform_bs, GFP_KERNEL);
     if (!dm_ctx->transform_bs)
     {
         ti->error = "bio_set alloc failed";

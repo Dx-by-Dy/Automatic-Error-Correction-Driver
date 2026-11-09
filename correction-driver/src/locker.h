@@ -30,14 +30,14 @@ struct lock
 {
     /// @brief Read-write semaphore for protecting the chunk
     struct rw_semaphore sem;
- 
+
     /// @brief Reference counter for lifetime management
     /// @details
     /// If refcnt == 0, the lock is considered dead and will be deleted.
     ///
     /// It is guaranteed that while present in struct locker, refcnt > 0.
     refcount_t refcnt;
- 
+
     /// @brief RCU head for deferred memory release
     struct rcu_head rcu;
 };

@@ -25,6 +25,7 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 
     struct bio_vec bvec;
     struct bvec_iter iter;
+
     bio_for_each_segment(bvec, bio, iter)
     {
         void *addr = kmap_local_page(bvec.bv_page);
@@ -33,6 +34,7 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
         while (bvec_pos < bvec.bv_len)
         {
             unsigned int len = min(bvec.bv_len - bvec_pos, SECTOR_SIZE - in_sector_pos);
+
             current_crc = crc64_be(current_crc, addr + bvec.bv_offset + bvec_pos, len);
 
             bvec_pos += len;
@@ -88,7 +90,7 @@ trn_mw_rq_init(struct trn_p_rq *part,
     int r;
     struct trn_mw_rq *meta;
 
-    meta = kzalloc(sizeof(*meta), GFP_NOIO);
+    meta = kzalloc_obj(*meta, GFP_NOIO);
     if (!meta)
     {
         DM_ERR("kzalloc failed\n");
@@ -170,8 +172,7 @@ trn_mw_rq_init(struct trn_p_rq *part,
 /// @param meta Metadata transformation structure
 void complete_trn_mw_rq(struct trn_mw_rq *meta)
 {
-    DM_DEBUG("meta=%p write_bio=%p chunk_full=%d "
-             "first_sector=%u nr_sectors=%u\n",
+    DM_DEBUG("meta=%p write_bio=%p chunk_full=%d first_sector=%u nr_sectors=%u\n",
              meta, meta->write_bio, meta->chunk_full,
              meta->first_sector, meta->nr_sectors);
 

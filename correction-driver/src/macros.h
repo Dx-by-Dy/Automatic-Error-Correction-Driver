@@ -47,12 +47,6 @@
     } while (0)
 
 #else
-#define DM_DEBUG(fmt, ...) \
-    do                     \
-    {                      \
-    } while (0)
-#define DM_DEBUG_BIO(bio) \
-    do                    \
-    {                     \
-    } while (0)
+#define DM_DEBUG(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+#define DM_DEBUG_BIO(bio) ((void)(bio))
 #endif
