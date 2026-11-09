@@ -34,8 +34,6 @@ in a run, **From reading** means it was only found in the code.
   embed the metadata bio in the part.
 - **`dm_map` reads `bio` after it may have completed.** From reading: when `trn_rq_init` returns
   NULL, the bio may already have been ended, and `DM_ERR` then reads its fields.
-- **`check_crc` reads `md` after `kunmap_local`.** From reading: the `DM_ERR` on a mismatch
-  uses `md` after it was unmapped. Harmless on x86_64 without highmem, still wrong.
 
 ## Integrity and durability
 

@@ -105,6 +105,7 @@ void check_crc(struct trn_mr_rq *meta)
     struct chunk_metadata *md = kmap_local_page(meta->metadata_page);
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
+    u64 expected_crc = 0;
     unsigned int in_sector_pos = 0;
     bool crc_error = false;
     struct bvec_iter iter = meta->saved_iter;
@@ -135,6 +136,7 @@ void check_crc(struct trn_mr_rq *meta)
                 if (md->crc[sector_idx++] != cpu_to_le64(current_crc))
                 {
                     crc_error = true;
+                    expected_crc = le64_to_cpu(md->crc[sector_idx - 1]);
                     kunmap_local(addr);
                     goto out;
                 }
@@ -155,7 +157,7 @@ out:
         DM_ERR("CRC mismatch at sector %llu (+%u on chunk): expected_crc=%llu, computed_crc=%llu\n",
                (unsigned long long)(meta->part->index + sector_idx - 1),
                sector_idx - 1,
-               (unsigned long long)le64_to_cpu(md->crc[sector_idx - 1]),
+               (unsigned long long)expected_crc,
                (unsigned long long)current_crc);
 
         if (!atomic_xchg(&req->failed, 1))
