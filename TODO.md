@@ -12,28 +12,22 @@ in a run, **From reading** means it was only found in the code.
 
 ## Memory and locking
 
-- **A failed allocation of `req` loses the bio.** Confirmed with `failslab`: when `kzalloc` fails at
-  the start of `trn_rq_init`, it returns NULL without ending the bio, and `dm_map` returns
-  `DM_MAPIO_SUBMITTED`, so the I/O never completes and the task stays in state D. The comment on
-  `dm_map` says the bio is already completed. Confirmed with `failslab` and `fail_page_alloc`: the other
-  `kzalloc` and `alloc_page` calls on the I/O path have no mempool, so a failed one gives
-  `BLK_STS_IOERR`. The device stays consistent and KASAN is silent. From reading: small `GFP_NOIO`
-  allocations may stall in reclaim rather than fail. Fix: `per_io_data_size` and mempools.
+- **Allocations on the I/O path have no reserve.** Confirmed with `failslab` and `fail_page_alloc`: the
+  `kzalloc` and `alloc_page` calls for the metadata of a part, and those for the chunk lock and its
+  xarray nodes, have no mempool, so a failed one gives `BLK_STS_IOERR`. The device stays consistent and
+  KASAN is silent. From reading: small `GFP_NOIO` allocations may stall in reclaim rather than fail.
+  Fix: embed the metadata bio in the part, a page mempool, and a chunk lock table allocated in `dm_ctr`.
 - **No limit on requests in flight.** Confirmed: `fio` with `bs=1m`, `numjobs=8`, `iodepth=128` takes
   1179 MiB of available memory on the lower device and 2475 MiB through the driver, on the debug
   kernel. `dm_map` allocates everything for every chunk and returns, and a bio-based DM device has no
   request queue with tags, so only the submitters limit the load. Each chunk takes a whole page for
-  metadata plus structures and 2-3 bios, so writes of 4 KiB need more memory than the data they carry.
+  metadata plus structures and 1-2 bios, so writes of 4 KiB need more memory than the data they carry.
   Fix: a limit on parts in flight, where `dm_map` waits, together with the mempools. The wait must be
   in `dm_map`: workers sleeping on it would block the `complete_work` that releases it.
-- **Several bios from one bioset in one context.** Confirmed with `failslab` on `bio_alloc_bioset`:
-  `trn_rq_init` allocates 2-3 bios per chunk from `transform_bs` (128 reserved) in `dm_map`, before
-  submitting any, so a write of 1 MiB uses up the reserve and waits in `mempool_alloc` for bios it holds
-  itself. It goes on when allocations succeed again, so this is a stall for as long as memory is short,
-  and a deadlock only if memory cannot be freed without this I/O. Fix: let DM split the requests, and
-  embed the metadata bio in the part.
-- **`dm_map` reads `bio` after it may have completed.** From reading: when `trn_rq_init` returns
-  NULL, the bio may already have been ended, and `DM_ERR` then reads its fields.
+- **A partial write takes two bios from one bioset.** From reading: `trn_mw_rq_init` allocates both
+  `read_bio` and `write_bio` from `transform_bs`. If all 128 reserved bios are held by parts waiting for
+  their second one, none can go on. Whole chunk writes take one, and a large write now goes on with only
+  the reserves. Fix: embed the metadata bio in the part.
 
 ## Integrity and durability
 
@@ -77,9 +71,6 @@ in a run, **From reading** means it was only found in the code.
 - **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 corrdm` with no
   arguments, as there is no `.status`, so the table cannot be saved and reloaded. `.status` is
   also the natural place for counters such as CRC mismatches, which do not exist today.
-- **A target that does not start at sector 0 uses wrong sectors.** Confirmed: with a table that puts
-  `corrdm` at sector 2048, a write to its first sector lands on sector 2304 of the lower device, not 0.
-  `dm_map` uses `bi_sector` as it is, without `dm_target_offset`. Fix along with DM splitting the requests.
 - **The table length is ignored.** Confirmed: `dm_ctr` overwrites `ti->len` (16777216 requested,
   14913080 used). Fix: require a correct length, return an error otherwise, and print the
   right value with a helper command.
@@ -97,8 +88,8 @@ The goal of the project; only detection exists today.
 - **No design yet:** which code, what it corrects (bits, a sector, a whole chunk), where the
   redundancy lives and how much space it takes, and how it combines with the CRC.
 - **Recovery path:** the entry point is marked in `check_crc`. It needs a retry of the read,
-  rewriting the fixed data, and counters. This depends on copying `orig_bio` so a whole request
-  can be retried.
+  rewriting the fixed data, and counters. The clone of a chunk is ours until `bio_endio`, with its
+  iterator saved in `saved_iter`, so a read can be submitted again from `complete_work`.
 
 ## Optimization and cleanup
 
@@ -141,9 +132,8 @@ Carried over from the previous list.
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
    lifecycle, `sparse`.
 2. **Memory and locking.** Clean up the rest of [Memory and locking](#memory-and-locking): the bioset,
-   the mempools and the limit on requests in flight, the remaining use of freed data. DM splits the
-   requests and `trn_rq` goes away; the planned cache will replace pairing upper and lower bios, so keep
-   this simple. Done when that section is empty and the tests in `test_memory.py` pass.
+   the mempools and the limit on requests in flight. The planned cache will replace pairing upper and
+   lower bios, so keep this simple. Done when that section is empty and the tests in `test_memory.py` pass.
 3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.
 4. **Device Mapper integration and docs.** `.status` with counters, table length, queue limits,

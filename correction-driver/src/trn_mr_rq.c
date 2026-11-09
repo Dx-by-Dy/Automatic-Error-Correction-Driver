@@ -1,6 +1,5 @@
 #include "trn_mr_rq.h"
 #include "trn_p_rq.h"
-#include "trn_rq.h"
 #include "macros.h"
 
 /// @brief Initializes struct trn_mr_rq
@@ -89,7 +88,7 @@ void complete_trn_mr_rq(struct trn_mr_rq *meta)
 ///
 /// Computes CRC64 for each data sector of bio,
 /// comparing the result with the corresponding record on disk.
-/// On CRC mismatch, sets error flag in parent struct trn_rq
+/// On CRC mismatch, sets the status of the part
 /// and outputs error to the log.
 ///
 /// Expected execution context - process.
@@ -97,10 +96,9 @@ void complete_trn_mr_rq(struct trn_mr_rq *meta)
 void check_crc(struct trn_mr_rq *meta)
 {
     struct trn_p_rq *part = meta->part;
-    struct trn_rq *req = part->req;
 
-    DM_DEBUG("part=%p req=%p first_sector=%u nr_sectors=%u\n",
-             part, req, meta->first_sector, meta->nr_sectors);
+    DM_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
+             part, meta->first_sector, meta->nr_sectors);
 
     struct chunk_metadata *md = kmap_local_page(meta->metadata_page);
     unsigned int sector_idx = meta->first_sector;
@@ -160,8 +158,7 @@ out:
                (unsigned long long)expected_crc,
                (unsigned long long)current_crc);
 
-        if (!atomic_xchg(&req->failed, 1))
-            req->status = BLK_STS_IOERR;
+        part->status = BLK_STS_IOERR;
 
         // Entry point for recovery after CRC mismatch
     }

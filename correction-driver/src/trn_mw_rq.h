@@ -9,7 +9,6 @@
 #include "bio_helper.h"
 
 struct trn_p_rq;
-struct trn_rq;
 struct dm_context;
 
 /// @brief Representation of one chunk's metadata stored on disk

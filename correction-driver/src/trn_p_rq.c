@@ -71,8 +71,6 @@ static bool chunk_lock(struct trn_p_rq *part)
 
 /// @brief Releases the chunk lock and starts the parts that can take it now
 /// @details
-/// Does nothing unless part->state == LOCKED or part->state == CRC_UPDATE.
-///
 /// Grants the lock from the head of the list until a part is not compatible:
 /// one writer, or all readers up to the next writer. The parts are queued
 /// after wait_lock is dropped, and queueing one may free it at once, so the
@@ -82,16 +80,13 @@ static bool chunk_lock(struct trn_p_rq *part)
 /// @param part Chunk transformation structure
 static void chunk_unlock(struct trn_p_rq *part)
 {
-    struct workqueue_struct *wq = part->req->dm_ctx->transform_wq;
+    struct workqueue_struct *wq = part->dm_ctx->transform_wq;
     struct lock *chunk = part->lock;
     struct trn_p_rq *next;
     struct trn_p_rq *tmp;
     LIST_HEAD(granted);
 
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
-
-    if (part->state != LOCKED && part->state != CRC_UPDATE)
-        return;
 
     spin_lock(&chunk->wait_lock);
 
@@ -123,25 +118,17 @@ static void chunk_unlock(struct trn_p_rq *part)
 /// Runs from transform_wq for each trn_p_rq, and once more if the part had to
 /// wait for the lock: then part->state is already LOCKED.
 ///
-/// First checks the failed flag of parent trn_rq — if another chunk has
-/// already completed with error, immediately transitions to completion
-/// without sending bio. complete_work releases the lock if the part holds it.
-///
-/// On success, submits data bio and chunk metadata depending on transformation type:
+/// Submits data bio and chunk metadata depending on transformation type:
 ///   - TRANSFORM_READ:  metadata reading bio
 ///   - TRANSFORM_WRITE: write_bio (chunk_full) or read_bio (partial write)
 ///
 /// Expected execution context - process.
-/// @param work Pointer to work_struct embedded in part->submit_wor
+/// @param work Pointer to work_struct embedded in part->submit_work
 static void submit_work(struct work_struct *work)
 {
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, submit_work);
-    struct trn_rq *req = part->req;
 
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
-
-    if (atomic_read(&req->failed))
-        goto fail;
 
     if (part->state == INITIALIZED && !chunk_lock(part))
         return;
@@ -159,17 +146,7 @@ static void submit_work(struct work_struct *work)
         break;
     }
 
-    submit_bio(part->bio);
-
-    return;
-
-fail:
-    DM_ERR("req failed before submission, part=%p, index=%lu, status=%d\n", part, part->index, req->status);
-
-    if (!atomic_xchg(&req->failed, 1))
-        req->status = BLK_STS_IOERR;
-
-    queue_work(req->dm_ctx->transform_wq, &part->complete_work);
+    submit_bio_noacct(part->bio);
 }
 
 /// @brief Function advancing state machine and completing structure lifecycle
@@ -187,17 +164,17 @@ fail:
 ///   submits write_bio to update CRC on disk.
 ///   Transitions state to CRC_UPDATE.
 ///
-///   If chunk_full == true — releases write lock and frees
-///   metadata, bio, structure, and decrements req->pending.
+///   If chunk_full == true — releases write lock and frees metadata.
 ///
-/// If req->pending reaches 0 — calls complete_trn_rq.
+/// Finally hands bio back to device mapper with the status of the part.
+/// This frees the part, as it lives in the per-bio data of bio.
 ///
 /// Expected execution context - process.
 /// @param work Pointer to work_struct embedded in part->complete_work
 static void complete_work(struct work_struct *work)
 {
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, complete_work);
-    struct trn_rq *req = part->req;
+    struct bio *bio = part->bio;
 
     DM_DEBUG("part=%p, state=%d, type=%d, index=%lu\n", part, part->state, part->type, part->index);
 
@@ -205,12 +182,12 @@ static void complete_work(struct work_struct *work)
     {
     case TRANSFORM_READ:
         chunk_unlock(part);
-        if (part->state == LOCKED && !atomic_read(&req->failed))
+        if (!part->status)
             check_crc(part->meta.read);
         complete_trn_mr_rq(part->meta.read);
         break;
     case TRANSFORM_WRITE:
-        if (part->state == LOCKED && !part->meta.write->chunk_full && !atomic_read(&req->failed))
+        if (part->state == LOCKED && !part->meta.write->chunk_full && !part->status)
         {
             part->state = CRC_UPDATE;
             update_crc_local(part->meta.write);
@@ -223,19 +200,17 @@ static void complete_work(struct work_struct *work)
         break;
     }
 
-    locker_put_lock(req->dm_ctx->locker, part->index, part->lock);
-    bio_put(part->bio);
-    kfree(part);
+    locker_put_lock(part->dm_ctx->locker, part->index, part->lock);
 
-    if (atomic_dec_and_test(&req->pending))
-        complete_trn_rq(req);
+    bio->bi_end_io = part->orig_end_io;
+    bio->bi_status = part->status;
+    bio_endio(bio);
 }
 
-/// @brief Initializes struct trn_p_rq
+/// @brief Initializes struct trn_p_rq and prepares bio for the lower device
 /// @details
-/// Allocates memory for trn_p_rq, initializes fields, and creates
-/// metadata structure (trn_mr_rq or trn_mw_rq) depending
-/// on transformation type.
+/// Initializes fields and creates metadata structure (trn_mr_rq or trn_mw_rq)
+/// depending on transformation type.
 ///
 /// Obtains chunk lock via locker_get_lock by the index of
 /// the start of the chunk's data area.
@@ -244,35 +219,30 @@ static void complete_work(struct work_struct *work)
 ///
 /// Pending counter is initialized to 2: data bio + metadata bio.
 ///
+/// Redirects bio to the physical sector on the lower device, and its
+/// completion to trn_p_rq_end_io.
+///
 /// Expected execution context - process.
 ///
-/// On error, frees all resources.
-/// @param part_bio Bio with chunk data
-/// @param req      Parent struct trn_rq
-/// @param dm_ctx   Driver context
-/// @param type     Transformation type (TRANSFORM_READ or TRANSFORM_WRITE)
-/// @return Pointer to trn_p_rq on success, NULL on error
-struct trn_p_rq *
-trn_p_rq_init(struct bio *part_bio,
-              struct trn_rq *req,
-              struct dm_context *dm_ctx,
-              enum trn_p_type type)
+/// On error, frees all resources and leaves the rest of bio to the caller.
+/// @param part   Structure to initialize, the per-bio data of bio
+/// @param bio    Bio with chunk data, bi_sector relative to the start of the target
+/// @param dm_ctx Driver context
+/// @param type   Transformation type (TRANSFORM_READ or TRANSFORM_WRITE)
+/// @return 0 on success, -ENOMEM on error
+int trn_p_rq_init(struct trn_p_rq *part,
+                  struct bio *bio,
+                  struct dm_context *dm_ctx,
+                  enum trn_p_type type)
 {
-    DM_DEBUG("part_bio=%p, req=%p, type=%d\n", part_bio, req, type);
+    DM_DEBUG("part=%p, bio=%p, type=%d\n", part, bio, type);
 
-    struct trn_p_rq *part;
-
-    part = kzalloc_obj(*part, GFP_NOIO);
-    if (!part)
-    {
-        DM_ERR("kzalloc failed\n");
-        return NULL;
-    }
-
-    part->index = start_data_sector(part_bio->bi_iter.bi_sector);
-    part->req = req;
-    part->bio = part_bio;
+    part->index = start_data_sector(bio->bi_iter.bi_sector);
+    part->dm_ctx = dm_ctx;
+    part->bio = bio;
     part->type = type;
+    part->status = BLK_STS_OK;
+    part->state = INITIALIZED;
     atomic_set(&part->pending, 2);
 
     switch (part->type)
@@ -282,18 +252,16 @@ trn_p_rq_init(struct bio *part_bio,
         if (!part->meta.read)
         {
             DM_ERR("trn_mr_rq_init failed\n");
-            kfree(part);
-            return NULL;
+            return -ENOMEM;
         }
-        part->meta.read->saved_iter = part_bio->bi_iter;
+        part->meta.read->saved_iter = bio->bi_iter;
         break;
     case TRANSFORM_WRITE:
         part->meta.write = trn_mw_rq_init(part, dm_ctx);
         if (!part->meta.write)
         {
             DM_ERR("trn_mw_rq_init failed\n");
-            kfree(part);
-            return NULL;
+            return -ENOMEM;
         }
         break;
     }
@@ -311,24 +279,29 @@ trn_p_rq_init(struct bio *part_bio,
             complete_trn_mw_rq(part->meta.write);
             break;
         }
-        kfree(part);
-        return NULL;
+        return -ENOMEM;
     }
 
     INIT_WORK(&part->submit_work, submit_work);
     INIT_WORK(&part->complete_work, complete_work);
-    part->state = INITIALIZED;
+
+    part->orig_end_io = bio->bi_end_io;
+    bio->bi_end_io = trn_p_rq_end_io;
+    bio->bi_private = part;
+    bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+    bio_set_dev(bio, dm_ctx->dev->bdev);
 
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
+    DM_DEBUG_BIO(bio);
 
-    return part;
+    return 0;
 }
 
 /// @brief Handler for completion of data and metadata bios
 /// @details
 /// Called upon completion of any data bio or metadata bio.
 ///
-/// On bio error, captures status in parent struct trn_rq.
+/// On bio error, captures status in the part.
 ///
 /// Decrements part->pending counter of the chunk transformation request.
 /// When pending == 0, starts complete_work to advance the state machine.
@@ -338,7 +311,6 @@ trn_p_rq_init(struct bio *part_bio,
 void trn_p_rq_end_io(struct bio *bio)
 {
     struct trn_p_rq *part = bio->bi_private;
-    struct trn_rq *req = part->req;
 
     DM_DEBUG("bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
 
@@ -346,10 +318,9 @@ void trn_p_rq_end_io(struct bio *bio)
     {
         DM_ERR("bio failed, bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
 
-        if (!atomic_xchg(&req->failed, 1))
-            req->status = bio->bi_status;
+        WRITE_ONCE(part->status, bio->bi_status);
     }
 
     if (atomic_dec_and_test(&part->pending))
-        queue_work(req->dm_ctx->transform_wq, &part->complete_work);
+        queue_work(part->dm_ctx->transform_wq, &part->complete_work);
 }

@@ -49,7 +49,6 @@ def test_table_shows_the_lower_device(lower):
     assert len(fields) == 4, fields
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: A target that does not start at sector 0 uses wrong sectors")
 def test_target_may_start_after_sector_0(lower):
     path, sectors = lower
     start = DATA_SECTORS * 8

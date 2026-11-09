@@ -129,19 +129,18 @@ def injection():
     current.finish()
 
 
-@pytest.mark.known_hang
 def test_failed_first_allocation_keeps_the_bio(stack, injection):
-    """TODO.md: "A failed allocation of req loses the bio". The first allocation is req."""
+    """Whichever allocation of the driver comes first, the request must end."""
     injection.arm("failslab", driver_range())
     outcome = injection.run(lambda: stack.upper.read(0, DATA_SECTORS))
     assert outcome is not STUCK
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: A failed allocation of req loses the bio")
+@pytest.mark.xfail(strict=True, reason="TODO.md: Allocations on the I/O path have no reserve")
 @pytest.mark.parametrize("fault", ["failslab", "fail_page_alloc"])
 @pytest.mark.parametrize("operation", ["read", "write"])
 def test_failed_allocation_does_not_fail_the_io(stack, injection, fault, operation):
-    """Only allocations for the parts fail, so this does not lose the bio as the test above."""
+    """One allocation fails, as when memory is short, and the request must not notice."""
     old, new = pattern(1, SECTORS), pattern(2, SECTORS)
     stack.upper.write(0, old)
     injection.arm(fault, function_range("trn_p_rq_init"))
@@ -180,7 +179,6 @@ def test_failed_allocation_leaves_the_device_usable(stack, injection, operation,
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason="TODO.md: Several bios from one bioset in one context")
 def test_write_goes_on_with_only_the_bio_reserve(stack, injection):
     """All new bios of this thread fail, as when memory is short, so only the reserves are left.
 

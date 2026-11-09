@@ -12,8 +12,6 @@
 #include "trn_mw_rq.h"
 #include "trn_mr_rq.h"
 
-struct trn_rq;
-
 /// @brief Chunk transformation type
 /// @details Defines the direction of the I/O operation:
 /// reading data followed by CRC verification, or
@@ -49,8 +47,13 @@ union trn_m_rq
 
 /// @brief Structure for single chunk transformation
 /// @details
-/// Represents a processing unit for a single chunk within the parent
-/// trn_rq. Each trn_p_rq covers exactly one data chunk.
+/// Represents a processing unit for a single chunk. Device mapper splits
+/// requests at chunk boundaries (ti->max_io_len), so each bio passed to dm_map
+/// stays within one data chunk.
+///
+/// Lives in the per-bio data of that bio (ti->per_io_data_size), so it cannot
+/// fail to allocate, and it is freed along with the bio: nothing may touch it
+/// after bio_endio at the end of complete_work.
 ///
 /// Lifecycle:
 ///   1. trn_p_rq_init         — resource allocation, bio and metadata initialization
@@ -66,9 +69,8 @@ struct trn_p_rq
     /// @brief Work item for acquiring the lock and submitting bios to the underlying device
     struct work_struct submit_work;
 
-    /// @brief List node: first in the parent trn_rq, then among waiters of the chunk lock
-    /// @details In the parent trn_rq until trn_rq_submit is called. After that, in
-    /// lock->waiters while waiting for the lock, protected by lock->wait_lock.
+    /// @brief List node among waiters of the chunk lock
+    /// @details In lock->waiters while waiting for the lock, protected by lock->wait_lock.
     struct list_head list;
 
     /// @brief Work item for advancing the state machine and eventually finalizing the structure lifecycle
@@ -77,11 +79,18 @@ struct trn_p_rq
     ///          For TRANSFORM_WRITE (write_bio): triggers lock release and resource cleanup.
     struct work_struct complete_work;
 
-    /// @brief Pointer to the parent struct trn_rq
-    struct trn_rq *req;
+    /// @brief Driver context
+    struct dm_context *dm_ctx;
 
-    /// @brief bio containing chunk data (excluding metadata)
+    /// @brief bio containing chunk data (excluding metadata), the one passed to dm_map
     struct bio *bio;
+
+    /// @brief bi_end_io of bio set by device mapper, restored to complete it
+    bio_end_io_t *orig_end_io;
+
+    /// @brief Status of the part, given to bio on completion
+    /// @details Any error of the data or metadata bios, or a CRC mismatch.
+    blk_status_t status;
 
     /// @brief Chunk index (physical sector of the start of the chunk data area)
     unsigned long index;
@@ -105,11 +114,10 @@ struct trn_p_rq
     union trn_m_rq meta;
 };
 
-struct trn_p_rq *
-trn_p_rq_init(struct bio *part_bio,
-              struct trn_rq *req,
-              struct dm_context *dm_ctx,
-              enum trn_p_type type);
+int trn_p_rq_init(struct trn_p_rq *part,
+                  struct bio *bio,
+                  struct dm_context *dm_ctx,
+                  enum trn_p_type type);
 void trn_p_rq_end_io(struct bio *bio);
 
 #endif

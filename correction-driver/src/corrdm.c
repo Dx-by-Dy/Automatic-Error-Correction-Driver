@@ -7,17 +7,19 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 
 /// @brief Handles incoming bio requests
 /// @details
-/// Called by the DM subsystem for each incoming bio.
-/// For read and write operations, creates a trn_rq, which splits the bio
-/// by chunk boundaries and asynchronously processes each part.
+/// Called by the DM subsystem for each incoming bio. DM splits requests at chunk
+/// boundaries, so the bio stays within one chunk.
+///
+/// For read and write operations, initializes the trn_p_rq in the per-bio data
+/// of the bio and processes it asynchronously.
 ///
 /// For other operations (FLUSH, DISCARD, etc.) forwards the bio
 /// directly to the lower-level device.
 ///
-/// On trn_rq initialization error, the incoming bio is already completed with BLK_STS_IOERR.
+/// On trn_p_rq initialization error, DM completes the bio with BLK_STS_IOERR.
 /// @param ti  DM target
 /// @param bio Incoming bio request
-/// @return DM_MAPIO_SUBMITTED for READ, WRITE.
+/// @return DM_MAPIO_SUBMITTED for READ, WRITE, DM_MAPIO_KILL if they fail to start.
 ///         DM_MAPIO_REMAPPED for FLUSH, DISCARD, etc.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
@@ -27,20 +29,21 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
              (unsigned long long)bio->bi_iter.bi_sector,
              bio->bi_iter.bi_size);
 
-    struct trn_rq *req;
     struct dm_context *dm_ctx = ti->private;
+    struct trn_p_rq *part = dm_per_bio_data(bio, ti->per_io_data_size);
+    sector_t sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     enum trn_p_type type;
 
     switch (bio_op(bio))
     {
     case REQ_OP_FLUSH:
         flush_workqueue(dm_ctx->transform_wq);
-        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+        bio->bi_iter.bi_sector = align_data_sector(sector);
         bio_set_dev(bio, dm_ctx->dev->bdev);
         return DM_MAPIO_REMAPPED;
 
     case REQ_OP_DISCARD:
-        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+        bio->bi_iter.bi_sector = align_data_sector(sector);
         bio_set_dev(bio, dm_ctx->dev->bdev);
         return DM_MAPIO_REMAPPED;
 
@@ -54,22 +57,23 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 
     default:
         DM_ERR("unsupported bio op=%u\n", bio_op(bio));
-        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+        bio->bi_iter.bi_sector = align_data_sector(sector);
         bio_set_dev(bio, dm_ctx->dev->bdev);
         return DM_MAPIO_REMAPPED;
     }
 
-    req = trn_rq_init(bio, dm_ctx, type);
-    if (!req)
+    bio->bi_iter.bi_sector = sector;
+
+    if (trn_p_rq_init(part, bio, dm_ctx, type))
     {
-        DM_ERR("trn_rq_init failed, op=%u sector=%llu, type=%d\n",
+        DM_ERR("trn_p_rq_init failed, op=%u sector=%llu, type=%d\n",
                bio_op(bio),
-               (unsigned long long)bio->bi_iter.bi_sector,
+               (unsigned long long)sector,
                type);
-        return DM_MAPIO_SUBMITTED;
+        return DM_MAPIO_KILL;
     }
 
-    trn_rq_submit(req);
+    queue_work(dm_ctx->transform_wq, &part->submit_work);
     return DM_MAPIO_SUBMITTED;
 }
 
@@ -144,6 +148,14 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         DM_ERR("bioset_init failed, err=%d\n", r);
         goto error_bioset_init;
     }
+
+    r = dm_set_target_max_io_len(ti, DATA_SIZE_SECTORS);
+    if (r)
+    {
+        DM_ERR("dm_set_target_max_io_len failed, err=%d\n", r);
+        goto error_dm_get_device;
+    }
+    ti->per_io_data_size = sizeof(struct trn_p_rq);
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)

@@ -1,6 +1,5 @@
 #include "trn_mw_rq.h"
 #include "trn_p_rq.h"
-#include "trn_rq.h"
 #include "macros.h"
 
 /// @brief Calculates CRC64 for each bio sector and writes results to meta->page

@@ -14,7 +14,6 @@
 
 #include "locker.h"
 #include "bio_helper.h"
-#include "trn_rq.h"
 #include "trn_p_rq.h"
 
 /// @brief DM target context
