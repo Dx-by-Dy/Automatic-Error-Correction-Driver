@@ -32,9 +32,6 @@ KERNEL_REPORT = re.compile(
 # Bugs already recorded in TODO.md. They are listed after the run and do not fail a test;
 # any other report does. Delete an entry when its bug is fixed.
 KNOWN_KERNEL_REPORTS = {
-    "Use-after-free in trn_rq_submit": re.compile(
-        r"KASAN: slab-use-after-free in trn_rq_submit"
-    ),
     "The chunk lock is released by another task": re.compile(
         r"workqueue leaked atomic, lock or RCU"
         r"|WARNING: kernel/locking/rwsem\.c"

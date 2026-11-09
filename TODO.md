@@ -12,11 +12,11 @@ in a run, **From reading** means it was only found in the code.
 
 ## Memory and locking
 
-- **Use-after-free in `trn_rq_submit`.** Confirmed: KASAN reports a
-  `slab-use-after-free` read there, 10 times over a short fio run at sizes from 4k to 1m.
-  After the last `queue_work`, `list_for_each_entry_safe` reads `req->parts.next`,
-  but all parts may already have completed and freed `req`. Fix: move the parts to a local
-  list before queueing, or keep a reference on `req` until the loop ends.
+- **A failed allocation of `req` loses the bio.** From reading: when `kzalloc` fails at the start of
+  `trn_rq_init`, it returns NULL without ending the bio, and `dm_map` returns `DM_MAPIO_SUBMITTED`,
+  so the I/O never completes. The comment on `dm_map` says the bio is already completed. The other
+  `kzalloc` and `alloc_page` calls on the I/O path fail with `BLK_STS_IOERR`, as they have no
+  mempool, so memory pressure turns into I/O errors. Fix: `per_io_data_size` and mempools.
 - **The chunk lock is released by another task.** Confirmed: the `rw_semaphore` is taken in
   `submit_work` and released in `complete_work`. The kernel reports `workqueue leaked
   atomic, lock or RCU` and a `DEBUG_RWSEMS_WARN_ON` in `__up_write`, then lockdep reports a
@@ -147,8 +147,7 @@ Carried over from the previous list.
 1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
    lifecycle, `sparse`.
-2. **Memory and locking.** Fix the use-after-free, replace the chunk lock so lockdep stays on and the
-   hang is gone, then clean up the rest of [Memory and locking](#memory-and-locking). Done when
+2. **Memory and locking.** Replace the chunk lock so lockdep stays on and the hang is gone, then clean up the rest of [Memory and locking](#memory-and-locking). Done when
    `KNOWN_KERNEL_REPORTS` in `tests/conftest.py` is empty and the `known_hang` tests pass as normal
    tests.
 3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and

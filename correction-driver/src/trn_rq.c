@@ -129,11 +129,15 @@ error:
     {
         struct trn_p_rq *p;
         struct trn_p_rq *tmp;
+        LIST_HEAD(parts);
 
-        list_for_each_entry_safe(p, tmp, &req->parts, list)
+        // req may be freed once the last part is queued, so the list head must not be in it
+        list_splice_init(&req->parts, &parts);
+
+        list_for_each_entry_safe(p, tmp, &parts, list)
         {
             list_del(&p->list);
-            queue_work(req->dm_ctx->transform_wq, &p->complete_work);
+            queue_work(dm_ctx->transform_wq, &p->complete_work);
         }
     }
 
@@ -142,9 +146,11 @@ error:
 
 /// @brief Queues all trn_p_rq in transform_wq for processing
 /// @details
-/// Traverses parts list, removes each element and queues
-/// its submit_work in transform_wq. After the call, the parts list
-/// becomes empty.
+/// Moves the parts to a local list, removes each element and queues
+/// its submit_work in transform_wq.
+///
+/// req may be freed as soon as the last part is queued, so it must not be
+/// accessed after the first queue_work, including by the caller.
 ///
 /// Expected execution context - process.
 /// @param req Request structure
@@ -152,12 +158,16 @@ void trn_rq_submit(struct trn_rq *req)
 {
     DM_DEBUG("req=%p, parts=%d\n", req, atomic_read(&req->pending));
 
+    struct workqueue_struct *wq = req->dm_ctx->transform_wq;
     struct trn_p_rq *part;
     struct trn_p_rq *tmp;
+    LIST_HEAD(parts);
 
-    list_for_each_entry_safe(part, tmp, &req->parts, list)
+    list_splice_init(&req->parts, &parts);
+
+    list_for_each_entry_safe(part, tmp, &parts, list)
     {
         list_del(&part->list);
-        queue_work(req->dm_ctx->transform_wq, &part->submit_work);
+        queue_work(wq, &part->submit_work);
     }
 }

@@ -134,12 +134,13 @@ Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace even
 
 The list is in `TODO.md`, under "Tests and tooling": lower device errors, lifecycle, crash consistency.
 
-Two blind spots until stage 2 of `TODO.md` is done:
+A blind spot until stage 2 of `TODO.md` is done:
 
 - **Lockdep is off during the tests.** The chunk lock turns it off under the first I/O, in `reinit`, before
   the first test, so locking bugs are not reported.
-- **Reports can be missed.** The use-after-free floods the kernel log and overruns it, which the summary
-  of the run reports as `Kernel log overran N times`. A new report in that window would go unseen.
+
+If the kernel log overruns during a run, the summary reports it as `Kernel log overran N times`; a report in
+that window would go unseen.
 
 ## Do the tests catch bugs?
 
