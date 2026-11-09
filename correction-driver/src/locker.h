@@ -2,7 +2,8 @@
 #define LOCKER_H
 
 #include <linux/xarray.h>
-#include <linux/rwsem.h>
+#include <linux/spinlock.h>
+#include <linux/list.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/rcupdate.h>
@@ -19,17 +20,27 @@ struct locker
 
 /// @brief Lock for a single chunk
 /// @details
-/// Contains rw_semaphore for separating readers and writers,
-/// reference counter for lifetime management, and rcu_head
-/// for safe memory deallocation.
+/// Separates readers and writers of a chunk for the whole time their I/O is
+/// in flight, so it is taken in one work item and released in another. A part
+/// that cannot take it waits on the list, without holding a worker. The rules
+/// are in chunk_lock and chunk_unlock in trn_p_rq.c.
 ///
 /// Lifetime: lock is "alive" as long as refcnt > 0.
 /// When refcnt reaches zero, the object is removed from the table and
 /// freed via RCU.
 struct lock
 {
-    /// @brief Read-write semaphore for protecting the chunk
-    struct rw_semaphore sem;
+    /// @brief Protects readers, writer and waiters. Never held across I/O.
+    spinlock_t wait_lock;
+
+    /// @brief Number of parts holding the lock shared
+    unsigned int readers;
+
+    /// @brief A part holds the lock exclusively
+    bool writer;
+
+    /// @brief Parts waiting for the lock, in order of arrival
+    struct list_head waiters;
 
     /// @brief Reference counter for lifetime management
     /// @details

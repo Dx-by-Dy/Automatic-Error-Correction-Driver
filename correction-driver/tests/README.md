@@ -1,6 +1,6 @@
 # Driver tests
 
-141 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+144 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [CLAUDE.md](../../CLAUDE.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,11 +8,10 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all but known_hang: 135 tests, about 7 minutes
+deploy/vm.sh test                                     # all but known_hang: 144 tests, about 16 minutes
 deploy/vm.sh test -m "not slow"                       # the fast ones: 113 tests, about 1 minute
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
-deploy/vm.sh test -m known_hang -k "32k and write"    # hangs the guest on purpose
 ```
 
 `deploy/vm.sh test` copies the working tree to the VM, rebuilds and reloads the driver, then runs
@@ -121,23 +120,19 @@ Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace even
 | ---- | ----- | ------ |
 | `test_file_survives_a_remount` | 2 | ext4 and xfs: a 128 MiB random file keeps its SHA-256 after dropping caches and after a remount |
 
-### `test_fio.py`: load (26 tests, `slow`)
+### `test_fio.py`: load (29 tests, `slow`)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_single_job` | 7 | fio verify, `bs` from 512 bytes to 1 MiB, `iodepth=16` |
 | `test_parallel_jobs_on_separate_areas` | 7 | fio verify, the same sizes, 8 jobs at `iodepth=32`, each in its own area |
 | `test_jobs_competing_within_the_worker_limit` | 6 | 20 seconds of `write` and `randwrite` on a shared area, `bs`/`numjobs` of `4k/8`, `16k/8`, `4k/32`; then the whole area must read without a CRC error |
-| `test_jobs_competing_beyond_the_worker_limit` | 6 | **known_hang**: the same with `32k/8`, `16k/32`, `1m/8`. See "Workers block the work that would release them" in `TODO.md`. The hang was seen with `32k/8` and `16k/32` on `write`; the other four cases are expected from the same limit and were not run |
+| `test_reads_and_writes_competing` | 3 | The same with `randrw`, `bs` of `512`, `4k`, `32k`, 8 jobs: a read that meets a write in a chunk must not get a CRC error |
+| `test_jobs_competing_beyond_the_worker_limit` | 6 | The same as the first with `32k/8`, `16k/32`, `1m/8`: more items than the workqueue runs at a time, which hangs if a worker ever sleeps on a chunk |
 
 ## What is not tested yet
 
 The list is in `TODO.md`, under "Tests and tooling": lower device errors, lifecycle, crash consistency.
-
-A blind spot until stage 2 of `TODO.md` is done:
-
-- **Lockdep is off during the tests.** The chunk lock turns it off under the first I/O, in `reinit`, before
-  the first test, so locking bugs are not reported.
 
 If the kernel log overruns during a run, the summary reports it as `Kernel log overran N times`; a report in
 that window would go unseen.
@@ -151,5 +146,13 @@ Checked by breaking the driver on purpose, in the copy inside the VM, and runnin
 | No `check_crc` call in `complete_work` | 24 | `test_corruption.py`, as expected |
 | No merging of old CRCs in `update_crc_local` | 10 | Partial writes, boundaries and random writes in `test_data.py` |
 | `bio_crc_calc` starts at index 0, not `first_sector` | 50 | `test_data.py` |
+
+The chunk lock is checked the same way, on the slow tests that compete for chunks:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| Two writers may hold a chunk | Failed, `Input/output error` | `test_jobs_competing_within_the_worker_limit`, first case |
+| Readers and writers ignore each other | Failed, `Input/output error` | `test_reads_and_writes_competing`, first case; nothing else in `test_fio.py`, `test_filesystem.py`, `test_durability.py` caught it |
+| Releasing the lock does not start the next part | Exit code 3, a hang | `test_jobs_competing_beyond_the_worker_limit` |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.

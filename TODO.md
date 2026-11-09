@@ -15,26 +15,13 @@ in a run, **From reading** means it was only found in the code.
 - **A failed allocation of `req` loses the bio.** From reading: when `kzalloc` fails at the start of
   `trn_rq_init`, it returns NULL without ending the bio, and `dm_map` returns `DM_MAPIO_SUBMITTED`,
   so the I/O never completes. The comment on `dm_map` says the bio is already completed. The other
-  `kzalloc` and `alloc_page` calls on the I/O path fail with `BLK_STS_IOERR`, as they have no
-  mempool, so memory pressure turns into I/O errors. Fix: `per_io_data_size` and mempools.
-- **The chunk lock is released by another task.** Confirmed: the `rw_semaphore` is taken in
-  `submit_work` and released in `complete_work`. The kernel reports `workqueue leaked
-  atomic, lock or RCU` and a `DEBUG_RWSEMS_WARN_ON` in `__up_write`, then lockdep reports a
-  possible circular dependency between `&lock->sem` and `transformation_wq` and turns itself
-  off (`debug_locks: 0`). **Until this is fixed, lockdep checks nothing else in the system.**
-  An `rw_semaphore` is not meant for this; the kernel has no non-owner `up_write`. Fix: a chunk
-  lock of our own (state and a list of waiting parts under a spinlock), where the part that
-  releases the lock queues the next one.
-- **Workers block the work that would release them.** Confirmed: this is the hang under load.
-  `submit_work` sleeps on the chunk lock in the same workqueue that runs `complete_work`, which
-  releases it. When all 1024 active workers (`WQ_DFL_ACTIVE`) wait on locks, the `complete_work`
-  items stay queued behind them and I/O stops for good, with nothing in flight on the lower
-  device. A request takes one item per 4 KiB chunk, so it takes more items than workers once
-  `numjobs * iodepth * chunks per request > 1024` on a shared area. With `numjobs=8` and
-  `iodepth=32`, `bs=16k` is exactly 1024 and passes, while `bs=32k` is 2048 and hangs. That is
-  why it appeared as `bs >= 32k`; `bs=16k` with `numjobs=32` hangs as well. Reproduce with
-  `deploy/vm.sh test -m known_hang -k "32k and write"`. Replacing the chunk lock as described
-  above fixes this too, as a worker then never sleeps on a chunk.
+  `kzalloc` and `alloc_page` calls on the I/O path have no mempool, so under memory pressure they
+  either give `BLK_STS_IOERR` or stall in reclaim. Fix: `per_io_data_size` and mempools.
+- **No limit on requests in flight.** From reading: `dm_map` allocates everything for every chunk
+  and returns, and a bio-based DM device has no request queue with tags, so only the submitters
+  limit the load (`iodepth`, the dirty page limit). Each chunk takes a whole page for metadata plus
+  structures and 2-3 bios, so writes of 4 KiB need more memory than the data they carry. Flushing
+  1 GiB of dirty pages can need over 1 GiB, just when memory is short. Fix: a limit on parts in flight, where `dm_map` waits, together with the mempools.
 - **Several bios from one bioset in one context.** From reading: `trn_rq_init` allocates 2-3
   bios per chunk from `transform_bs` (128 reserved) in `dm_map`, before submitting any.
   A 1 MiB request needs over 500. Under memory pressure this can wait for bios that are
@@ -123,7 +110,8 @@ Carried over from the previous list.
 - **Tests that do not exist yet:**
   - lower device errors, through `dm-flakey` and `dm-dust`;
   - lifecycle: removal under load, unloading the module, leaks through kmemleak;
-  - crash consistency: `dm-log-writes`.
+  - crash consistency: `dm-log-writes`;
+  - memory pressure: buffered writes larger than the memory of the VM, once the hang is fixed.
 - **`sparse` does not run.** The kernel requires `__typeof_unqual__`, which sparse 0.6.4 from
   Fedora does not support, so `make check` prints a warning and skips it. It takes a build from
   upstream sources.
@@ -147,9 +135,9 @@ Carried over from the previous list.
 1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
    lifecycle, `sparse`.
-2. **Memory and locking.** Replace the chunk lock so lockdep stays on and the hang is gone, then clean up the rest of [Memory and locking](#memory-and-locking). Done when
-   `KNOWN_KERNEL_REPORTS` in `tests/conftest.py` is empty and the `known_hang` tests pass as normal
-   tests.
+2. **Memory and locking.** Clean up the rest of [Memory and locking](#memory-and-locking): the bioset,
+   the mempools and the limit on requests in flight, the remaining use of freed data. Done when that
+   section is empty and the memory pressure test passes.
 3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.
 4. **Device Mapper integration and docs.** `.status` with counters, table length, queue limits,

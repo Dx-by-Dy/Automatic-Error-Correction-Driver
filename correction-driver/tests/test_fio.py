@@ -53,10 +53,11 @@ def test_parallel_jobs_on_separate_areas(make_stack, bs):
 
 
 def compete_for_the_same_chunks(make_stack, bs, numjobs, rw):
-    """All jobs write the same area, as the competitive benchmarks in the README do.
+    """All jobs use the same area, as the competitive benchmarks in the README do.
 
     Their writes overlap, so fio cannot verify the contents, but each chunk must still hold
-    data matching its CRC, as a chunk lock keeps a write's data and CRC together.
+    data matching its CRC, as a chunk lock keeps a write's data and CRC together. A read that
+    meets a write in a chunk would fail with a CRC mismatch without the lock, and fio reports it.
     """
     stack = make_stack(LOWER_MIB)
     fio(
@@ -83,10 +84,17 @@ def test_jobs_competing_within_the_worker_limit(make_stack, bs, numjobs, rw):
     compete_for_the_same_chunks(make_stack, bs, numjobs, rw)
 
 
-# TODO.md: "Workers block the work that would release them". These hang the guest, which ends
-# the run, so they cannot be xfail. Run them with: deploy/vm.sh test -m known_hang -k <one case>
+# Readers and writers must exclude each other: without that, a read sees the data of a write
+# and the CRC from before it.
 @pytest.mark.slow
-@pytest.mark.known_hang
+@pytest.mark.parametrize("bs", ["512", "4k", "32k"])
+def test_reads_and_writes_competing(make_stack, bs):
+    compete_for_the_same_chunks(make_stack, bs, 8, "randrw")
+
+
+# These loads take more items than the workqueue runs at a time, so they hang if a worker ever
+# sleeps on a chunk: the items that would release it stay queued behind the sleeping ones.
+@pytest.mark.slow
 @pytest.mark.parametrize("rw", ["write", "randwrite"])
 @pytest.mark.parametrize("bs,numjobs", [("32k", 8), ("16k", 32), ("1m", 8)], ids=str)
 def test_jobs_competing_beyond_the_worker_limit(make_stack, bs, numjobs, rw):

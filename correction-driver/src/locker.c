@@ -68,7 +68,8 @@ struct lock *locker_get_lock(struct locker *locker, unsigned long index)
         DM_ERR("kzalloc failed\n");
         return NULL;
     }
-    init_rwsem(&lock->sem);
+    spin_lock_init(&lock->wait_lock);
+    INIT_LIST_HEAD(&lock->waiters);
     refcount_set(&lock->refcnt, 1);
 
     xa_lock(&locker->table);

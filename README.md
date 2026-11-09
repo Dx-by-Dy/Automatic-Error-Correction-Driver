@@ -75,11 +75,11 @@ Each chunk contains:
 
 The driver uses chunk-level synchronization based on:
 
-* `rw_semaphore`
+* A lock of its own: state under a spinlock and a list of waiting parts, in order of arrival
 * `xarray`
 * Lazy lock allocation
 
-This approach allows concurrent reads while preventing conflicting write operations and minimizing memory consumption.
+This approach allows concurrent reads while preventing conflicting write operations and minimizing memory consumption. A part that has to wait does not hold a worker: the part that releases the lock queues the next one.
 
 ## Building
 

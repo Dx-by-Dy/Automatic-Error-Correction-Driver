@@ -27,10 +27,11 @@ enum trn_p_type
 /// @brief Lifecycle state of trn_p_rq
 enum trn_p_state
 {
-    /// @brief Structure is created, bios are not yet submitted.
+    /// @brief Structure is created, chunk lock is not held, bios are not yet submitted.
+    /// The part may be waiting for the lock on its list.
     INITIALIZED,
 
-    /// @brief Chunk lock is acquired, bios are submitted, waiting for completion.
+    /// @brief Chunk lock is acquired; bios are about to be submitted or are in flight.
     LOCKED,
 
     /// @brief (TRANSFORM_WRITE only) meta.write->read_bio has completed;
@@ -53,7 +54,8 @@ union trn_m_rq
 ///
 /// Lifecycle:
 ///   1. trn_p_rq_init         — resource allocation, bio and metadata initialization
-///   2. submit_work           — acquiring chunk lock, submitting bios to the underlying device
+///   2. submit_work           — acquiring chunk lock, or waiting for it on its list and running
+///                              again when it is granted; submitting bios to the underlying device
 ///   3. complete_work         — see details of the complete_work field
 ///
 /// The pending counter tracks the number of outstanding bios:
@@ -64,8 +66,9 @@ struct trn_p_rq
     /// @brief Work item for acquiring the lock and submitting bios to the underlying device
     struct work_struct submit_work;
 
-    /// @brief List node for all trn_p_rq instances in the parent trn_rq
-    /// @details Valid only until trn_rq_submit is called.
+    /// @brief List node: first in the parent trn_rq, then among waiters of the chunk lock
+    /// @details In the parent trn_rq until trn_rq_submit is called. After that, in
+    /// lock->waiters while waiting for the lock, protected by lock->wait_lock.
     struct list_head list;
 
     /// @brief Work item for advancing the state machine and eventually finalizing the structure lifecycle
