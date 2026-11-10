@@ -6,6 +6,16 @@ run it is in [deploy/README.md](deploy/README.md); the tests are described in
 not done yet.
 The order of work is in [Stages](#stages), at the end.
 
+How to keep this file:
+
+- Remove an item once it is done; the history is in git. How the driver works belongs in `README.md`
+  and `docs/`, not here.
+- Group items by topic under `##` headings. Start an item with a short bold statement of the problem,
+  then give the cause, the consequence and a way to fix it, if known.
+- Say how a problem is known, as below. Do not promote an item to **Confirmed** without a run.
+- `## Stages` stays the last section and gives the order of work. Update it when items are added or
+  finished.
+
 Problems below were found at commit `086ef3c`, on Fedora 45 with kernel
 `7.2.15+debug`, a virtio disk as `/dev/vdb`. **Confirmed** means it was observed
 in a run, **From reading** means it was only found in the code.
