@@ -10,17 +10,6 @@ Problems below were found at commit `086ef3c`, on Fedora 45 with kernel
 `7.2.15+debug`, a virtio disk as `/dev/vdb`. **Confirmed** means it was observed
 in a run, **From reading** means it was only found in the code.
 
-## Memory and locking
-
-- **No limit on requests in flight.** Confirmed: `fio` with `bs=1m`, `numjobs=8`, `iodepth=128` takes
-  1179 MiB of available memory on the lower device and 2475 MiB through the driver, on the debug
-  kernel. `dm_map` allocates everything for every chunk and returns, and a bio-based DM device has no
-  request queue with tags, so only the submitters limit the load. Each chunk takes a whole page for
-  metadata plus a clone with the part in its per-bio data, so writes of 4 KiB need more memory than the
-  data they carry.
-  Fix: a limit on parts in flight, where `dm_map` waits. The wait must be in `dm_map`: workers
-  sleeping on it would block the `complete_work` that releases it.
-
 ## Integrity and durability
 
 - **`fsync` does not reach the lower device.** Confirmed: `vdb` is `write back`, the dm device is
@@ -57,8 +46,9 @@ in a run, **From reading** means it was only found in the code.
 ## Device Mapper integration
 
 - **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 corrdm` with no
-  arguments, as there is no `.status`, so the table cannot be saved and reloaded. `.status` is
-  also the natural place for counters such as CRC mismatches, which do not exist today.
+  arguments, as `.status` gives nothing for `STATUSTYPE_TABLE`, so the table cannot be saved and
+  reloaded. `dmsetup status` has a single counter, the waits for a place among the parts in flight;
+  counters such as CRC mismatches do not exist yet.
 - **The table length is ignored.** Confirmed: `dm_ctr` overwrites `ti->len` (16777216 requested,
   14913080 used). Fix: require a correct length, return an error otherwise, and print the
   right value with a helper command.
@@ -119,14 +109,12 @@ Carried over from the previous list.
 1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
    lifecycle, `sparse`.
-2. **Memory and locking.** Clean up the rest of [Memory and locking](#memory-and-locking): the limit on
-   requests in flight. The planned cache will replace pairing upper and
-   lower bios, so keep this simple. Done when that section is empty and the tests in `test_memory.py` pass.
-3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
+2. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.
-4. **Device Mapper integration and docs.** `.status` with counters, table length, queue limits,
+3. **Device Mapper integration and docs.** `.status` with the table and more counters, table length, queue limits,
    the README.
-5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, to compare the
+4. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, to compare the
    later stages against.
-6. **Correction.** Settle the open questions, design the code and the format, implement recovery.
-7. **Optimization.** Metadata cache, preallocation, Crypto API, guided by the baseline.
+5. **Correction.** Settle the open questions, design the code and the format, implement recovery.
+6. **Optimization.** Metadata cache, preallocation, Crypto API, tuning the limit on parts in flight,
+   guided by the baseline.

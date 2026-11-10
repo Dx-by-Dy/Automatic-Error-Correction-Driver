@@ -84,6 +84,8 @@ This approach allows concurrent reads while preventing conflicting write operati
 
 Nothing on the I/O path can fail to allocate. A part lives in the per-bio data of its bio, with its metadata structure and its metadata bio embedded in it, and the page for the metadata sector comes from a mempool with a reserve of 128 pages. When memory is short, `dm_map` waits for a page that another part gives back; workers never wait for memory, as they run the completions that give it back.
 
+At most 4096 parts are in flight per device. A bio-based device has no request queue with tags, so `dm_map` waits for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
+
 ## Building
 
 ### Requirements
@@ -131,6 +133,14 @@ Verify device creation:
 ```bash
 ls -l /dev/mapper/corrdm
 ```
+
+Show the counters:
+
+```bash
+dmsetup status corrdm
+```
+
+After the usual `<start> <length> corrdm`, it prints how many times `dm_map` waited for a place among the parts in flight.
 
 ## Usage
 

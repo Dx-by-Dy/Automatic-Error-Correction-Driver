@@ -204,6 +204,12 @@ def available_kib():
     pytest.fail("no MemAvailable")
 
 
+def test_ordinary_load_does_not_wait(stack):
+    """16 requests of 128 KiB at a time are 512 parts, far below the limit, so none waits for it."""
+    fio(stack.upper_path, rw="randrw", bs="128k", size="8m", iodepth=16, time_based=1, runtime=5)
+    assert stack.map_waits() == 0
+
+
 def memory_taken_mib(path):
     """How far the available memory falls under a load of many large requests."""
     before = available_kib()
@@ -230,11 +236,14 @@ def memory_taken_mib(path):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason="TODO.md: No limit on requests in flight")
 def test_memory_of_requests_in_flight_is_limited(make_stack):
-    """fio takes the same memory on either device, so the difference is what the driver holds."""
+    """fio takes the same memory on either device, so the difference is what the driver holds.
+
+    The load is far above the limit on parts in flight, so requests must have waited for it.
+    """
     stack = make_stack(MEMORY_LOWER_MIB)
     on_lower = memory_taken_mib(stack.lower_path)
     time.sleep(3)
     on_upper = memory_taken_mib(stack.upper_path)
     assert on_upper - on_lower < MEMORY_MARGIN_MIB, f"lower {on_lower} MiB, upper {on_upper} MiB"
+    assert stack.map_waits() > 0

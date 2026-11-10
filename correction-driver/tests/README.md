@@ -1,6 +1,6 @@
 # Driver tests
 
-160 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+161 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [CLAUDE.md](../../CLAUDE.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,7 +8,7 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 160 tests, about 17 minutes
+deploy/vm.sh test                                     # all 161 tests, about 17 minutes
 deploy/vm.sh test -m "not slow"                       # the fast ones: 131 tests, about 2 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
@@ -131,10 +131,10 @@ Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace even
 | `test_reads_and_writes_competing` | 3 | The same with `randrw`, `bs` of `512`, `4k`, `32k`, 8 jobs: a read that meets a write in a chunk must not get a CRC error |
 | `test_jobs_competing_beyond_the_worker_limit` | 6 | The same as the first with `32k/8`, `16k/32`, `1m/8`: more items than the workqueue runs at a time, which hangs if a worker ever sleeps on a chunk |
 
-### `test_memory.py`: I/O when memory is short (15 tests)
+### `test_memory.py`: I/O when memory is short (16 tests)
 
 Failures come from the kernel's fault injection (`failslab`, `fail_page_alloc`), limited to one thread and to
-allocations whose stack passes through given code. See "Memory and locking" in `TODO.md`.
+allocations whose stack passes through given code. How the driver uses memory is in "Memory" in `README.md`.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
@@ -142,7 +142,8 @@ allocations whose stack passes through given code. See "Memory and locking" in `
 | `test_failed_page_allocation_does_not_fail_the_io` | 10 | `read`, `write` of 64 chunks with one metadata page failing at a varying place, which must have happened: the reserve takes over, no error and correct data |
 | `test_write_goes_on_with_only_the_page_reserve` | 1 | All new metadata pages of the thread fail, and a write of 1 MiB, more pages than the reserve holds, must finish and read back |
 | `test_write_goes_on_with_only_the_bio_reserve` | 1 | `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
-| `test_memory_of_requests_in_flight_is_limited` | 1 | **xfail**, `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device |
+| `test_ordinary_load_does_not_wait` | 1 | `fio` `randrw` with `bs=128k`, `iodepth=16`, at most 512 parts: `dmsetup status` shows no wait for a place among the parts in flight |
+| `test_memory_of_requests_in_flight_is_limited` | 1 | `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device, and requests waited for the limit. Measured: 1074 MiB on the lower device, 1052 MiB through the driver, 28833 waits |
 
 ## What is not tested yet
 

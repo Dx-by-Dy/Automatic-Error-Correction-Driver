@@ -154,7 +154,8 @@ static void submit_work(struct work_struct *work)
 ///
 ///   If chunk_full == true — releases write lock and frees metadata.
 ///
-/// Finally hands bio back to device mapper with the status of the part.
+/// Finally gives back the place of the part among the parts in flight, and
+/// hands bio back to device mapper with the status of the part.
 /// This frees the part, as it lives in the per-bio data of bio.
 ///
 /// Expected execution context - process.
@@ -189,6 +190,8 @@ static void complete_work(struct work_struct *work)
         complete_trn_mw_rq(&part->meta.write);
         break;
     }
+
+    up(&part->dm_ctx->parts_in_flight);
 
     bio->bi_end_io = part->orig_end_io;
     bio->bi_status = part->status;

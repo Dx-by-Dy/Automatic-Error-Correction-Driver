@@ -12,6 +12,8 @@
 #include <linux/crc64.h>
 #include <linux/workqueue.h>
 #include <linux/mempool.h>
+#include <linux/semaphore.h>
+#include <linux/atomic.h>
 
 #include "locker.h"
 #include "bio_helper.h"
@@ -20,6 +22,13 @@
 /// @brief Number of metadata pages kept in reserve for when memory is short
 /// @details A part takes one page, so any reserve lets parts go on one at a time.
 #define PAGE_POOL_RESERVE 128
+
+/// @brief Number of parts that may be in flight at once
+/// @details
+/// A bio-based device has no request queue with tags, so without a limit the
+/// submitters fill memory with parts. 4096 parts are 16 MiB of data, far more
+/// than a disk queue of 256 requests takes, so ordinary load never reaches it.
+#define MAX_PARTS_IN_FLIGHT 4096
 
 /// @brief DM target context
 /// @details
@@ -39,6 +48,13 @@ struct dm_context
 
     /// @brief Chunk lock table
     struct locker locker;
+
+    /// @brief Free places for parts in flight, MAX_PARTS_IN_FLIGHT at most
+    /// @details Taken in dm_map, given back in complete_work before bio_endio.
+    struct semaphore parts_in_flight;
+
+    /// @brief How many times dm_map had to wait for a place, shown by dmsetup status
+    atomic64_t map_waits;
 };
 
 #endif

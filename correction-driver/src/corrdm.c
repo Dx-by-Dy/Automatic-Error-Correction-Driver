@@ -10,10 +10,12 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// Called by the DM subsystem for each incoming bio. DM splits requests at chunk
 /// boundaries, so the bio stays within one chunk.
 ///
-/// For read and write operations, initializes the trn_p_rq in the per-bio data
-/// of the bio and processes it asynchronously. That may wait for memory, which
-/// belongs here and never in a worker: workers run the complete_work that
-/// gives memory back.
+/// For read and write operations, takes a place among the parts in flight,
+/// initializes the trn_p_rq in the per-bio data of the bio and processes it
+/// asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in flight, or for
+/// memory, which blocks the submitter as a full request queue of a disk would.
+/// The waiting belongs here and never in a worker: workers run the complete_work
+/// that gives places and memory back.
 ///
 /// For other operations (FLUSH, DISCARD, etc.) forwards the bio
 /// directly to the lower-level device.
@@ -60,6 +62,12 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         bio->bi_iter.bi_sector = align_data_sector(sector);
         bio_set_dev(bio, dm_ctx->dev->bdev);
         return DM_MAPIO_REMAPPED;
+    }
+
+    if (down_trylock(&dm_ctx->parts_in_flight))
+    {
+        atomic64_inc(&dm_ctx->map_waits);
+        down(&dm_ctx->parts_in_flight);
     }
 
     bio->bi_iter.bi_sector = sector;
@@ -129,6 +137,9 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_page_pool;
     }
 
+    sema_init(&dm_ctx->parts_in_flight, MAX_PARTS_IN_FLIGHT);
+    atomic64_set(&dm_ctx->map_waits, 0);
+
     r = dm_set_target_max_io_len(ti, DATA_SIZE_SECTORS);
     if (r)
     {
@@ -186,6 +197,34 @@ static void dm_dtr(struct dm_target *ti)
     kfree(dm_ctx);
 }
 
+/// @brief Reports the state of the target to dmsetup
+/// @details
+/// STATUSTYPE_INFO (dmsetup status) gives the counters: for now the number of
+/// times dm_map waited for a place among the parts in flight.
+/// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
+/// @param ti           DM target
+/// @param type         What to report
+/// @param status_flags Flags of the request, unused
+/// @param result       Buffer for the text
+/// @param maxlen       Size of the buffer
+static void dm_status(struct dm_target *ti, status_type_t type,
+                      unsigned int status_flags, char *result, unsigned int maxlen)
+{
+    struct dm_context *dm_ctx = ti->private;
+    unsigned int sz = 0;
+
+    switch (type)
+    {
+    case STATUSTYPE_INFO:
+        DMEMIT("%llu", (unsigned long long)atomic64_read(&dm_ctx->map_waits));
+        break;
+    case STATUSTYPE_TABLE:
+    case STATUSTYPE_IMA:
+        result[0] = '\0';
+        break;
+    }
+}
+
 static struct target_type target = {
     .name = "corrdm",
     .version = {1, 0, 0},
@@ -193,6 +232,7 @@ static struct target_type target = {
     .ctr = dm_ctr,
     .dtr = dm_dtr,
     .map = dm_map,
+    .status = dm_status,
 };
 
 /// @brief Registers the DM target on module load

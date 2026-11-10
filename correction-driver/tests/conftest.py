@@ -135,6 +135,12 @@ class Stack:
     def sectors(self):
         return capacity(self.lower_sectors)
 
+    def map_waits(self):
+        """How many times the driver made a request wait for a place among the parts in flight."""
+        fields = run("dmsetup", "status", UPPER_NAME).stdout.split()
+        assert fields[2] == "corrdm", fields
+        return int(fields[3])
+
     def open(self):
         self.lower = BlockDevice(self.lower_path)
         self.upper = BlockDevice(self.upper_path)
