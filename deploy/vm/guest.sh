@@ -11,7 +11,7 @@ guest_reinit() {
     cd "$TREE/correction-driver"
 
     # The test devices stay behind when a test run was cut short.
-    for device in corrdm corrdm-test corrdm-test-lower; do
+    for device in corrdm corrdm-test corrdm-test-log corrdm-test-logdev corrdm-test-lower; do
         if dmsetup info "$device" >/dev/null 2>&1; then
             dmsetup remove "$device"
         fi

@@ -19,6 +19,11 @@ TEST_DISK = "/dev/vdb"
 REINIT_DEVICE = "corrdm"
 LOWER_NAME = "corrdm-test-lower"
 UPPER_NAME = "corrdm-test"
+# The crash tests put dm-log-writes between the driver and the lower device, with a log of its own.
+LOG_NAME = "corrdm-test-log"
+LOG_DEVICE_NAME = "corrdm-test-logdev"
+# Removed in this order, the devices on top first.
+TEST_DEVICES = (UPPER_NAME, LOG_NAME, LOG_DEVICE_NAME, LOWER_NAME)
 DEFAULT_LOWER_MIB = 16
 
 HUNG_TASK_SECONDS = 30
@@ -67,7 +72,7 @@ def environment():
         pytest.exit("the tests must run as root", returncode=2)
     if "corrdm" not in run("dmsetup", "targets").stdout:
         pytest.exit("the corrdm target is not loaded, run: deploy/vm.sh reinit", returncode=2)
-    for name in (UPPER_NAME, LOWER_NAME, REINIT_DEVICE):
+    for name in (*TEST_DEVICES, REINIT_DEVICE):
         if device_exists(name):
             dmsetup_remove(name)
     # Report stuck tasks soon and every time, so a hang is in the log before the test gives up.
@@ -158,9 +163,10 @@ class Stack:
         self.upper = BlockDevice(self.upper_path)
 
 
-def make_lower(sectors):
-    run("dmsetup", "create", LOWER_NAME, stdin=f"0 {sectors} linear {TEST_DISK} 0\n")
-    path = f"/dev/mapper/{LOWER_NAME}"
+def make_lower(sectors, name=LOWER_NAME, offset_mib=0):
+    """A zeroed dm-linear region of the test disk, at the start unless told otherwise."""
+    run("dmsetup", "create", name, stdin=f"0 {sectors} linear {TEST_DISK} {offset_mib * 2048}\n")
+    path = f"/dev/mapper/{name}"
     # Direct, so that nothing of this stays in the page cache of the test disk.
     run("dd", "if=/dev/zero", f"of={path}", "bs=1M", "oflag=direct", f"count={sectors // 2048}")
     return path

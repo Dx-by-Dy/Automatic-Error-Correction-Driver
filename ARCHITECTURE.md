@@ -196,11 +196,12 @@ it counts.
 **Decided:**
 
 - Everything runs in the development VM with a debug kernel, never on the host: [deploy/README.md](deploy/README.md).
-- Crash consistency is tested with `dm-log-writes` below the driver and `replay-log` from xfstests: the log
-  holds every lower request with its flushes and FUA, and replaying a prefix of it to a clean device gives the
-  state after a crash at that point. A prefix that ends at a flush must keep everything the filesystem made
-  durable. A prefix that cuts a write between its data and its metadata is a strict `xfail` until the open
-  question in [Cache](#cache) is decided.
+- Crash consistency is tested with `dm-log-writes` below the driver, and a replay of its log in the tests
+  (the format of `replay-log` from xfstests): the log holds every lower request with its flushes and FUA, and
+  replaying a prefix of it to a clean device gives the state after a crash at that point. A crash right after
+  an `fsync` must keep everything the filesystem made durable. A crash at any flush or FUA write, while other
+  writes are in flight, and a crash between the data and the metadata of one write, are strict `xfail` until
+  the open question in [Cache](#cache) is decided.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen blocks fail) and `dm-flakey` (writes
   fail or are dropped for a while).
 

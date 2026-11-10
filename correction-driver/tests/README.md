@@ -1,6 +1,6 @@
 # Driver tests
 
-165 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+171 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,7 +8,7 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 165 tests, about 17 minutes
+deploy/vm.sh test                                     # all 171 tests, about 17 minutes
 deploy/vm.sh test -m "not slow"                       # the fast ones: 135 tests, about 2 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
@@ -28,7 +28,9 @@ pytest through `deploy/vm/guest.sh`. Logs go to `~/vms/corrdm/logs/`: the test o
 
 **Device.** The `stack` fixture gives each test a new device, `make_stack(lower_mib)` one of a chosen
 size. The stack is `corrdm-test` (the driver) on `corrdm-test-lower` (`dm-linear` over the start of
-`/dev/vdb`). The lower device is zeroed first, 16 MiB by default.
+`/dev/vdb`). The lower device is zeroed first, 16 MiB by default. `test_crash.py` builds a stack of its own,
+with `dm-log-writes` between the two (`corrdm-test-log`, its log on `corrdm-test-logdev` at 256 MiB of
+`/dev/vdb`).
 
 **I/O.** `BlockDevice` in `harness.py` reads and writes whole sectors with `O_DIRECT`. The page cache
 would hide reads from the driver, and a buffered write to the lower device writes a whole 4 KiB block
@@ -109,6 +111,20 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
 | `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: a FUA write is seen (the journal commit) and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
+### `test_crash.py`: the device after a crash (6 tests)
+
+`dm-log-writes` logs every write that reaches the disk below the driver, with its flushes and FUA, in
+the order the data reaches the disk itself. `logwrites.py` reads the log and replays a prefix of it to the
+zeroed lower device, then the driver is put on it again: that is the device after a crash at that point.
+The format is that of `replay-log` from xfstests, which is not needed.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_flushed_writes_survive_a_crash` | 1 | Whole chunks, partial writes and a write across a chunk, each step flushed and marked, then a write left unflushed: at each mark the device holds exactly what was written before it |
+| `test_a_write_cut_between_data_and_metadata_reads_old_or_new` | 2 | **xfail**: Data and CRC are not written atomically. A whole chunk and one sector: the replay stops after the first of the two writes of the chunk, and the chunk must read as the old or the new data |
+| `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
+| `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`, **xfail**: Data and CRC are not written atomically. The same at every flush and FUA write after `mkfs`. It fails at once: ext4 writes its superblock, part of a chunk, with FUA, and its data reaches the disk before the metadata write is sent |
+
 ### `test_target.py`: arguments and table of the target (7 tests)
 
 | Test | Cases | Checks |
@@ -151,7 +167,7 @@ allocations whose stack passes through given code. How the driver uses memory is
 
 ## What is not tested yet
 
-The list is in `TODO.md`, under "Tests and tooling": lower device errors, lifecycle, crash consistency.
+The list is in `TODO.md`, under "Tests and tooling": lower device errors, lifecycle.
 
 A part lives in the per-bio data of its bio, so `bio_endio` frees it, and it must be the last thing
 `complete_work` does. KASAN does not report a read of the part right after `bio_endio`, for a reason not found
@@ -201,5 +217,13 @@ Flushes and FUA, with `test_durability.py`:
 | The metadata write of a whole chunk without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 4k blocks]` |
 | The metadata write of a partial write without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 1k blocks]` |
 | An empty flush completed in `dm_map` without reaching the lower device | 3 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
+
+Crash consistency, with `test_crash.py`:
+
+| Change | Failed | Where |
+| ------ | ------ | ----- |
+| An empty flush completed in `dm_map` without reaching the lower device | 2 | `test_flushed_writes_survive_a_crash`, `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
+| The metadata write of a partial write without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
+| The metadata write of a whole chunk without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[4k blocks]`; the case with 1 KiB blocks does not catch it |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
