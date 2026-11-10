@@ -202,8 +202,9 @@ it counts.
   an `fsync` must keep everything the filesystem made durable. A crash at any flush or FUA write, while other
   writes are in flight, and a crash between the data and the metadata of one write, are strict `xfail` until
   the open question in [Cache](#cache) is decided.
-- Failures of the lower device are tested with `dm-dust` (reads of chosen blocks fail) and `dm-flakey` (writes
-  fail or are dropped for a while).
+- Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
+  chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes that are dropped
+  silently wait for the threat model, as lost writes are an open threat.
 
 ## Decision log
 

@@ -35,8 +35,8 @@ in a run, **From reading** means it was only found in the code.
   misdirected write would pass the same way. Fix: mix the sector number into the seed.
 - **Data and CRC are not written atomically.** From reading: they are two independent bios, so
   after a power loss a chunk may have new data and an old CRC, and reads fail on data that
-  is fine. It is the same when the metadata bio of a partial write fails after its data bio
-  succeeded. Confirmed by the crash tests, which are strict `xfail` for it. Needs a decision, see
+  is fine. It is the same when the metadata bio of a partial write, its read of the old
+  metadata or its write of the new, fails after its data bio succeeded. Confirmed by the crash tests, which are strict `xfail` for it. Needs a decision, see
   "Cache" in `ARCHITECTURE.md`.
 - **Pages can change after their CRC is computed.** From reading, with `stable_writes=0`
   confirmed: the CRC is computed in `dm_map` and the pages are submitted later, without a copy.
@@ -86,7 +86,6 @@ Carried over from the previous list.
 ## Tests and tooling
 
 - **Tests that do not exist yet:**
-  - lower device errors, through `dm-flakey` and `dm-dust`;
   - lifecycle: removal under load, unloading the module, leaks through kmemleak.
 
 ## Documentation
@@ -99,8 +98,7 @@ Carried over from the previous list.
 ## Stages
 
 1. **Test base.** Data, corruption, filesystem, fio and target tests are in place, known bugs
-   are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
-   lifecycle.
+   are strict `xfail` or `known_hang`, `make check` is clean. What is left: lifecycle.
 2. **Cache.** Design it in `ARCHITECTURE.md`, then write it. It goes first as it changes the I/O path,
    the unit of the format and how flushes work.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and

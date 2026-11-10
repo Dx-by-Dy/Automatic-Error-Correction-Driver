@@ -22,8 +22,10 @@ UPPER_NAME = "corrdm-test"
 # The crash tests put dm-log-writes between the driver and the lower device, with a log of its own.
 LOG_NAME = "corrdm-test-log"
 LOG_DEVICE_NAME = "corrdm-test-logdev"
+# The tests of lower device errors put dm-dust or dm-flakey there.
+FAULTY_NAME = "corrdm-test-faulty"
 # Removed in this order, the devices on top first.
-TEST_DEVICES = (UPPER_NAME, LOG_NAME, LOG_DEVICE_NAME, LOWER_NAME)
+TEST_DEVICES = (UPPER_NAME, LOG_NAME, FAULTY_NAME, LOG_DEVICE_NAME, LOWER_NAME)
 DEFAULT_LOWER_MIB = 16
 
 HUNG_TASK_SECONDS = 30

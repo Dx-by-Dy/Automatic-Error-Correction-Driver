@@ -1,0 +1,168 @@
+"""Failures of the lower device: they fail only the I/O that needs the failed sector.
+
+dm-dust sits between the driver and the lower device, with 512-byte blocks, so a data sector and a
+metadata sector fail apart. Its blocks are sectors of the lower device. A block fails reads once
+added and enabled; a write to it clears it, unless it was added with a count of writes to fail
+first, and until then reads of it fail too. One test loads dm-flakey in its place instead.
+"""
+
+import errno
+
+import pytest
+
+from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
+from harness import DATA_SECTORS, BlockDevice, capacity, metadata_sector, pattern, physical_sector, run
+
+LOWER_MIB = 4
+CHUNKS = 3
+AREA = CHUNKS * DATA_SECTORS
+BAD_CHUNK = 1
+
+
+class FaultyStack:
+    """The driver on dm-dust on a zeroed lower device."""
+
+    def __init__(self):
+        sectors = LOWER_MIB * 2048
+        self.lower = make_lower(sectors)
+        self.lower_sectors = sectors
+        run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} dust {self.lower} 0 512\n")
+        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+        self.sectors = capacity(sectors)
+        self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+
+    def message(self, *words):
+        run("dmsetup", "message", FAULTY_NAME, "0", *map(str, words))
+
+    def fail(self, lower_sector, writes=None):
+        """Makes reads of a lower sector fail and, with a count, that many writes to it."""
+        self.message("addbadblock", lower_sector, *([] if writes is None else [writes]))
+        self.message("enable")
+
+    def load(self, table):
+        """Replaces the table of the faulty device, which the driver keeps open."""
+        run("dmsetup", "suspend", FAULTY_NAME)
+        run("dmsetup", "reload", FAULTY_NAME, stdin=f"0 {self.lower_sectors} {table}\n")
+        run("dmsetup", "resume", FAULTY_NAME)
+
+    def heal(self):
+        self.message("clearbadblocks")
+
+    def close(self):
+        self.upper.close()
+
+
+@pytest.fixture
+def faulty():
+    stack = FaultyStack()
+    stack.upper.write(0, pattern("before", AREA))
+    yield stack
+    stack.close()
+    for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
+        dmsetup_remove(name)
+
+
+def fails_with_eio(action):
+    try:
+        action()
+    except OSError as error:
+        assert error.errno == errno.EIO, error
+        return True
+    return False
+
+
+def unreadable_sectors(device):
+    """The sectors of the area that fail when read one at a time."""
+    return [sector for sector in range(AREA) if fails_with_eio(lambda: device.read(sector))]
+
+
+def chunk_sectors(chunk):
+    return list(range(chunk * DATA_SECTORS, (chunk + 1) * DATA_SECTORS))
+
+
+@pytest.mark.parametrize("index", [0, DATA_SECTORS - 1], ids=["first sector", "last sector"])
+def test_failed_data_sector_fails_only_its_reads(faulty, index):
+    bad = BAD_CHUNK * DATA_SECTORS + index
+    faulty.fail(physical_sector(bad))
+
+    assert unreadable_sectors(faulty.upper) == [bad]
+    assert fails_with_eio(lambda: faulty.upper.read(0, AREA))
+    assert faulty.upper.read(0, BAD_CHUNK * DATA_SECTORS) == pattern("before", AREA)[: BAD_CHUNK * DATA_SECTORS * 512]
+
+
+def test_failed_metadata_sector_fails_only_its_chunk(faulty):
+    faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
+    assert unreadable_sectors(faulty.upper) == chunk_sectors(BAD_CHUNK)
+
+
+def test_device_works_again_once_the_sector_reads(faulty):
+    faulty.fail(physical_sector(BAD_CHUNK * DATA_SECTORS))
+    faulty.fail(metadata_sector((BAD_CHUNK + 1) * DATA_SECTORS))
+    assert unreadable_sectors(faulty.upper)
+    faulty.heal()
+    assert faulty.upper.read(0, AREA) == pattern("before", AREA)
+
+
+def test_whole_chunk_write_over_a_failed_metadata_sector_needs_no_read(faulty):
+    """A whole chunk is written without reading its old metadata, and the write clears the bad sector."""
+    faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
+    assert fails_with_eio(lambda: faulty.upper.read(BAD_CHUNK * DATA_SECTORS)), "the failure is not on"
+    new = pattern("after", DATA_SECTORS)
+    faulty.upper.write(BAD_CHUNK * DATA_SECTORS, new)
+    assert faulty.upper.read(BAD_CHUNK * DATA_SECTORS, DATA_SECTORS) == new
+    assert not unreadable_sectors(faulty.upper)
+
+
+def test_partial_write_fails_when_the_old_metadata_does_not_read(faulty):
+    """Its CRCs cannot be merged with those of the other sectors, so the write fails.
+
+    What the chunk holds afterwards is open, see "Data and CRC are not written atomically" in
+    TODO.md; here only the error and the other chunks are checked.
+    """
+    faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
+    assert fails_with_eio(lambda: faulty.upper.write(BAD_CHUNK * DATA_SECTORS + 2, pattern("after", 1)))
+    faulty.heal()
+    readable = [sector for sector in range(AREA) if sector not in chunk_sectors(BAD_CHUNK)]
+    assert not set(unreadable_sectors(faulty.upper)) & set(readable)
+
+
+@pytest.mark.parametrize(
+    "lower_sector, start, sectors",
+    [
+        (physical_sector(BAD_CHUNK * DATA_SECTORS + 3), BAD_CHUNK * DATA_SECTORS, DATA_SECTORS),
+        (metadata_sector(BAD_CHUNK * DATA_SECTORS), BAD_CHUNK * DATA_SECTORS, DATA_SECTORS),
+        (physical_sector(BAD_CHUNK * DATA_SECTORS + 3), BAD_CHUNK * DATA_SECTORS + 3, 1),
+    ],
+    ids=["data of a whole chunk", "metadata of a whole chunk", "data of one sector"],
+)
+def test_failed_write_is_reported(faulty, lower_sector, start, sectors):
+    """A write whose data or metadata fails to reach the lower device fails, and the device goes on.
+
+    A failed metadata write of a partial write is in test_writes_fail_while_reads_go_on: dm-dust
+    would fail its read of the old metadata first.
+    """
+    faulty.fail(lower_sector, writes=1)
+    assert fails_with_eio(lambda: faulty.upper.write(start, pattern("after", sectors)))
+
+    faulty.heal()
+    new = pattern("again", sectors)
+    faulty.upper.write(start, new)
+    assert faulty.upper.read(start, sectors) == new
+    others = [sector for sector in range(AREA) if sector not in chunk_sectors(BAD_CHUNK)]
+    assert not set(unreadable_sectors(faulty.upper)) & set(others)
+
+
+def test_writes_fail_while_reads_go_on(faulty):
+    """dm-flakey fails every write and lets reads through, as a drive that can no longer write.
+
+    Nothing reaches the lower device, so all the data written before still reads back.
+    """
+    faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
+    for start, sectors in [(0, DATA_SECTORS), (BAD_CHUNK * DATA_SECTORS + 2, 1), (5, 6)]:
+        assert fails_with_eio(lambda: faulty.upper.write(start, pattern("after", sectors))), (start, sectors)
+    assert faulty.upper.read(0, AREA) == pattern("before", AREA)
+
+    faulty.load(f"linear {faulty.lower} 0")
+    assert faulty.upper.read(0, AREA) == pattern("before", AREA)
+    faulty.upper.write(0, pattern("again", AREA))
+    assert faulty.upper.read(0, AREA) == pattern("again", AREA)
