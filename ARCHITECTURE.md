@@ -73,9 +73,10 @@ device:
 The filesystem journal relies on 1 and 2 for the order of its writes, and on 3 when it replays: `jbd2` reads
 past the last commit to find the end of the journal, and a read error there stops the mount.
 
-**Current.** Points 1 and 2 do not hold: flushes do not reach the lower device ("`fsync` does not reach the
-lower device" in `TODO.md`). Point 3 does not hold: data and CRC are two writes ("Data and CRC are not written
-atomically").
+**Current.** Points 1 and 2 hold: an empty flush goes to the lower device as it is, and a FUA write is FUA
+for both its data and its metadata. As a write completes only once both have, a flush covers every write
+completed before it. Point 3 does not hold: data and CRC are two writes ("Data and CRC are not written
+atomically" in `TODO.md`).
 
 ## On-disk format
 

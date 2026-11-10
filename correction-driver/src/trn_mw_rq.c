@@ -94,7 +94,7 @@ void trn_mw_rq_init(struct trn_mw_rq *meta,
     memzero_page(meta->page, 0, METADATA_SIZE_SECTORS * SECTOR_SIZE);
 
     if (meta->chunk_full)
-        metadata_bio_init(part, meta->page, 0, REQ_OP_WRITE);
+        metadata_bio_init(part, meta->page, 0, metadata_write_opf(part->bio));
     else
         metadata_bio_init(part, meta->page, METADATA_SIZE_SECTORS * SECTOR_SIZE, REQ_OP_READ);
 

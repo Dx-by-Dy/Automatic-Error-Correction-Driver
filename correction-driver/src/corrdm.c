@@ -10,6 +10,11 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// Called by the DM subsystem for each incoming bio. DM splits requests at chunk
 /// boundaries, so the bio stays within one chunk.
 ///
+/// An empty flush goes to the lower device as it is. Device mapper sends one
+/// for each REQ_PREFLUSH, and the data of such a bio comes afterwards without
+/// the flag. A write completes only once its data and metadata have, so the
+/// flush covers every write completed before it.
+///
 /// For read and write operations, takes a place among the parts in flight,
 /// initializes the trn_p_rq in the per-bio data of the bio and processes it
 /// asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in flight, or for
@@ -17,12 +22,13 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// The waiting belongs here and never in a worker: workers run the complete_work
 /// that gives places and memory back.
 ///
-/// For other operations (FLUSH, DISCARD, etc.) forwards the bio
-/// directly to the lower-level device.
+/// Other operations are refused: device mapper sends none of them, as the
+/// target does not offer them, and remapping one would bypass the CRC.
 /// @param ti  DM target
 /// @param bio Incoming bio request
 /// @return DM_MAPIO_SUBMITTED for READ, WRITE.
-///         DM_MAPIO_REMAPPED for FLUSH, DISCARD, etc.
+///         DM_MAPIO_REMAPPED for an empty flush.
+///         DM_MAPIO_KILL for anything else.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
     DM_DEBUG("bio=%p op=%u sector=%llu size=%u\n",
@@ -36,19 +42,16 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
     sector_t sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     enum trn_p_type type;
 
+    if (bio->bi_opf & REQ_PREFLUSH)
+    {
+        if (WARN_ON_ONCE(bio_has_data(bio)))
+            return DM_MAPIO_KILL;
+        bio_set_dev(bio, dm_ctx->dev->bdev);
+        return DM_MAPIO_REMAPPED;
+    }
+
     switch (bio_op(bio))
     {
-    case REQ_OP_FLUSH:
-        flush_workqueue(dm_ctx->transform_wq);
-        bio->bi_iter.bi_sector = align_data_sector(sector);
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
-
-    case REQ_OP_DISCARD:
-        bio->bi_iter.bi_sector = align_data_sector(sector);
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
-
     case REQ_OP_READ:
         type = TRANSFORM_READ;
         break;
@@ -59,9 +62,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 
     default:
         DM_ERR("unsupported bio op=%u\n", bio_op(bio));
-        bio->bi_iter.bi_sector = align_data_sector(sector);
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
+        return DM_MAPIO_KILL;
     }
 
     if (down_trylock(&dm_ctx->parts_in_flight))
@@ -147,6 +148,8 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_dm_get_device;
     }
     ti->per_io_data_size = sizeof(struct trn_p_rq);
+    ti->num_flush_bios = 1;
+    ti->flush_supported = true;
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)

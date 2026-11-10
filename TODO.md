@@ -23,12 +23,6 @@ in a run, **From reading** means it was only found in the code.
 
 ## Integrity and durability
 
-- **`fsync` does not reach the lower device.** Confirmed: `vdb` is `write back`, the dm device is
-  `write through`. An `fsync` on the dm device gives 0 flush bios on `vdb`, the same `fsync` on
-  `vdb` itself gives 1. A filesystem believes its data is durable while it is in the lower
-  device's cache. `num_flush_bios` is not set, and the `REQ_OP_FLUSH` branch in `dm_map` is
-  dead code, since a flush arrives as an empty `REQ_OP_WRITE` with `REQ_PREFLUSH`. Fix: enable
-  flushes, handle the empty bio, carry FUA over to both the data and the metadata.
 - **A zeroed chunk passes the check.** Confirmed: with a chunk and its metadata sector zeroed
   on the lower device, the read succeeds and returns zeros. CRC64 of zeros with a zero seed is
   0, the same as empty metadata. A lost or trimmed region is never noticed. Fix: a non-zero
@@ -48,10 +42,9 @@ in a run, **From reading** means it was only found in the code.
   confirmed: the CRC is computed in `dm_map` and the pages are submitted later, without a copy.
   A page changed in between (`mmap`, a buffer in use during O_DIRECT) gives a CRC that does not
   match the data, then a false mismatch on read. The cache copies the data, which closes it.
-- **Other request types bypass the CRC.** From reading: the `REQ_OP_DISCARD` and `default`
-  branches in `dm_map` only remap the start sector, so a range would also cover metadata sectors.
-  They do not run today (`discard_max_bytes=0` confirmed). Either remove them, or implement
-  discard along with the "never written" state.
+- **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
+  operation other than read, write and an empty flush. Discard needs the "never written" state,
+  so that a discarded chunk does not fail its check.
 
 ## Device Mapper integration
 
@@ -107,8 +100,8 @@ Carried over from the previous list.
 ## Stages
 
 1. **Test base.** Data, corruption, filesystem, fio and target tests are in place, known bugs
-   are strict `xfail` or `known_hang`, `make check` is clean. What is left: flushes and FUA (tests and
-   the minimal fix), crash tests, lower device errors, lifecycle.
+   are strict `xfail` or `known_hang`, `make check` is clean. What is left: crash tests, lower device
+   errors, lifecycle.
 2. **Cache.** Design it in `ARCHITECTURE.md`, then write it. It goes first as it changes the I/O path,
    the unit of the format and how flushes work.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and

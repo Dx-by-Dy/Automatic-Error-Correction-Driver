@@ -74,6 +74,12 @@ Each chunk contains:
 7. Calculating and verifying checksums;
 8. Completing the request.
 
+### Flushes
+
+The device reports a write cache with FUA. An empty flush goes to the lower device as it is: a write completes
+only once its data and its metadata have, so the flush covers every write completed before it. A FUA write
+makes both its data and its metadata FUA. Any other operation, such as discard, is refused.
+
 ### Synchronization
 
 The driver uses chunk-level synchronization based on:

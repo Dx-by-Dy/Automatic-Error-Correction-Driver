@@ -1,6 +1,6 @@
 # Driver tests
 
-161 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+165 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 161 tests, about 17 minutes
-deploy/vm.sh test -m "not slow"                       # the fast ones: 131 tests, about 2 minutes
+deploy/vm.sh test                                     # all 165 tests, about 17 minutes
+deploy/vm.sh test -m "not slow"                       # the fast ones: 135 tests, about 2 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -96,15 +96,18 @@ Three chunks are written, and the damage is done to the middle one.
 | `test_zeroed_chunk_is_detected` | 1 | **xfail**: A zeroed chunk passes the check |
 | `test_chunk_copied_elsewhere_is_detected` | 1 | **xfail**: The CRC does not depend on the position |
 
-### `test_durability.py`: an fsync reaches the lower device (3 tests)
+### `test_durability.py`: flushes and FUA writes reach the lower device (7 tests)
 
-Counts flush and FUA bios on `/dev/vdb` through the `block_bio_queue` trace event.
+Reads the bios queued on `/dev/vdb` from the `block_bio_queue` trace event. A write is durable once it is FUA
+or a flush is queued after it, so after an `fsync` no write it caused may be neither.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_the_test_disk_has_a_write_cache` | 1 | Control: `vdb` is `write back`, or the next tests would prove nothing |
+| `test_device_reports_a_write_cache_and_fua` | 1 | The device is `write back` with `fua` 1, or the layers above send neither |
 | `test_fsync_on_the_lower_device_flushes` | 1 | Control: this way of counting does see flushes |
-| `test_fsync_on_the_device_flushes` | 1 | **xfail**: fsync does not reach the lower device |
+| `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
+| `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: a FUA write is seen (the journal commit) and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
 ### `test_target.py`: arguments and table of the target (7 tests)
 
@@ -189,5 +192,14 @@ Memory on the I/O path:
 | ------ | ------ | ----- |
 | The driver before the page pool and the lock table (`4a73a2f`) | Failed, `Input/output error` | All 13 tests above `test_write_goes_on_with_only_the_bio_reserve` |
 | A page reserve of 1 instead of 128 | Passed, as it should: parts go on one at a time | `test_write_goes_on_with_only_the_page_reserve`, `test_failed_page_allocation_does_not_fail_the_io` |
+
+Flushes and FUA, with `test_durability.py`:
+
+| Change | Failed | Where |
+| ------ | ------ | ----- |
+| The driver before flushes were enabled (`f130fb4`) | 3 | Every test of the device, the controls passed |
+| The metadata write of a whole chunk without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 4k blocks]` |
+| The metadata write of a partial write without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 1k blocks]` |
+| An empty flush completed in `dm_map` without reaching the lower device | 3 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.

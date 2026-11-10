@@ -62,6 +62,17 @@ struct trn_mw_rq
     bool chunk_full;
 };
 
+/// @brief Operation and flags of the bio that writes the metadata of a chunk
+/// @details
+/// A FUA write is durable once it completes, so its metadata has to be FUA as
+/// well: the data bio is the upper bio and keeps the flag by itself.
+/// @param data The data bio of the part
+/// @return REQ_OP_WRITE, with REQ_FUA if the data bio has it
+static inline blk_opf_t metadata_write_opf(const struct bio *data)
+{
+    return REQ_OP_WRITE | (data->bi_opf & REQ_FUA);
+}
+
 void trn_mw_rq_init(struct trn_mw_rq *meta,
                     struct trn_p_rq *part,
                     struct dm_context *dm_ctx);

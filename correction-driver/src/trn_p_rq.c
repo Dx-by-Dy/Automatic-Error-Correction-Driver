@@ -181,7 +181,7 @@ static void complete_work(struct work_struct *work)
             part->state = CRC_UPDATE;
             update_crc_local(&part->meta.write);
             bio_uninit(&part->meta_bio);
-            metadata_bio_init(part, part->meta.write.page, 0, REQ_OP_WRITE);
+            metadata_bio_init(part, part->meta.write.page, 0, metadata_write_opf(bio));
             atomic_inc(&part->pending);
             submit_bio(&part->meta_bio);
             return;
