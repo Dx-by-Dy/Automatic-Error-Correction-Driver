@@ -12,22 +12,14 @@ in a run, **From reading** means it was only found in the code.
 
 ## Memory and locking
 
-- **Allocations on the I/O path have no reserve.** Confirmed with `failslab` and `fail_page_alloc`: the
-  `kzalloc` and `alloc_page` calls for the metadata of a part, and those for the chunk lock and its
-  xarray nodes, have no mempool, so a failed one gives `BLK_STS_IOERR`. The device stays consistent and
-  KASAN is silent. From reading: small `GFP_NOIO` allocations may stall in reclaim rather than fail.
-  Fix: embed the metadata bio in the part, a page mempool, and a chunk lock table allocated in `dm_ctr`.
 - **No limit on requests in flight.** Confirmed: `fio` with `bs=1m`, `numjobs=8`, `iodepth=128` takes
   1179 MiB of available memory on the lower device and 2475 MiB through the driver, on the debug
   kernel. `dm_map` allocates everything for every chunk and returns, and a bio-based DM device has no
   request queue with tags, so only the submitters limit the load. Each chunk takes a whole page for
-  metadata plus structures and 1-2 bios, so writes of 4 KiB need more memory than the data they carry.
-  Fix: a limit on parts in flight, where `dm_map` waits, together with the mempools. The wait must be
-  in `dm_map`: workers sleeping on it would block the `complete_work` that releases it.
-- **A partial write takes two bios from one bioset.** From reading: `trn_mw_rq_init` allocates both
-  `read_bio` and `write_bio` from `transform_bs`. If all 128 reserved bios are held by parts waiting for
-  their second one, none can go on. Whole chunk writes take one, and a large write now goes on with only
-  the reserves. Fix: embed the metadata bio in the part.
+  metadata plus a clone with the part in its per-bio data, so writes of 4 KiB need more memory than the
+  data they carry.
+  Fix: a limit on parts in flight, where `dm_map` waits. The wait must be in `dm_map`: workers
+  sleeping on it would block the `complete_work` that releases it.
 
 ## Integrity and durability
 
@@ -57,10 +49,6 @@ in a run, **From reading** means it was only found in the code.
   A page changed in between (`mmap`, a buffer in use during O_DIRECT) gives a CRC that does not
   match the data, then a false mismatch on read. Fix: request stable writes in `io_hints` and
   check it is enough, or write from a copy.
-- **The metadata sector has an uninitialized tail.** From reading: `alloc_page` is not zeroed, and
-  only 64 of the 512 bytes are filled before the sector goes to disk. The run showed zeros, but
-  `init_on_alloc` is on here and hides it. Without it, kernel memory reaches the disk.
-  Fix: `__GFP_ZERO`.
 - **Other request types bypass the CRC.** From reading: the `REQ_OP_DISCARD` and `default`
   branches in `dm_map` only remap the start sector, so a range would also cover metadata sectors.
   They do not run today (`discard_max_bytes=0` confirmed). Either remove them, or implement
@@ -131,8 +119,8 @@ Carried over from the previous list.
 1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
    lifecycle, `sparse`.
-2. **Memory and locking.** Clean up the rest of [Memory and locking](#memory-and-locking): the bioset,
-   the mempools and the limit on requests in flight. The planned cache will replace pairing upper and
+2. **Memory and locking.** Clean up the rest of [Memory and locking](#memory-and-locking): the limit on
+   requests in flight. The planned cache will replace pairing upper and
    lower bios, so keep this simple. Done when that section is empty and the tests in `test_memory.py` pass.
 3. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.

@@ -76,10 +76,13 @@ Each chunk contains:
 The driver uses chunk-level synchronization based on:
 
 * A lock of its own: state under a spinlock and a list of waiting parts, in order of arrival
-* `xarray`
-* Lazy lock allocation
+* A fixed table of 65536 such locks, allocated when the target is created: chunk n uses lock n modulo 65536
 
-This approach allows concurrent reads while preventing conflicting write operations and minimizing memory consumption. A part that has to wait does not hold a worker: the part that releases the lock queues the next one.
+This approach allows concurrent reads while preventing conflicting write operations, and taking a lock never allocates memory. Chunks that share a lock sometimes wait for each other, which cannot deadlock, as a part holds one lock at a time. A part that has to wait does not hold a worker: the part that releases the lock queues the next one.
+
+### Memory
+
+Nothing on the I/O path can fail to allocate. A part lives in the per-bio data of its bio, with its metadata structure and its metadata bio embedded in it, and the page for the metadata sector comes from a mempool with a reserve of 128 pages. When memory is short, `dm_map` waits for a page that another part gives back; workers never wait for memory, as they run the completions that give it back.
 
 ## Building
 

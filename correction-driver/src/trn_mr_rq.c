@@ -4,81 +4,45 @@
 
 /// @brief Initializes struct trn_mr_rq
 /// @details
-/// Allocates memory for trn_mr_rq, a page for storing metadata,
-/// iterator for bio reading data, and creates bio for reading
-/// chunk metadata from disk.
+/// Takes a page for the metadata from the page pool and sets up
+/// part->meta_bio to read the chunk metadata sector into it.
 ///
-/// Expected execution context - process.
-///
-/// On error at any stage, frees all allocated resources.
-/// @param part Parent struct trn_p_rq for chunk transformation
+/// Expected execution context - process, may sleep: waits for a page
+/// from the pool if memory is short, and never fails.
+/// @param meta   Structure to initialize, inside part
+/// @param part   Parent struct trn_p_rq for chunk transformation
 /// @param dm_ctx Driver context
-/// @return Pointer to trn_mr_rq on success, NULL on error
-struct trn_mr_rq *
-trn_mr_rq_init(struct trn_p_rq *part,
-               struct dm_context *dm_ctx)
+void trn_mr_rq_init(struct trn_mr_rq *meta,
+                    struct trn_p_rq *part,
+                    struct dm_context *dm_ctx)
 {
     DM_DEBUG("part=%p bio_sector=%llu\n", part, (unsigned long long)part->bio->bi_iter.bi_sector);
-
-    int r;
-    struct trn_mr_rq *meta;
-
-    meta = kzalloc_obj(*meta, GFP_NOIO);
-    if (!meta)
-    {
-        DM_ERR("kzalloc failed\n");
-        return NULL;
-    }
 
     meta->first_sector = (u8)(align_data_sector(part->bio->bi_iter.bi_sector) - part->index);
     meta->nr_sectors = bio_sectors(part->bio);
     meta->part = part;
+    meta->metadata_page = mempool_alloc(dm_ctx->page_pool, GFP_NOIO);
 
-    meta->metadata_page = alloc_page(GFP_NOIO);
-    if (!meta->metadata_page)
-    {
-        DM_ERR("alloc_page failed\n");
-        kfree(meta);
-        return NULL;
-    }
+    metadata_bio_init(part, meta->metadata_page, 0, REQ_OP_READ);
 
-    r = metadata_bio_init(&meta->read_bio,
-                          meta->metadata_page,
-                          0,
-                          dm_ctx,
-                          part,
-                          start_metadata_sector(part->bio->bi_iter.bi_sector),
-                          (blk_opf_t)REQ_OP_READ);
-    if (r)
-    {
-        DM_ERR("metadata_bio_init for read_bio failed, err=%d\n", r);
-        __free_page(meta->metadata_page);
-        kfree(meta);
-        return NULL;
-    }
-    meta->read_bio->bi_end_io = trn_p_rq_end_io;
-
-    DM_DEBUG("meta=%p read_bio=%p first_sector=%u nr_sectors=%u\n",
-             meta, meta->read_bio, meta->first_sector, meta->nr_sectors);
-    DM_DEBUG_BIO(meta->read_bio);
-
-    return meta;
+    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+             meta, meta->first_sector, meta->nr_sectors);
+    DM_DEBUG_BIO(&part->meta_bio);
 }
 
 /// @brief Frees all resources of struct trn_mr_rq
 /// @details
-/// Frees metadata reading bio, memory page, and the structure itself.
+/// Releases the metadata bio and returns the page to the pool.
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure
 void complete_trn_mr_rq(struct trn_mr_rq *meta)
 {
-    DM_DEBUG("meta=%p read_bio=%p first_sector=%u nr_sectors=%u\n",
-             meta, meta->read_bio, meta->first_sector, meta->nr_sectors);
+    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+             meta, meta->first_sector, meta->nr_sectors);
 
-    bio_put(meta->read_bio);
-    __free_page(meta->metadata_page);
-    kfree(meta);
+    bio_uninit(&meta->part->meta_bio);
+    mempool_free(meta->metadata_page, meta->part->dm_ctx->page_pool);
 }
 
 /// @brief Verifies CRC of read data against chunk metadata

@@ -1,128 +1,50 @@
+#include <linux/slab.h>
+
 #include "locker.h"
+#include "alignment.h"
 #include "macros.h"
 
-/// @brief Initializes the lock table
+/// @brief Allocates and initializes the lock table
 /// @details
-/// Performs initialization of the XArray used to store lock objects.
-///
+/// Expected execution context - process, may sleep.
 /// @param locker Pointer to the lock table structure
-void locker_init(struct locker *locker)
+/// @return 0 on success, -ENOMEM on error
+int locker_init(struct locker *locker)
 {
     DM_DEBUG("locker=%p\n", locker);
 
-    xa_init(&locker->table);
+    locker->table = kvcalloc(LOCKER_SIZE, sizeof(*locker->table), GFP_KERNEL);
+    if (!locker->table)
+        return -ENOMEM;
+
+    for (unsigned long i = 0; i < LOCKER_SIZE; i++)
+    {
+        spin_lock_init(&locker->table[i].wait_lock);
+        INIT_LIST_HEAD(&locker->table[i].waiters);
+    }
+
+    return 0;
 }
 
-/// @brief Frees all resources of the lock table
+/// @brief Frees the lock table
 /// @details
-/// Iterates over all XArray elements and removes them via kfree_rcu.
-///
+/// No part may hold or wait for a lock by then.
 /// @param locker Pointer to the lock table
 void locker_exit(struct locker *locker)
 {
     DM_DEBUG("locker=%p\n", locker);
 
-    struct lock *lock;
-    unsigned long index;
-
-    xa_for_each(&locker->table, index, lock)
-    {
-        xa_erase(&locker->table, index);
-        kfree_rcu(lock, rcu);
-    }
-
-    xa_destroy(&locker->table);
+    kvfree(locker->table);
+    locker->table = NULL;
 }
 
-/// @brief Safely obtains a lock from the lock table
+/// @brief Finds the lock of a chunk
 /// @details
-/// The function attempts to obtain an existing lock from the XArray under RCU.
-/// If the lock is absent, creates a new instance and attempts to atomically
-/// insert it via xa_cmpxchg.
-///
+/// Never fails and never allocates.
 /// @param locker Lock table
-/// @param index Lock index
-/// @return Pointer to lock on success, NULL on memory allocation error
-struct lock *locker_get_lock(struct locker *locker, unsigned long index)
+/// @param index Physical sector of the start of the chunk data area
+/// @return The lock of the chunk
+struct lock *locker_lock_of(struct locker *locker, sector_t index)
 {
-    DM_DEBUG("locker=%p, index=%lu\n", locker, index);
-
-    struct lock *lock;
-    struct lock *old;
-
-    rcu_read_lock();
-    old = xa_load(&locker->table, index);
-    if (old)
-    {
-        if (refcount_inc_not_zero(&old->refcnt))
-        {
-            rcu_read_unlock();
-            return old;
-        }
-    }
-    rcu_read_unlock();
-
-    lock = kzalloc_obj(*lock, GFP_NOIO);
-    if (!lock)
-    {
-        DM_ERR("kzalloc failed\n");
-        return NULL;
-    }
-    spin_lock_init(&lock->wait_lock);
-    INIT_LIST_HEAD(&lock->waiters);
-    refcount_set(&lock->refcnt, 1);
-
-    xa_lock(&locker->table);
-    old = __xa_cmpxchg(&locker->table,
-                       index,
-                       NULL,
-                       lock,
-                       GFP_NOIO);
-
-    if (!xa_is_err(old) && old)
-        refcount_inc(&old->refcnt);
-    xa_unlock(&locker->table);
-
-    if (xa_is_err(old))
-    {
-        DM_ERR("xa_cmpxchg failed\n");
-        kfree(lock);
-        return NULL;
-    }
-
-    if (old)
-    {
-        kfree(lock);
-        return old;
-    }
-
-    return lock;
-}
-
-/// @brief Safely releases a lock from the lock table
-/// @details
-/// Decrements the lock's refcount. If this is the last owner,
-/// the object is removed from the XArray and freed via RCU.
-///
-/// Guarantees safe deletion even with concurrent access.
-/// @param locker Lock table
-/// @param index Lock index
-/// @param lock The lock to release a reference to
-void locker_put_lock(struct locker *locker,
-                     unsigned long index,
-                     struct lock *lock)
-{
-    DM_DEBUG("locker=%p, index=%lu, lock=%p\n", locker, index, lock);
-
-    xa_lock(&locker->table);
-    if (!refcount_dec_and_test(&lock->refcnt))
-    {
-        xa_unlock(&locker->table);
-        return;
-    }
-
-    __xa_erase(&locker->table, index);
-    xa_unlock(&locker->table);
-
-    kfree_rcu(lock, rcu);
+    return &locker->table[(index / CHUNK_SIZE_SECTORS) & (LOCKER_SIZE - 1)];
 }

@@ -129,53 +129,59 @@ def injection():
     current.finish()
 
 
-def test_failed_first_allocation_keeps_the_bio(stack, injection):
-    """Whichever allocation of the driver comes first, the request must end."""
-    injection.arm("failslab", driver_range())
-    outcome = injection.run(lambda: stack.upper.read(0, DATA_SECTORS))
-    assert outcome is not STUCK
-
-
-@pytest.mark.xfail(strict=True, reason="TODO.md: Allocations on the I/O path have no reserve")
-@pytest.mark.parametrize("fault", ["failslab", "fail_page_alloc"])
 @pytest.mark.parametrize("operation", ["read", "write"])
-def test_failed_allocation_does_not_fail_the_io(stack, injection, fault, operation):
-    """One allocation fails, as when memory is short, and the request must not notice."""
+def test_io_takes_nothing_from_slab_in_the_driver(stack, injection, operation):
+    """Every slab allocation whose stack passes the driver fails, and the request must not notice."""
     old, new = pattern(1, SECTORS), pattern(2, SECTORS)
     stack.upper.write(0, old)
-    injection.arm(fault, function_range("trn_p_rq_init"))
+    injection.arm("failslab", driver_range(), times=-1)
     if operation == "write":
         outcome = injection.run(lambda: stack.upper.write(0, new))
         assert not isinstance(outcome, OSError), outcome
-        assert stack.upper.read(0, SECTORS) == new
+        expected = new
     else:
-        assert injection.run(lambda: stack.upper.read(0, SECTORS)) == old
+        outcome = injection.run(lambda: stack.upper.read(0, SECTORS))
+        assert outcome == old
+        expected = old
+    injection.disarm()
+    assert stack.upper.read(0, SECTORS) == expected
 
 
-@pytest.mark.parametrize("interval", [1, 7, 13, 29, 53, 97])
+@pytest.mark.parametrize("interval", [1, 7, 13, 29, 53])
 @pytest.mark.parametrize("operation", ["read", "write"])
-def test_failed_allocation_leaves_the_device_usable(stack, injection, operation, interval):
-    """Fails one allocation at a varying place: the request is correct, or reports an error.
+def test_failed_page_allocation_does_not_fail_the_io(stack, injection, operation, interval):
+    """One metadata page fails to allocate at a varying place, and the reserve must take its place.
 
-    Several parts of the request may be in flight then, which the error path has to wind down.
+    A request of 64 chunks takes 64 pages, so every interval here lands within it.
     """
     old, new = pattern(1, SECTORS), pattern(2, SECTORS)
     stack.upper.write(0, old)
-    injection.arm("failslab", function_range("trn_p_rq_init"), interval=interval)
+    injection.arm("fail_page_alloc", function_range("trn_p_rq_init"), interval=interval)
     if operation == "write":
         outcome = injection.run(lambda: stack.upper.write(0, new))
+        assert not isinstance(outcome, OSError), outcome
+        expected = new
     else:
         outcome = injection.run(lambda: stack.upper.read(0, SECTORS))
-    assert outcome is not STUCK
-    assert injection.fired("failslab"), "no allocation failed, so this tested nothing"
+        assert outcome == old
+        expected = old
+    assert injection.fired("fail_page_alloc"), "no allocation failed, so this tested nothing"
     injection.disarm()
+    assert stack.upper.read(0, SECTORS) == expected
 
-    after = stack.upper.read(0, SECTORS)
-    if operation == "read":
-        assert after == old
-        assert isinstance(outcome, OSError) or outcome == old
-    elif not isinstance(outcome, OSError):
-        assert after == new
+
+def test_write_goes_on_with_only_the_page_reserve(stack, injection):
+    """All new metadata pages of this thread fail, so only the reserve of the driver is left.
+
+    A write of 1 MiB takes 256 pages, more than the reserve holds, so parts must wait for pages
+    that others give back, and it must still finish.
+    """
+    data = pattern(1, 2048)
+    injection.arm("fail_page_alloc", function_range("trn_p_rq_init"), times=-1)
+    outcome = injection.run(lambda: stack.upper.write(0, data))
+    assert outcome is not STUCK
+    assert not isinstance(outcome, OSError), outcome
+    assert injection.run(lambda: stack.upper.read(0, 2048)) == data
 
 
 @pytest.mark.slow

@@ -4,7 +4,6 @@
 #include <linux/bio.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
-#include <linux/refcount.h>
 
 #include "corrdm.h"
 #include "locker.h"
@@ -32,17 +31,17 @@ enum trn_p_state
     /// @brief Chunk lock is acquired; bios are about to be submitted or are in flight.
     LOCKED,
 
-    /// @brief (TRANSFORM_WRITE only) meta.write->read_bio has completed;
-    /// local CRC is being updated in meta.write->page and on disk via meta.write->write_bio.
+    /// @brief (TRANSFORM_WRITE only) the old metadata has been read;
+    /// local CRC is being updated in meta.write.page and on disk via meta_bio.
     CRC_UPDATE,
 };
 
-/// @brief Union of pointers to read and write metadata structures
+/// @brief Union of read and write metadata structures
 /// @details The active field type is determined by the type field in trn_p_rq.
 union trn_m_rq
 {
-    struct trn_mw_rq *write;
-    struct trn_mr_rq *read;
+    struct trn_mw_rq write;
+    struct trn_mr_rq read;
 };
 
 /// @brief Structure for single chunk transformation
@@ -53,10 +52,12 @@ union trn_m_rq
 ///
 /// Lives in the per-bio data of that bio (ti->per_io_data_size), so it cannot
 /// fail to allocate, and it is freed along with the bio: nothing may touch it
-/// after bio_endio at the end of complete_work.
+/// after bio_endio at the end of complete_work. Its metadata structure and
+/// metadata bio are embedded in it, and the metadata page comes from a mempool,
+/// so nothing on the I/O path can fail to allocate.
 ///
 /// Lifecycle:
-///   1. trn_p_rq_init         — resource allocation, bio and metadata initialization
+///   1. trn_p_rq_init         — bio and metadata initialization
 ///   2. submit_work           — acquiring chunk lock, or waiting for it on its list and running
 ///                              again when it is granted; submitting bios to the underlying device
 ///   3. complete_work         — see details of the complete_work field
@@ -75,8 +76,9 @@ struct trn_p_rq
 
     /// @brief Work item for advancing the state machine and eventually finalizing the structure lifecycle
     /// @details For TRANSFORM_READ: releases the lock and triggers CRC verification (check_crc), followed by resource cleanup.
-    ///          For TRANSFORM_WRITE (read_bio): triggers local CRC update (update_crc_local) and submits write_bio.
-    ///          For TRANSFORM_WRITE (write_bio): triggers lock release and resource cleanup.
+    ///          For TRANSFORM_WRITE (old metadata read): triggers local CRC update (update_crc_local)
+    ///          and submits meta_bio again to write the metadata.
+    ///          For TRANSFORM_WRITE (metadata written): triggers lock release and resource cleanup.
     struct work_struct complete_work;
 
     /// @brief Driver context
@@ -100,8 +102,8 @@ struct trn_p_rq
 
     /// @brief Counter of outstanding bios: data bio + metadata bio
     /// @details Initialized to 2. When it reaches 0, complete_work is invoked.
-    /// Can be incremented from 0 to 1 after a successful read_bio during TRANSFORM_WRITE
-    /// to re-invoke complete_work after write_bio completes.
+    /// Can be incremented from 0 to 1 after a successful read of the old metadata during
+    /// TRANSFORM_WRITE to re-invoke complete_work after the metadata is written.
     atomic_t pending;
 
     /// @brief Current lifecycle state
@@ -112,12 +114,20 @@ struct trn_p_rq
 
     /// @brief Chunk metadata structure (read or write depending on type)
     union trn_m_rq meta;
+
+    /// @brief Bio for the metadata sector of the chunk
+    /// @details Set up by metadata_bio_init. A partial write reads the old metadata
+    /// with it, then sets it up again to write the new one.
+    struct bio meta_bio;
+
+    /// @brief The only segment of meta_bio
+    struct bio_vec meta_bvec;
 };
 
-int trn_p_rq_init(struct trn_p_rq *part,
-                  struct bio *bio,
-                  struct dm_context *dm_ctx,
-                  enum trn_p_type type);
+void trn_p_rq_init(struct trn_p_rq *part,
+                   struct bio *bio,
+                   struct dm_context *dm_ctx,
+                   enum trn_p_type type);
 void trn_p_rq_end_io(struct bio *bio);
 
 #endif

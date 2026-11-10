@@ -61,130 +61,72 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 
 /// @brief Initializes struct trn_mw_rq
 /// @details
-/// Allocates memory for trn_mw_rq, a page for metadata, and necessary bios.
+/// Takes a page for the metadata from the page pool, with its first sector
+/// cleared, as only the CRCs are filled in before it goes to disk.
 ///
-/// For partial write (chunk_full == false) creates read_bio to read
+/// For partial write (chunk_full == false) sets up part->meta_bio to read
 /// old metadata into the second half of the page, to later
-/// preserve CRC for unmodified sectors. Then creates write_bio to write
+/// preserve CRC for unmodified sectors. complete_work sets it up again to write
 /// updated metadata from the first half of the page.
 ///
-/// For full write (chunk_full == true) read_bio is not created —
-/// all sector CRCs are recalculated and immediately written.
+/// For full write (chunk_full == true) the old metadata is not read —
+/// part->meta_bio is set up to write all recalculated CRCs at once.
 ///
 /// In both cases, calls bio_crc_calc to calculate new CRCs
 /// from data in part->bio.
 ///
-/// Expected execution context - process.
-///
-/// On error at any stage, frees all previously allocated resources.
+/// Expected execution context - process, may sleep: waits for a page
+/// from the pool if memory is short, and never fails.
+/// @param meta   Structure to initialize, inside part
 /// @param part   Parent struct trn_p_rq
 /// @param dm_ctx Driver context
-/// @return Pointer to trn_mw_rq on success, NULL on error
-struct trn_mw_rq *
-trn_mw_rq_init(struct trn_p_rq *part,
-               struct dm_context *dm_ctx)
+void trn_mw_rq_init(struct trn_mw_rq *meta,
+                    struct trn_p_rq *part,
+                    struct dm_context *dm_ctx)
 {
     DM_DEBUG("part=%p\n", part);
-
-    int r;
-    struct trn_mw_rq *meta;
-
-    meta = kzalloc_obj(*meta, GFP_NOIO);
-    if (!meta)
-    {
-        DM_ERR("kzalloc failed\n");
-        return NULL;
-    }
 
     meta->chunk_full = (bio_sectors(part->bio) == DATA_SIZE_SECTORS);
     meta->first_sector = (u8)(align_data_sector(part->bio->bi_iter.bi_sector) - part->index);
     meta->nr_sectors = (u8)bio_sectors(part->bio);
     meta->part = part;
+    meta->page = mempool_alloc(dm_ctx->page_pool, GFP_NOIO);
+    memzero_page(meta->page, 0, METADATA_SIZE_SECTORS * SECTOR_SIZE);
 
-    meta->page = alloc_page(GFP_NOIO);
-    if (!meta->page)
-    {
-        DM_ERR("alloc_page failed\n");
-        kfree(meta);
-        return NULL;
-    }
+    if (meta->chunk_full)
+        metadata_bio_init(part, meta->page, 0, REQ_OP_WRITE);
+    else
+        metadata_bio_init(part, meta->page, METADATA_SIZE_SECTORS * SECTOR_SIZE, REQ_OP_READ);
 
-    if (!meta->chunk_full)
-    {
-        r = metadata_bio_init(&meta->read_bio,
-                              meta->page,
-                              METADATA_SIZE_SECTORS * SECTOR_SIZE,
-                              dm_ctx,
-                              part,
-                              start_metadata_sector(part->bio->bi_iter.bi_sector),
-                              (blk_opf_t)REQ_OP_READ);
-        if (r)
-        {
-            DM_ERR("metadata_bio_init for read_bio failed, err=%d\n", r);
-            __free_page(meta->page);
-            kfree(meta);
-            return NULL;
-        }
-        meta->read_bio->bi_end_io = trn_p_rq_end_io;
-
-        DM_DEBUG("meta=%p read_bio=%p\n", meta, meta->read_bio);
-        DM_DEBUG_BIO(meta->read_bio);
-    }
-
-    r = metadata_bio_init(&meta->write_bio,
-                          meta->page,
-                          0,
-                          dm_ctx,
-                          part,
-                          start_metadata_sector(part->bio->bi_iter.bi_sector),
-                          (blk_opf_t)REQ_OP_WRITE);
-    if (r)
-    {
-        DM_ERR("metadata_bio_init for write_bio failed, err=%d\n", r);
-        if (!meta->chunk_full)
-            bio_put(meta->read_bio);
-        __free_page(meta->page);
-        kfree(meta);
-        return NULL;
-    }
-
-    meta->write_bio->bi_end_io = trn_p_rq_end_io;
     bio_crc_calc(meta, part->bio);
 
-    DM_DEBUG("meta=%p, write_bio=%p, chunk_full=%d, first_sector=%u, nr_sectors=%u\n",
+    DM_DEBUG("meta=%p, chunk_full=%d, first_sector=%u, nr_sectors=%u\n",
              meta,
-             meta->write_bio,
              meta->chunk_full,
              meta->first_sector,
              meta->nr_sectors);
-    DM_DEBUG_BIO(meta->write_bio);
-
-    return meta;
+    DM_DEBUG_BIO(&part->meta_bio);
 }
 
 /// @brief Frees all resources of struct trn_mw_rq
 /// @details
-/// Frees read_bio (only when chunk_full == false), write_bio,
-/// memory page, and the structure itself.
+/// Releases the metadata bio and returns the page to the pool.
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure
 void complete_trn_mw_rq(struct trn_mw_rq *meta)
 {
-    DM_DEBUG("meta=%p write_bio=%p chunk_full=%d first_sector=%u nr_sectors=%u\n",
-             meta, meta->write_bio, meta->chunk_full,
+    DM_DEBUG("meta=%p chunk_full=%d first_sector=%u nr_sectors=%u\n",
+             meta, meta->chunk_full,
              meta->first_sector, meta->nr_sectors);
 
-    if (!meta->chunk_full)
-        bio_put(meta->read_bio);
-    bio_put(meta->write_bio);
-    __free_page(meta->page);
-    kfree(meta);
+    bio_uninit(&meta->part->meta_bio);
+    mempool_free(meta->page, meta->part->dm_ctx->page_pool);
 }
 
 /// @brief Merges old and new CRCs
 /// @details
-/// Runs after successful old metadata read via read_bio.
+/// Runs after successful old metadata read via part->meta_bio.
 ///
 /// Copies CRCs for sectors unaffected by the current write request
 /// from old metadata (second half of page) to new
@@ -192,7 +134,7 @@ void complete_trn_mw_rq(struct trn_mw_rq *meta)
 /// calculated in bio_crc_calc during initialization.
 ///
 /// Expected execution context - process.
-/// @param meta Metadata transformation structureых
+/// @param meta Metadata transformation structure
 void update_crc_local(struct trn_mw_rq *meta)
 {
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",

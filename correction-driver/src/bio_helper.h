@@ -4,14 +4,11 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 
-struct dm_context;
+struct trn_p_rq;
 
-int metadata_bio_init(struct bio **bio,
-                      struct page *page,
-                      unsigned int offset,
-                      struct dm_context *dm_ctx,
-                      void *private_data,
-                      sector_t sector,
-                      blk_opf_t opf);
+void metadata_bio_init(struct trn_p_rq *part,
+                       struct page *page,
+                       unsigned int offset,
+                       blk_opf_t opf);
 
 #endif
