@@ -83,11 +83,6 @@ Carried over from the previous list.
 - **Use the Crypto API to speed up CRC64.**
 - **Cache hot metadata blocks** (a lock on the cache and a state machine).
 
-## Tests and tooling
-
-- **Tests that do not exist yet:**
-  - lifecycle: removal under load, unloading the module, leaks through kmemleak.
-
 ## Documentation
 
 - **The README uses the wrong target name.** Confirmed: it says `correction_driver`, the target is
@@ -97,8 +92,9 @@ Carried over from the previous list.
 
 ## Stages
 
-1. **Test base.** Data, corruption, filesystem, fio and target tests are in place, known bugs
-   are strict `xfail` or `known_hang`, `make check` is clean. What is left: lifecycle.
+1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
+   and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
+   clean. What is left: mark the commit before the cache.
 2. **Cache.** Design it in `ARCHITECTURE.md`, then write it. It goes first as it changes the I/O path,
    the unit of the format and how flushes work.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and

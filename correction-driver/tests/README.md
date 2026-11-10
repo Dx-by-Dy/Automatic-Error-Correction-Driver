@@ -1,6 +1,6 @@
 # Driver tests
 
-181 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+185 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 181 tests, about 17 minutes
-deploy/vm.sh test -m "not slow"                       # the fast ones: 145 tests, about 3 minutes
+deploy/vm.sh test                                     # all 185 tests, about 18 minutes
+deploy/vm.sh test -m "not slow"                       # the fast ones: 146 tests, about 3 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -142,6 +142,22 @@ Three chunks are written first, and the middle one gets the failures.
 | `test_failed_write_is_reported` | 3 | The data or the metadata of a whole chunk, the data of one sector fails to write once: the write fails with `EIO`, the next one succeeds, the other chunks read |
 | `test_writes_fail_while_reads_go_on` | 1 | `dm-flakey` with `error_writes`: whole, partial and crossing writes fail, the data from before reads back, and once `dm-linear` is back the device takes writes again |
 
+### `test_lifecycle.py`: the device and the module come and go (4 tests)
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, enough that parts wait in `dm_map` for a place, which is checked |
+| `test_table_reload_under_load` | 1 | `slow`: the same with `dmsetup reload` and `resume`, which builds a new target and destroys the old one |
+| `test_module_unloads_only_without_devices` | 1 | `rmmod` fails while a device exists, succeeds without one; loaded again, the device works |
+| `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: its lock table in `/proc/vmallocinfo` and the rescuer thread of its workqueue are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
+
+`kmemleak` does not catch everything here. A context left behind by `dm_dtr` was not reported in a minute of
+scans, and showed up only after more devices had come and gone. The likely reason: per-bio data is not cleared
+when a bio is allocated again, so bios in the reserves of the bio pools still hold the old `part->dm_ctx`, and
+`kmemleak` takes that for a reference. It also reports a leak only a few scans after it, so a leak from an
+earlier test of the same boot may show up in this one. The lock table and the workqueue are checked directly
+for that reason.
+
 ### `test_target.py`: arguments and table of the target (7 tests)
 
 | Test | Cases | Checks |
@@ -184,7 +200,9 @@ allocations whose stack passes through given code. How the driver uses memory is
 
 ## What is not tested yet
 
-The list is in `TODO.md`, under "Tests and tooling": lifecycle.
+Nothing of what stage 1 of `TODO.md` asked for. Suspend and reload under load have no positive control: the
+driver has no code for them yet, so no change to it makes them fail but for ones that break everything else
+too. They will guard the cache, which has to write back its data on a suspend.
 
 A part lives in the per-bio data of its bio, so `bio_endio` frees it, and it must be the last thing
 `complete_work` does. KASAN does not report a read of the part right after `bio_endio`, for a reason not found
@@ -248,5 +266,14 @@ Lower device errors, with `test_lower_errors.py`:
 | Change | Failed | Where |
 | ------ | ------ | ----- |
 | `complete_work` hands the bio back with `BLK_STS_OK` instead of the status of the part | 10 | All of them |
+
+Lifecycle, with `test_lifecycle.py`:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| `dm_exit` does not unregister the target | Failed, `insmod` gives an error; the kernel then oopses in `get_target_type`, as the target list points into the unloaded module, and needs `deploy/vm.sh reset` | `test_module_unloads_only_without_devices` |
+| `dm_dtr` does not free the lock table | Failed, one vmalloc area more | `test_nothing_leaks` |
+| `dm_dtr` does not destroy the workqueue | Failed, one rescuer thread more | `test_nothing_leaks` |
+| `dm_dtr` does not free the context | **Not caught**, see above | `test_nothing_leaks` |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
