@@ -1,7 +1,7 @@
 # Driver tests
 
 161 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
-as they overwrite `/dev/vdb`. The VM is described in [CLAUDE.md](../../CLAUDE.md).
+as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
 
@@ -15,7 +15,7 @@ deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
 
 `deploy/vm.sh test` copies the working tree to the VM, rebuilds and reloads the driver, then runs
-`deploy/run_tests.sh`. Logs go to `~/vms/corrdm/logs/`: the test output and the kernel log of the run.
+pytest through `deploy/vm/guest.sh`. Logs go to `~/vms/corrdm/logs/`: the test output and the kernel log of the run.
 
 | Exit code | Meaning |
 | --------- | ------- |
@@ -40,6 +40,7 @@ with 8 CRCs of 8 bytes each. A change of layout has to be made there as well.
 **Kernel log.** Each test reads the kernel log it caused. An unknown `BUG`, `WARNING`, `Oops`, KASAN,
 UBSAN, lockdep or hung task report fails the test. `KNOWN_KERNEL_REPORTS` in `conftest.py` lists the
 reports of bugs already in `TODO.md`: they are counted at the end of the run and do not fail it.
+Remove an entry when its bug is fixed.
 
 **Hangs.** A hang ends the whole run, as stuck I/O never finishes and no later test could pass. There
 are two ways to detect one, and both print the test name and dump blocked tasks and busy workqueues to
@@ -158,7 +159,8 @@ that window would go unseen.
 
 ## Do the tests catch bugs?
 
-Checked by breaking the driver on purpose, in the copy inside the VM, and running the fast tests:
+Checked by breaking the driver on purpose, in the copy inside the VM, and running the fast tests with
+`deploy/vm.sh test --no-sync`, see [deploy/README.md](../../deploy/README.md):
 
 | Change | Failed | Where |
 | ------ | ------ | ----- |

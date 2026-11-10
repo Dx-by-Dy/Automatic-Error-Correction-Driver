@@ -170,6 +170,10 @@ dmsetup remove corrdm
 
 ## Testing
 
+The driver is built, loaded and tested only in a development VM with a debug kernel, never on the host:
+see [deploy/README.md](deploy/README.md). The tests are described in
+[correction-driver/tests/README.md](correction-driver/tests/README.md).
+
 ### Write and Read Benchmarks
 
 Uncompetitive write benchmark:

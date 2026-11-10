@@ -1,7 +1,7 @@
 # TODO
 
 How the driver works is in [README.md](README.md) and `docs/`; how to build and
-run it is in [CLAUDE.md](CLAUDE.md); the tests are described in
+run it is in [deploy/README.md](deploy/README.md); the tests are described in
 [correction-driver/tests/README.md](correction-driver/tests/README.md). This file holds only what is
 not done yet.
 The order of work is in [Stages](#stages), at the end.
@@ -24,7 +24,7 @@ in a run, **From reading** means it was only found in the code.
   seed, plus a way to tell unwritten chunks from written ones (see the next item).
 - **A fresh device has to be zeroed by hand.** From reading: there is no superblock, format
   version or "never written" state. On a device with old contents every read fails, and
-  `corrdm_reinit.sh` zeroes only the first 1 GiB.
+  `deploy/vm.sh reinit` zeroes only the first 1 GiB.
 - **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
   another chunk reads back without an error, as the sector number is not part of the CRC. A
   misdirected write would pass the same way. Fix: mix the sector number into the seed.

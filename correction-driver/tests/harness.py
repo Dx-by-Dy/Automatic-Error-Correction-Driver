@@ -45,7 +45,7 @@ def pattern(seed, sectors):
 def declare_hang(reason):
     """Ends the run at once: stuck I/O never finishes, so no later test could pass.
 
-    Leaves the kernel's view of the hang in its log and tells deploy/run_tests.sh about it.
+    Leaves the kernel's view of the hang in its log and tells deploy/vm/guest.sh about it.
     A thread stuck in the kernel keeps this process alive after its exit, which is why the
     wrapper has to be told, and why all descriptors are closed: otherwise the SSH session
     would stay open for as long as the process exists.
