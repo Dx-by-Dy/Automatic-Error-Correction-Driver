@@ -1,6 +1,7 @@
 # TODO
 
-How the driver works is in [README.md](README.md) and `docs/`; how to build and
+How the driver works is in [README.md](README.md) and `docs/`; the global decisions (threat model,
+contract, format, cache) are in [ARCHITECTURE.md](ARCHITECTURE.md); how to build and
 run it is in [deploy/README.md](deploy/README.md); the tests are described in
 [correction-driver/tests/README.md](correction-driver/tests/README.md). This file holds only what is
 not done yet.
@@ -46,8 +47,7 @@ in a run, **From reading** means it was only found in the code.
 - **Pages can change after their CRC is computed.** From reading, with `stable_writes=0`
   confirmed: the CRC is computed in `dm_map` and the pages are submitted later, without a copy.
   A page changed in between (`mmap`, a buffer in use during O_DIRECT) gives a CRC that does not
-  match the data, then a false mismatch on read. Fix: request stable writes in `io_hints` and
-  check it is enough, or write from a copy.
+  match the data, then a false mismatch on read. The cache copies the data, which closes it.
 - **Other request types bypass the CRC.** From reading: the `REQ_OP_DISCARD` and `default`
   branches in `dm_map` only remap the start sector, so a range would also cover metadata sectors.
   They do not run today (`discard_max_bytes=0` confirmed). Either remove them, or implement
@@ -104,24 +104,20 @@ Carried over from the previous list.
 - **The README claims functional testing is done**, and does not mention the VM.
 - **`MODULE_DESCRIPTION` says "Linux Kernel 6.16"**, while the driver builds on 7.1 and 7.2.
 
-## Open questions
-
-- Should a CRC cover a 512-byte sector or the whole 4 KiB chunk? Per sector takes 64 bytes per chunk
-  and can tell which sector is bad, which matters for correction.
-- Should metadata stay next to the data? It makes a metadata write a seek and splits
-  sequential I/O; a separate area would change the on-disk format, so decide before ECC.
-
 ## Stages
 
-1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
-   are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
-   lifecycle.
-2. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
-   position in the CRC, the on-disk format, crash tests.
-3. **Device Mapper integration and docs.** `.status` with the table and more counters, table length, queue limits,
-   the README.
-4. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, to compare the
-   later stages against.
-5. **Correction.** Settle the open questions, design the code and the format, implement recovery.
-6. **Optimization.** Metadata cache, preallocation, Crypto API, tuning the limit on parts in flight,
-   guided by the baseline.
+1. **Test base.** Data, corruption, filesystem, fio and target tests are in place, known bugs
+   are strict `xfail` or `known_hang`, `make check` is clean. What is left: flushes and FUA (tests and
+   the minimal fix), crash tests, lower device errors, lifecycle.
+2. **Cache.** Design it in `ARCHITECTURE.md`, then write it. It goes first as it changes the I/O path,
+   the unit of the format and how flushes work.
+3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and
+   position in the CRC after the threat research, discard.
+4. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,
+   queue limits, the README.
+5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
+   the cache and for the cache.
+6. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
+   implement recovery.
+7. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
+   flight, guided by the baseline.

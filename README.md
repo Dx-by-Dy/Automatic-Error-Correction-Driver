@@ -23,6 +23,9 @@ The project serves as a foundation for future implementation of Error Correcting
 
 ## Architecture
 
+The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
+[ARCHITECTURE.md](ARCHITECTURE.md). This section describes the driver as it is.
+
 The virtual device is divided into fixed-size chunks.
 
 Each chunk contains:
