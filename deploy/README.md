@@ -59,6 +59,21 @@ reaches the file. It uses Linux AIO on a real disk and its own threads on tmpfs,
 `guest_run` sends `guest.sh` over SSH to `bash` in the VM, so the guest needs only the synced tree.
 `guest.sh` refuses to run outside a VM.
 
+## sparse
+
+`deploy/vm.sh check` runs `sparse` through the kernel build (`C=1`). The kernel takes it only if it
+understands `__typeof_unqual__`, which sparse 0.6.4 from Fedora does not, so without a newer one `make check`
+prints a warning and goes on without it. Build it from upstream inside the VM, once; `/usr/local/bin` comes
+first in the `secure_path` of `sudo`, so `make check` finds it:
+
+```bash
+deploy/vm.sh ssh 'sudo dnf -y -q install git && git clone --depth 1 https://git.kernel.org/pub/scm/devel/sparse/sparse.git ~/sparse && make -C ~/sparse -j6 sparse && sudo install -m 755 ~/sparse/sparse /usr/local/bin/sparse'
+deploy/vm.sh ssh 'sh /usr/src/kernels/$(uname -r)/scripts/checker-valid.sh sparse -m64 -mlittle-endian'   # must print 1
+```
+
+Checked with commit `84ec065` of 2026-10-22, whose `--version` still says 0.6.4. A deliberate endianness bug
+(`md->crc[i] = current_crc` without `cpu_to_le64`) gives `incorrect type in assignment`.
+
 ## Tests and hangs
 
 - A test also fails on `BUG`, `WARNING`, KASAN, UBSAN, lockdep and hung task reports in the kernel log.

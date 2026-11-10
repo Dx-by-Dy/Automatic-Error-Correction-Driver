@@ -96,9 +96,6 @@ Carried over from the previous list.
   - lower device errors, through `dm-flakey` and `dm-dust`;
   - lifecycle: removal under load, unloading the module, leaks through kmemleak;
   - crash consistency: `dm-log-writes`.
-- **`sparse` does not run.** The kernel requires `__typeof_unqual__`, which sparse 0.6.4 from
-  Fedora does not support, so `make check` prints a warning and skips it. It takes a build from
-  upstream sources.
 
 ## Documentation
 
@@ -118,7 +115,7 @@ Carried over from the previous list.
 
 1. **Trustworthy tests.** Data, corruption, filesystem, fio and target tests are in place, known bugs
    are strict `xfail` or `known_hang`, `make check` is clean. What is left: lower device errors,
-   lifecycle, `sparse`.
+   lifecycle.
 2. **Integrity and durability.** Flushes first, as they lose data today; then stable pages, seed and
    position in the CRC, the on-disk format, crash tests.
 3. **Device Mapper integration and docs.** `.status` with the table and more counters, table length, queue limits,
