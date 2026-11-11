@@ -1,6 +1,6 @@
 # Driver tests
 
-185 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+194 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 185 tests, about 18 minutes
-deploy/vm.sh test -m "not slow"                       # the fast ones: 146 tests, about 3 minutes
+deploy/vm.sh test                                     # all 194 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 154 tests, about 4 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -83,6 +83,22 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 | `test_data_survives_recreating_the_device` | 1 | Data and CRCs persist after `dmsetup remove` and `create` |
 | `test_random_writes_match_a_reference_copy` | 1 | 1500 random overlapping reads and writes against a copy in memory, fixed seed |
 
+### `test_cache.py`: the write back cache (8 tests)
+
+What reaches the lower device and when, and what reads see before it does. The chunk under test is written
+and flushed first where the lower device has to hold it.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_a_write_reaches_the_lower_device_on_a_flush` | 1 | A write is not on the lower device and counts as dirty, and is there after a flush |
+| `test_dirty_data_is_written_back_by_age` | 1 | Without a flush, the data reaches the lower device within 10 seconds |
+| `test_a_fua_write_reaches_the_lower_device` | 1 | A write with `RWF_DSYNC`, so FUA, is on the lower device when it returns |
+| `test_a_suspend_writes_back` | 1 | `dmsetup suspend` writes back what is dirty; after `resume` it reads back |
+| `test_a_partial_chunk_writes_only_its_sectors` | 1 | Sectors 1 and 5 of a chunk written: the lower device changes only there, and each sector reads with its CRC |
+| `test_a_read_of_a_partly_dirty_chunk` | 1 | One dirty sector comes from the cache, the other seven from the lower device |
+| `test_a_dirty_sector_reads_while_a_clean_one_is_damaged` | 1 | A damaged clean sector fails, the dirty one and the sectors before it read |
+| `test_writes_larger_than_the_cache_go_through` | 1 | `slow`: 96 MiB through a cache of 64 MiB, without a flush in between, all read back. Waits for free entries are checked under fio, in `test_lifecycle.py` and `test_memory.py` |
+
 ### `test_corruption.py`: damage is detected, and only where it is (28 tests)
 
 Three chunks are written, and the damage is done to the middle one.
@@ -112,7 +128,7 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_device_reports_a_write_cache_and_fua` | 1 | The device is `write back` with `fua` 1, or the layers above send neither |
 | `test_fsync_on_the_lower_device_flushes` | 1 | Control: this way of counting does see flushes |
 | `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
-| `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: a FUA write is seen (the journal commit) and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
+| `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: the journal commit is seen, as a FUA write on the lower device alone and as a flush through the driver, whose cache turns FUA into a write back and a flush; and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
 ### `test_crash.py`: the device after a crash (6 tests)
 
@@ -126,9 +142,9 @@ The format is that of `replay-log` from xfstests, which is not needed.
 | `test_flushed_writes_survive_a_crash` | 1 | Whole chunks, partial writes and a write across a chunk, each step flushed and marked, then a write left unflushed: at each mark the device holds exactly what was written before it |
 | `test_a_write_cut_between_data_and_metadata_reads_old_or_new` | 2 | **xfail**: Data and CRC are not written atomically. A whole chunk and one sector: the replay stops after the first of the two writes of the chunk, and the chunk must read as the old or the new data |
 | `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
-| `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`, **xfail**: Data and CRC are not written atomically. The same at every flush and FUA write after `mkfs`. It fails at once: ext4 writes its superblock, part of a chunk, with FUA, and its data reaches the disk before the metadata write is sent |
+| `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush and FUA write after `mkfs`. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA. With the cache a flush reaches the disk only after every write back before it, so nothing of the driver is in flight at these points |
 
-### `test_lower_errors.py`: the lower device fails (10 tests)
+### `test_lower_errors.py`: the lower device fails (11 tests)
 
 `dm-dust` with 512-byte blocks fails reads of chosen sectors of the lower device, and writes to them a
 chosen number of times; a write to such a sector clears it. One test loads `dm-flakey` in its place.
@@ -142,13 +158,14 @@ Three chunks are written first, and the middle one gets the failures.
 | `test_whole_chunk_write_over_a_failed_metadata_sector_needs_no_read` | 1 | The chunk does not read, then a write of it succeeds, as it does not read the old metadata, and the chunk reads back |
 | `test_partial_write_fails_when_the_old_metadata_does_not_read` | 1 | The write or its flush fails with `EIO`; the other chunks read. What the chunk holds after it is open |
 | `test_failed_write_is_reported` | 3 | The data or the metadata of a whole chunk, the data of one sector fails to write once: the write or its flush fails with `EIO`, the next one succeeds, the other chunks read |
-| `test_writes_fail_while_reads_go_on` | 1 | `dm-flakey` with `error_writes`: whole, partial and crossing writes fail, the data from before reads back, and once `dm-linear` is back the device takes writes again |
+| `test_writes_fail_while_reads_go_on` | 1 | `dm-flakey` with `error_writes`: whole, partial and crossing writes fail on their flush and stay in the cache, so they read back, and every flush fails; once `dm-linear` is back a flush writes them back and the device takes writes again |
+| `test_a_cache_full_of_failed_chunks_refuses_writes` | 1 | `dm-flakey` with `error_writes` under a device larger than the cache: writes of 1 MiB are taken in until every entry has failed, at most 64 MiB, then refused with `EIO`; what was taken in reads back, and reaches the lower device once `dm-linear` is back |
 
 ### `test_lifecycle.py`: the device and the module come and go (4 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, enough that parts wait in `dm_map` for a place, which is checked |
+| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds, so writes wait in `dm_map` for a free entry, which is checked |
 | `test_table_reload_under_load` | 1 | `slow`: the same with `dmsetup reload` and `resume`, which builds a new target and destroys the old one |
 | `test_module_unloads_only_without_devices` | 1 | `rmmod` fails while a device exists, succeeds without one; loaded again, the device works |
 | `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: its lock table in `/proc/vmallocinfo` and the rescuer thread of its workqueue are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
@@ -193,18 +210,17 @@ allocations whose stack passes through given code. How the driver uses memory is
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_io_takes_nothing_from_slab_in_the_driver` | 2 | `read`, `write` of 64 chunks while every slab allocation through the driver fails: no error and correct data |
-| `test_failed_page_allocation_does_not_fail_the_io` | 10 | `read`, `write` of 64 chunks with one metadata page failing at a varying place, which must have happened: the reserve takes over, no error and correct data |
-| `test_write_goes_on_with_only_the_page_reserve` | 1 | All new metadata pages of the thread fail, and a write of 1 MiB, more pages than the reserve holds, must finish and read back |
+| `test_io_takes_nothing_from_slab_in_the_driver` | 2 | `read`, `write` and flush of 64 chunks while every slab allocation through the driver fails, for a write in any task, as the write back runs in the worker of the cache: no error and correct data |
+| `test_failed_page_allocation_does_not_fail_the_io` | 10 | `read`, `write` and flush of 64 chunks with one metadata page failing at a varying place, which must have happened: the reserve takes over, no error and correct data |
+| `test_write_goes_on_with_only_the_page_reserve` | 1 | All new metadata pages fail, and a write of 1 MiB and its flush, more pages than the reserve holds, must finish and read back |
 | `test_write_goes_on_with_only_the_bio_reserve` | 1 | `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
 | `test_ordinary_load_does_not_wait` | 1 | `fio` `randrw` with `bs=128k`, `iodepth=16`, at most 512 parts: `dmsetup status` shows no wait for a place among the parts in flight |
-| `test_memory_of_requests_in_flight_is_limited` | 1 | `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device, and requests waited for the limit. Measured: 1074 MiB on the lower device, 1052 MiB through the driver, 28833 waits |
+| `test_memory_of_requests_in_flight_is_limited` | 1 | `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device, and writes waited for a free entry of the cache. Measured before the cache: 1074 MiB on the lower device, 1052 MiB through the driver |
 
 ## What is not tested yet
 
-Nothing of what stage 1 of `TODO.md` asked for. Suspend and reload under load have no positive control: the
-driver has no code for them yet, so no change to it makes them fail but for ones that break everything else
-too. They will guard the cache, which has to write back its data on a suspend.
+Nothing of what stage 1 of `TODO.md` asked for. That a write to an entry under write back waits is not tested
+on its own: the fio tests that compete for chunks go through it, but nothing checks the counter.
 
 A part lives in the per-bio data of its bio, so `bio_endio` frees it, and it must be the last thing
 `complete_work` does. KASAN does not report a read of the part right after `bio_endio`, for a reason not found
@@ -251,8 +267,8 @@ Flushes and FUA, with `test_durability.py`:
 | Change | Failed | Where |
 | ------ | ------ | ----- |
 | The driver before flushes were enabled (`f130fb4`) | 3 | Every test of the device, the controls passed |
-| The metadata write of a whole chunk without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 4k blocks]` |
-| The metadata write of a partial write without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 1k blocks]` |
+| Before the cache: the metadata write of a whole chunk without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 4k blocks]` |
+| Before the cache: the metadata write of a partial write without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 1k blocks]` |
 | An empty flush completed in `dm_map` without reaching the lower device | 3 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
 
 Crash consistency, with `test_crash.py`:
@@ -260,8 +276,8 @@ Crash consistency, with `test_crash.py`:
 | Change | Failed | Where |
 | ------ | ------ | ----- |
 | An empty flush completed in `dm_map` without reaching the lower device | 2 | `test_flushed_writes_survive_a_crash`, `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
-| The metadata write of a partial write without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
-| The metadata write of a whole chunk without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[4k blocks]`; the case with 1 KiB blocks does not catch it |
+| Before the cache: the metadata write of a partial write without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
+| Before the cache: the metadata write of a whole chunk without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[4k blocks]`; the case with 1 KiB blocks does not catch it |
 
 Lower device errors, with `test_lower_errors.py`:
 
@@ -279,3 +295,20 @@ Lifecycle, with `test_lifecycle.py`:
 | `dm_dtr` does not free the context | **Not caught**, see above | `test_nothing_leaks` |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
+
+The cache, with `test_cache.py` and the tests changed for it:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The driver before the cache (`b07497f`), with these tests | Failed, 3 | `test_a_write_reaches_the_lower_device_on_a_flush`, `test_writes_fail_while_reads_go_on`, `test_a_cache_full_of_failed_chunks_refuses_writes`; the others of `test_cache.py` pass on a driver that writes through |
+| `BlockDevice.flush` does nothing | Failed, 38 | The tests that look at or damage the lower device after a write, in `test_data.py`, `test_corruption.py`, `test_lower_errors.py`, `test_target.py` |
+| No write back by age (100 s instead of 1 s) | Failed | `test_dirty_data_is_written_back_by_age` |
+| A FUA write completes at once, as a plain write | Failed, 2 | The two device cases of `test_fsync_on_ext4_leaves_nothing_in_the_cache`; `test_a_dsync_write_reaches_the_lower_device` cannot tell, as `RWF_DSYNC` on a block device also does an fsync |
+| No write back on suspend | Failed, 2 | `test_a_suspend_writes_back`, `test_data_survives_recreating_the_device` |
+| The whole chunk counts as dirty | Failed, 2 | `test_a_partial_chunk_writes_only_its_sectors`, `test_a_read_of_a_partly_dirty_chunk`; only since the fixture writes another chunk after the original, as a freed entry comes back with its page unchanged |
+| A read copies the whole bio from the cache | Failed, 2 | `test_a_read_of_a_partly_dirty_chunk`, `test_a_dirty_sector_reads_while_a_clean_one_is_damaged` |
+| A flush does not try failed chunks again | Failed, 2 | `test_writes_fail_while_reads_go_on`, `test_a_cache_full_of_failed_chunks_refuses_writes` |
+
+A read cut to 0 sectors by `dm_accept_partial_bio` makes device mapper send it again and again, until the
+write back by age frees the entry and the read goes to the lower device, with the right data. The read tests
+check that the chunk is still dirty after the read, so such a bug fails them.

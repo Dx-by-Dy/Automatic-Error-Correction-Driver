@@ -73,10 +73,10 @@ device:
 The filesystem journal relies on 1 and 2 for the order of its writes, and on 3 when it replays: `jbd2` reads
 past the last commit to find the end of the journal, and a read error there stops the mount.
 
-**Current.** Points 1 and 2 hold: an empty flush goes to the lower device as it is, and a FUA write is FUA
-for both its data and its metadata. As a write completes only once both have, a flush covers every write
-completed before it. Point 3 does not hold: data and CRC are two writes ("Data and CRC are not written
-atomically" in `TODO.md`).
+**Current.** Points 1 and 2 hold: an empty flush and a FUA write wait until the cache has written back
+everything dirty and the lower device has flushed. Point 3 does not hold: data and CRC are two writes ("Data
+and CRC are not written atomically" in `TODO.md`). Point 5 holds as written: a failed write back fails every
+flush until the chunk is written.
 
 ## On-disk format
 
@@ -115,15 +115,19 @@ device, so the cache can read or write them in one request, and no seek separate
 **Decided**, the rules from stage 2 that any new design keeps:
 
 - Nothing on the I/O path allocates in a way that can fail: per-bio data, embedded structures, mempools.
-- All waiting happens in `dm_map`, which slows down the submitter as a full disk queue would. A worker never
-  waits for memory, a limit or a lock, as workers run the completions that give those back.
+- All waiting happens in `dm_map`, which slows down the submitter as a full disk queue would, or in the worker
+  of the cache, which runs on a workqueue of its own. The workers of `transform_wq` never wait for memory, a
+  limit or a lock, as they run the completions that give those back.
+- `dm_map` never waits for a lower bio of its own: it stays on `current->bio_list` until `map` returns.
 - A part never holds one element of a pool while waiting for another from the same pool.
 - The number of requests in flight is bounded.
 
-**Current.** Device mapper splits each bio at chunk boundaries (`max_io_len` of 8 sectors). Each piece is a part
-in the per-bio data of its bio, takes the lock of its chunk, and goes to the lower device as a data bio and a
-metadata bio. A write computes the CRC in `dm_map`; a partial write reads the old metadata first. A read checks
-the CRC in a worker. Details are in [README.md](README.md).
+**Current.** Device mapper splits each bio at chunk boundaries (`max_io_len` of 8 sectors). A write is copied
+into the cache and completes. The worker writes an entry back as one part per run of its dirty sectors: the part
+takes the lock of its chunk and goes to the lower device as a data bio and a metadata bio, and a partial chunk
+reads the old metadata first. A read takes the sectors the cache holds from it; the rest is a part in the
+per-bio data of its bio, which reads from the lower device and checks the CRC in a worker. Details are in
+[README.md](README.md).
 
 **Decided**, why this has to change: upper bios are tied to lower bios one chunk at a time. A large request
 becomes many 4 KiB pieces, each with its own metadata request, and a read takes two lower requests per chunk.
@@ -164,6 +168,17 @@ complexity and bugs.
   the rest of the chunk is not read.
 - **A write to a chunk under write back waits in `dm_map`** for now, and the waits are counted. A second copy of
   the chunk, as in `dm-writecache`, is the likely final answer and is left for the optimization stage.
+- **FUA goes the way of a flush** for now: the data is copied into the cache, then everything dirty is written
+  back and the lower device flushed before the bio completes. A write back of that chunk alone with FUA is left
+  for the optimization stage.
+- **A failed chunk is retried** only on a flush, on a suspend, or when it is written again; there is no timer of
+  its own.
+- **A suspend cannot fail**, so a chunk that still fails to write when the device is suspended for a removal or
+  a reload is lost, with its number in the kernel log. The reserved area will give it somewhere to go.
+- **The lock of a chunk moves into the cache**, after the first version of the cache and before runs: a read of
+  the lower device registers its range in the tree of the cache while in flight, and a write back waits for the
+  reads in flight on its chunks, while new reads of their clean sectors wait for it. A run spans many chunks, and
+  a part may not hold many chunk locks.
 - **Defaults are constants for now:** 64 MiB of cache per device, write back from 50% used down to 45%, an age of
   1 s. They are to be tuned later.
 
@@ -219,9 +234,9 @@ it counts.
 - Crash consistency is tested with `dm-log-writes` below the driver, and a replay of its log in the tests
   (the format of `replay-log` from xfstests): the log holds every lower request with its flushes and FUA, and
   replaying a prefix of it to a clean device gives the state after a crash at that point. A crash right after
-  an `fsync` must keep everything the filesystem made durable. A crash at any flush or FUA write, while other
-  writes are in flight, and a crash between the data and the metadata of one write, are strict `xfail` until
-  the two CRCs of [Cache](#cache) are written.
+  an `fsync` must keep everything the filesystem made durable, and so must a crash at any flush or FUA write
+  while other writes of the filesystem are in flight. A crash between the data and the metadata of one write is
+  strict `xfail` until the two CRCs of [Cache](#cache) are written.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
   chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes that are dropped
   silently wait for the threat model, as lost writes are an open threat.
@@ -239,4 +254,6 @@ it counts.
 | 2026-11-11 | The cache is a structure of our own in the shape of `dm-writecache` pmem, without `dm-bufio`, a chunk as its unit, keeping only dirty data for now | Write back stays under our control; [comparison](RESEARCH.md#caches-and-integrity-in-device-mapper) |
 | 2026-11-11 | Two CRCs are tried first for a write cut short by a crash, no journal | No blind spot, no double write, fits the format; [what it requires](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs) |
 | 2026-11-11 | The layout stays 8+1 until measured; a failed write back stays in RAM, with a place to plug in a reserved area later | Numbers first; the area needs a superblock, so it waits for the format |
+| 2026-11-11 | FUA goes the way of a flush; a failed chunk is retried on a flush, a suspend or a new write; a chunk that fails on a suspend is lost with a log line | One path of code first; a suspend cannot fail, and the reserved area is not there yet |
+| 2026-11-11 | The lock of a chunk is replaced by ranges in flight in the tree of the cache, before runs | A run spans many chunks; one state machine in the driver instead of two |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |

@@ -123,12 +123,13 @@ class BlockDevice:
             done = os.preadv(self.fd, [memoryview(buffer)[:size]], sector * SECTOR_SIZE)
             return buffer[:done]
 
-    def write(self, sector, data):
+    def write(self, sector, data, flags=0):
+        """Writes whole sectors; flags=os.RWF_DSYNC makes it a FUA write."""
         assert len(data) % SECTOR_SIZE == 0, "writes must be whole sectors"
         with mmap.mmap(-1, _page_aligned(len(data))) as buffer:
             buffer[: len(data)] = data
             done = os.pwritev(
-                self.fd, [memoryview(buffer)[: len(data)]], sector * SECTOR_SIZE
+                self.fd, [memoryview(buffer)[: len(data)]], sector * SECTOR_SIZE, flags
             )
         assert done == len(data), f"short write: {done} of {len(data)} bytes"
 

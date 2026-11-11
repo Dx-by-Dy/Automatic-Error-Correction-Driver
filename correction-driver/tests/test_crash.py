@@ -231,12 +231,14 @@ def test_ext4_survives_a_crash_after_each_fsync(logged, block_size):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason="TODO.md: Data and CRC are not written atomically")
 def test_ext4_survives_a_crash_at_any_flush(logged):
     """A crash at any flush or FUA write, with other writes of the filesystem in flight.
 
-    ext4 writes its superblock, part of a chunk, with FUA: the data reaches the disk before the
-    metadata write is even sent, so a crash between them leaves a chunk that does not read.
+    Before the cache it failed at once: ext4 writes its superblock, part of a chunk, with FUA, and the
+    data reached the disk before the metadata write was even sent. The cache turns a FUA write into a
+    write back and a flush, and sends a flush down only once every write back before it is done, so at
+    these points nothing of the driver is in flight. A crash between the data and the metadata of one
+    write is still possible, between flushes: test_a_write_cut_between_data_and_metadata_reads_old_or_new.
     """
     entries, written, marks = ext4_workload(logged)
     start = mark_index(entries, "mkfs")

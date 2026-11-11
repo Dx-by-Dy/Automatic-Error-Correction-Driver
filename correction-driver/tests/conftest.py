@@ -53,6 +53,22 @@ def device_exists(name):
     return run("dmsetup", "info", name, check=False).returncode == 0
 
 
+STATUS_FIELDS = ("map_waits", "free_waits", "busy_waits", "dirty", "failed")
+
+
+def device_status(name=UPPER_NAME):
+    """The counters of the driver in dmsetup status, see dm_status in corrdm.c.
+
+    map_waits: reads that waited in dm_map for a place among the parts in flight;
+    free_waits: writes that waited for a free entry of the cache;
+    busy_waits: writes that waited for an entry under write back;
+    dirty: entries with data not yet on the lower device; failed: entries whose write back failed.
+    """
+    fields = run("dmsetup", "status", name).stdout.split()
+    assert fields[2] == "corrdm", fields
+    return dict(zip(STATUS_FIELDS, map(int, fields[3:]), strict=True))
+
+
 def pytest_terminal_summary(terminalreporter):
     if known_report_counts:
         terminalreporter.section("known kernel reports, see TODO.md")
@@ -142,11 +158,12 @@ class Stack:
     def sectors(self):
         return capacity(self.lower_sectors)
 
+    def status(self):
+        return device_status()
+
     def map_waits(self):
-        """How many times the driver made a request wait for a place among the parts in flight."""
-        fields = run("dmsetup", "status", UPPER_NAME).stdout.split()
-        assert fields[2] == "corrdm", fields
-        return int(fields[3])
+        """How many times the driver made a read wait for a place among the parts in flight."""
+        return self.status()["map_waits"]
 
     def open(self):
         self.lower = BlockDevice(self.lower_path)

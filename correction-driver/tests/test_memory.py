@@ -63,16 +63,18 @@ class Injection:
         self.armed = []
         self.thread = None
 
-    def arm(self, fault, code_range, interval=1, times=1):
+    def arm(self, fault, code_range, interval=1, times=1, this_thread=True):
         """Fails `times` allocations, each the `interval`-th one whose stack passes `code_range`.
 
-        The kernel keeps counting across tests, so an interval picks a varying allocation.
+        The kernel keeps counting across tests, so an interval picks a varying allocation. Writes
+        allocate in the worker of the cache, not in the thread that writes, so for them
+        this_thread=False fails the allocations of any task, still only through `code_range`.
         """
         settings = {
             "require-start": code_range[0],
             "require-end": code_range[1],
             "ignore-gfp-wait": "N",
-            "task-filter": "Y",
+            "task-filter": "Y" if this_thread else "N",
             "verbose": 0,
             "interval": interval,
             "times": times,
@@ -129,14 +131,24 @@ def injection():
     current.finish()
 
 
+def write_and_flush(device, data):
+    device.write(0, data)
+    device.flush()
+
+
+def written_and_flushed(stack, data):
+    """The data on the lower device, so that reads go through the driver to it."""
+    write_and_flush(stack.upper, data)
+
+
 @pytest.mark.parametrize("operation", ["read", "write"])
 def test_io_takes_nothing_from_slab_in_the_driver(stack, injection, operation):
     """Every slab allocation whose stack passes the driver fails, and the request must not notice."""
     old, new = pattern(1, SECTORS), pattern(2, SECTORS)
-    stack.upper.write(0, old)
-    injection.arm("failslab", driver_range(), times=-1)
+    written_and_flushed(stack, old)
+    injection.arm("failslab", driver_range(), times=-1, this_thread=operation == "read")
     if operation == "write":
-        outcome = injection.run(lambda: stack.upper.write(0, new))
+        outcome = injection.run(lambda: write_and_flush(stack.upper, new))
         assert not isinstance(outcome, OSError), outcome
         expected = new
     else:
@@ -155,10 +167,12 @@ def test_failed_page_allocation_does_not_fail_the_io(stack, injection, operation
     A request of 64 chunks takes 64 pages, so every interval here lands within it.
     """
     old, new = pattern(1, SECTORS), pattern(2, SECTORS)
-    stack.upper.write(0, old)
-    injection.arm("fail_page_alloc", function_range("trn_p_rq_init"), interval=interval)
+    written_and_flushed(stack, old)
+    injection.arm(
+        "fail_page_alloc", function_range("trn_p_rq_init"), interval=interval, this_thread=operation == "read"
+    )
     if operation == "write":
-        outcome = injection.run(lambda: stack.upper.write(0, new))
+        outcome = injection.run(lambda: write_and_flush(stack.upper, new))
         assert not isinstance(outcome, OSError), outcome
         expected = new
     else:
@@ -177,8 +191,8 @@ def test_write_goes_on_with_only_the_page_reserve(stack, injection):
     that others give back, and it must still finish.
     """
     data = pattern(1, 2048)
-    injection.arm("fail_page_alloc", function_range("trn_p_rq_init"), times=-1)
-    outcome = injection.run(lambda: stack.upper.write(0, data))
+    injection.arm("fail_page_alloc", function_range("trn_p_rq_init"), times=-1, this_thread=False)
+    outcome = injection.run(lambda: write_and_flush(stack.upper, data))
     assert outcome is not STUCK
     assert not isinstance(outcome, OSError), outcome
     assert injection.run(lambda: stack.upper.read(0, 2048)) == data
@@ -239,11 +253,11 @@ def memory_taken_mib(path):
 def test_memory_of_requests_in_flight_is_limited(make_stack):
     """fio takes the same memory on either device, so the difference is what the driver holds.
 
-    The load is far above the limit on parts in flight, so requests must have waited for it.
+    The load is far above the size of the cache, so writes must have waited for free entries.
     """
     stack = make_stack(MEMORY_LOWER_MIB)
     on_lower = memory_taken_mib(stack.lower_path)
     time.sleep(3)
     on_upper = memory_taken_mib(stack.upper_path)
     assert on_upper - on_lower < MEMORY_MARGIN_MIB, f"lower {on_lower} MiB, upper {on_upper} MiB"
-    assert stack.map_waits() > 0
+    assert stack.status()["free_waits"] > 0

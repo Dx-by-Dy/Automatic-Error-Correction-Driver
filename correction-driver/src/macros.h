@@ -3,6 +3,10 @@
 #define DM_ERR(fmt, ...) \
     pr_err("[ERROR] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 
+/// @brief DM_ERR for messages that I/O can repeat, so that a failing device does not flood the log
+#define DM_ERR_LIMIT(fmt, ...) \
+    pr_err_ratelimited("[ERROR] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
+
 #define DM_WARN(fmt, ...) \
     pr_warn("[WARN] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 

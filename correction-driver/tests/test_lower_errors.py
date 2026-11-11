@@ -10,10 +10,11 @@ import errno
 
 import pytest
 
-from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
+from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, make_lower
 from harness import DATA_SECTORS, BlockDevice, capacity, metadata_sector, pattern, physical_sector, run
 
 LOWER_MIB = 4
+CACHE_MIB = 64
 CHUNKS = 3
 AREA = CHUNKS * DATA_SECTORS
 BAD_CHUNK = 1
@@ -22,8 +23,8 @@ BAD_CHUNK = 1
 class FaultyStack:
     """The driver on dm-dust on a zeroed lower device."""
 
-    def __init__(self):
-        sectors = LOWER_MIB * 2048
+    def __init__(self, lower_mib=LOWER_MIB):
+        sectors = lower_mib * 2048
         self.lower = make_lower(sectors)
         self.lower_sectors = sectors
         run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} dust {self.lower} 0 512\n")
@@ -51,6 +52,11 @@ class FaultyStack:
     def close(self):
         self.upper.close()
 
+    def remove(self):
+        self.close()
+        for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
+            dmsetup_remove(name)
+
 
 def flushed_write(device, start, data):
     """A write that has reached the lower device, or an error if it could not."""
@@ -63,9 +69,7 @@ def faulty():
     stack = FaultyStack()
     flushed_write(stack.upper, 0, pattern("before", AREA))
     yield stack
-    stack.close()
-    for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
-        dmsetup_remove(name)
+    stack.remove()
 
 
 def fails_with_eio(action):
@@ -163,14 +167,47 @@ def test_failed_write_is_reported(faulty, lower_sector, start, sectors):
 def test_writes_fail_while_reads_go_on(faulty):
     """dm-flakey fails every write and lets reads through, as a drive that can no longer write.
 
-    Nothing reaches the lower device, so all the data written before still reads back.
+    Whole, partial and crossing writes stay in the cache: they read back, and every flush fails
+    while they are not on the lower device. Once dm-linear is back, a flush writes them back.
     """
     faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
+    expected = bytearray(pattern("before", AREA))
     for start, sectors in [(0, DATA_SECTORS), (BAD_CHUNK * DATA_SECTORS + 2, 1), (5, 6)]:
-        assert fails_with_eio(lambda: flushed_write(faulty.upper, start, pattern("after", sectors))), (start, sectors)
-    assert faulty.upper.read(0, AREA) == pattern("before", AREA)
+        data = pattern(f"after {start}", sectors)
+        assert fails_with_eio(lambda: flushed_write(faulty.upper, start, data)), (start, sectors)
+        expected[start * 512 : (start + sectors) * 512] = data
+    assert faulty.upper.read(0, AREA) == expected
+    assert fails_with_eio(faulty.upper.flush), "a flush succeeded with chunks not written back"
+    assert device_status()["failed"] > 0
 
     faulty.load(f"linear {faulty.lower} 0")
-    assert faulty.upper.read(0, AREA) == pattern("before", AREA)
+    faulty.upper.flush()
+    assert device_status()["failed"] == 0
+    assert faulty.upper.read(0, AREA) == expected
     flushed_write(faulty.upper, 0, pattern("again", AREA))
     assert faulty.upper.read(0, AREA) == pattern("again", AREA)
+
+
+def test_a_cache_full_of_failed_chunks_refuses_writes():
+    """With every write back failing, the entries fill up and then new writes fail.
+
+    What was taken in stays readable, and reaches the lower device once it takes writes again.
+    """
+    faulty = FaultyStack(CACHE_MIB + 32)
+    try:
+        faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
+        accepted = 0
+        while accepted <= CACHE_MIB:
+            if fails_with_eio(lambda: faulty.upper.write(accepted * 2048, pattern(accepted, 2048))):
+                break
+            accepted += 1
+        assert 0 < accepted <= CACHE_MIB, f"{accepted} MiB taken in by a cache of {CACHE_MIB} MiB"
+        assert faulty.upper.read(0, 2048) == pattern(0, 2048)
+
+        faulty.load(f"linear {faulty.lower} 0")
+        faulty.upper.flush()
+        assert device_status()["failed"] == 0
+        for mib in range(accepted):
+            assert faulty.upper.read(mib * 2048, 2048) == pattern(mib, 2048), f"MiB {mib}"
+    finally:
+        faulty.remove()

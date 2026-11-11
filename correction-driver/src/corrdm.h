@@ -25,18 +25,24 @@
 
 /// @brief Number of parts that may be in flight at once
 /// @details
-/// A bio-based device has no request queue with tags, so without a limit the
+/// Reads from the device below and write back jobs of the cache are parts. A
+/// bio-based device has no request queue with tags, so without a limit the
 /// submitters fill memory with parts. 4096 parts are 16 MiB of data, far more
 /// than a disk queue of 256 requests takes, so ordinary load never reaches it.
 #define MAX_PARTS_IN_FLIGHT 4096
+
+struct cache;
 
 /// @brief DM target context
 /// @details
 /// Created in dm_ctr and stored in ti->private.
 /// Contains all resources necessary for request processing:
-/// lower-level device, work queue, metadata page pool, and chunk lock table.
+/// lower-level device, work queue, metadata page pool, chunk lock table and the cache.
 struct dm_context
 {
+    /// @brief Write back cache that every write goes through
+    struct cache *cache;
+
     /// @brief Lower-level device
     struct dm_dev *dev;
 
@@ -53,7 +59,7 @@ struct dm_context
     /// @details Taken in dm_map, given back in complete_work before bio_endio.
     struct semaphore parts_in_flight;
 
-    /// @brief How many times dm_map had to wait for a place, shown by dmsetup status
+    /// @brief How many times a read in dm_map had to wait for a place, shown by dmsetup status
     atomic64_t map_waits;
 };
 

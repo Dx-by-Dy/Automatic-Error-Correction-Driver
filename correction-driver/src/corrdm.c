@@ -1,4 +1,5 @@
 #include "corrdm.h"
+#include "cache.h"
 #include "macros.h"
 
 MODULE_LICENSE("GPL");
@@ -10,24 +11,25 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// Called by the DM subsystem for each incoming bio. DM splits requests at chunk
 /// boundaries, so the bio stays within one chunk.
 ///
-/// An empty flush goes to the lower device as it is. Device mapper sends one
-/// for each REQ_PREFLUSH, and the data of such a bio comes afterwards without
-/// the flag. A write completes only once its data and metadata have, so the
-/// flush covers every write completed before it.
+/// An empty flush goes to the cache, which writes back everything dirty and
+/// flushes the lower device before completing it. Device mapper sends one for
+/// each REQ_PREFLUSH, and the data of such a bio comes afterwards without the flag.
 ///
-/// For read and write operations, takes a place among the parts in flight,
-/// initializes the trn_p_rq in the per-bio data of the bio and processes it
-/// asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in flight, or for
-/// memory, which blocks the submitter as a full request queue of a disk would.
-/// The waiting belongs here and never in a worker: workers run the complete_work
-/// that gives places and memory back.
+/// A write goes into the cache, see cache_write. A read takes from the cache
+/// what it holds, see cache_read; for the rest it takes a place among the parts
+/// in flight, initializes the trn_p_rq in the per-bio data of the bio and
+/// processes it asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in
+/// flight, or for memory, which blocks the submitter as a full request queue of
+/// a disk would. Waiting belongs here and in the worker of the cache, never in
+/// transform_wq: its workers run the complete_work that gives places and
+/// memory back. dm_map never waits for a lower bio of its own, which stays on
+/// current->bio_list until it returns.
 ///
 /// Other operations are refused: device mapper sends none of them, as the
 /// target does not offer them, and remapping one would bypass the CRC.
 /// @param ti  DM target
 /// @param bio Incoming bio request
-/// @return DM_MAPIO_SUBMITTED for READ, WRITE.
-///         DM_MAPIO_REMAPPED for an empty flush.
+/// @return DM_MAPIO_SUBMITTED for READ, WRITE and an empty flush.
 ///         DM_MAPIO_KILL for anything else.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
@@ -39,26 +41,27 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 
     struct dm_context *dm_ctx = ti->private;
     struct trn_p_rq *part = dm_per_bio_data(bio, ti->per_io_data_size);
-    sector_t sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
-    enum trn_p_type type;
 
     if (bio->bi_opf & REQ_PREFLUSH)
     {
         if (WARN_ON_ONCE(bio_has_data(bio)))
             return DM_MAPIO_KILL;
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
+        cache_flush(dm_ctx->cache, bio);
+        return DM_MAPIO_SUBMITTED;
     }
+
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     switch (bio_op(bio))
     {
     case REQ_OP_READ:
-        type = TRANSFORM_READ;
+        if (cache_read(dm_ctx->cache, bio))
+            return DM_MAPIO_SUBMITTED;
         break;
 
     case REQ_OP_WRITE:
-        type = TRANSFORM_WRITE;
-        break;
+        cache_write(dm_ctx->cache, bio);
+        return DM_MAPIO_SUBMITTED;
 
     default:
         DM_ERR("unsupported bio op=%u\n", bio_op(bio));
@@ -71,8 +74,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         down(&dm_ctx->parts_in_flight);
     }
 
-    bio->bi_iter.bi_sector = sector;
-    trn_p_rq_init(part, bio, dm_ctx, type);
+    trn_p_rq_init(part, bio, dm_ctx, TRANSFORM_READ);
     queue_work(dm_ctx->transform_wq, &part->submit_work);
     return DM_MAPIO_SUBMITTED;
 }
@@ -159,6 +161,16 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_dm_get_device;
     }
 
+    dm_ctx->cache = cache_create(dm_ctx);
+    if (IS_ERR(dm_ctx->cache))
+    {
+        ti->error = "cache alloc failed";
+        r = PTR_ERR(dm_ctx->cache);
+        DM_ERR("cache_create failed, err=%d\n", r);
+        dm_put_device(ti, dm_ctx->dev);
+        goto error_dm_get_device;
+    }
+
     ti->private = dm_ctx;
     ti->len = device_new_capacity(get_capacity(dm_ctx->dev->bdev->bd_disk));
 
@@ -192,6 +204,7 @@ static void dm_dtr(struct dm_target *ti)
 
     DM_DEBUG("dm_ctx=%p\n", dm_ctx);
 
+    cache_destroy(dm_ctx->cache);
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
     locker_exit(&dm_ctx->locker);
@@ -200,10 +213,34 @@ static void dm_dtr(struct dm_target *ti)
     kfree(dm_ctx);
 }
 
+/// @brief Writes back the cache once device mapper has no bio of the device in flight
+/// @details
+/// Device mapper calls it before a table is replaced or destroyed, so nothing
+/// written is left behind in the cache, but chunks whose write back fails.
+/// @param ti DM target
+static void dm_target_postsuspend(struct dm_target *ti)
+{
+    struct dm_context *dm_ctx = ti->private;
+
+    cache_suspend(dm_ctx->cache);
+}
+
+/// @brief Lets the cache write back by age again
+/// @param ti DM target
+static void dm_target_resume(struct dm_target *ti)
+{
+    struct dm_context *dm_ctx = ti->private;
+
+    cache_resume(dm_ctx->cache);
+}
+
 /// @brief Reports the state of the target to dmsetup
 /// @details
-/// STATUSTYPE_INFO (dmsetup status) gives the counters: for now the number of
-/// times dm_map waited for a place among the parts in flight.
+/// STATUSTYPE_INFO (dmsetup status) gives the counters, in this order: waits of
+/// reads in dm_map for a place among the parts in flight, waits of writes for a
+/// free entry of the cache, waits of writes for an entry under write back,
+/// entries holding data not yet on the lower device, entries whose write back
+/// failed.
 /// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
@@ -214,12 +251,18 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                       unsigned int status_flags, char *result, unsigned int maxlen)
 {
     struct dm_context *dm_ctx = ti->private;
+    unsigned long dirty, failed;
     unsigned int sz = 0;
 
     switch (type)
     {
     case STATUSTYPE_INFO:
-        DMEMIT("%llu", (unsigned long long)atomic64_read(&dm_ctx->map_waits));
+        cache_counters(dm_ctx->cache, &dirty, &failed);
+        DMEMIT("%llu %llu %llu %lu %lu",
+               (unsigned long long)atomic64_read(&dm_ctx->map_waits),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
+               dirty, failed);
         break;
     case STATUSTYPE_TABLE:
     case STATUSTYPE_IMA:
@@ -235,6 +278,8 @@ static struct target_type target = {
     .ctr = dm_ctr,
     .dtr = dm_dtr,
     .map = dm_map,
+    .postsuspend = dm_target_postsuspend,
+    .resume = dm_target_resume,
     .status = dm_status,
 };
 

@@ -278,7 +278,7 @@ void trn_p_rq_end_io(struct bio *bio)
 
     if (bio->bi_status != BLK_STS_OK)
     {
-        DM_ERR("bio failed, bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
+        DM_ERR_LIMIT("bio failed, bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
 
         WRITE_ONCE(part->status, bio->bi_status);
     }

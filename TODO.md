@@ -38,10 +38,6 @@ in a run, **From reading** means it was only found in the code.
   is fine. It is the same when the metadata bio of a partial write, its read of the old
   metadata or its write of the new, fails after its data bio succeeded. Confirmed by the crash tests, which are strict `xfail` for it. Two CRCs are to be tried first, see
   "Cache" in `ARCHITECTURE.md`.
-- **Pages can change after their CRC is computed.** From reading, with `stable_writes=0`
-  confirmed: the CRC is computed in `dm_map` and the pages are submitted later, without a copy.
-  A page changed in between (`mmap`, a buffer in use during O_DIRECT) gives a CRC that does not
-  match the data, then a false mismatch on read. The cache copies the data, which closes it.
 - **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
   operation other than read, write and an empty flush. Discard needs the "never written" state,
   so that a discarded chunk does not fail its check.
@@ -50,8 +46,8 @@ in a run, **From reading** means it was only found in the code.
 
 - **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 corrdm` with no
   arguments, as `.status` gives nothing for `STATUSTYPE_TABLE`, so the table cannot be saved and
-  reloaded. `dmsetup status` has a single counter, the waits for a place among the parts in flight;
-  counters such as CRC mismatches do not exist yet.
+  reloaded. `dmsetup status` has only the counters of waits and of dirty and failed entries of the
+  cache; counters such as CRC mismatches do not exist yet.
 - **The table length is ignored.** Confirmed: `dm_ctr` overwrites `ti->len` (16777216 requested,
   14913080 used). Fix: require a correct length, return an error otherwise, and print the
   right value with a helper command.
@@ -83,7 +79,12 @@ Carried over from the previous list.
 - **Use the Crypto API to speed up CRC64.**
 - **Cache hot metadata blocks** (a lock on the cache and a state machine).
 - **A write to a chunk under write back waits.** By decision, for simplicity: a hot chunk stalls its writers
-  for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does.
+  for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does. A cheaper partial
+  fix: a mask of the sectors under write back, so that only writes to those sectors wait.
+- **A FUA write writes back the whole cache.** By decision, one path of code with the flush. Fix: write back
+  only the chunks of the bio, with FUA.
+- **One spinlock for the whole cache.** It is held only for a lookup and a copy of at most 4 KiB, but every
+  request takes it. Fix: locks per part of the tree, as `dm-bufio` hashes its buffers over several trees.
 
 ## Documentation
 
@@ -97,8 +98,9 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Cache.** Design it in `ARCHITECTURE.md`, then write it. It goes first as it changes the I/O path,
-   the unit of the format and how flushes work.
+2. **Cache.** Designed in `ARCHITECTURE.md`. Written so far: the cache with a write back of one chunk
+   at a time. Left: neighbouring chunks written back as one bio, a place to plug in the reserved area,
+   two CRCs.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
    write backs.

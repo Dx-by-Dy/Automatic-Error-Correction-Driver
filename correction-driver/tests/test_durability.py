@@ -7,6 +7,7 @@ be one or the other.
 
 import os
 import stat
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -18,6 +19,7 @@ TRACING = "/sys/kernel/tracing"
 EVENT = f"{TRACING}/events/block/block_bio_queue/enable"
 MOUNTPOINT = "/mnt/corrdm_durability"
 FS_LOWER_MIB = 64
+CACHE_AGE_SECONDS = 1
 
 
 @dataclass
@@ -137,20 +139,25 @@ def ext4(request, make_stack):
     os.makedirs(MOUNTPOINT, exist_ok=True)
     run("mount", path, MOUNTPOINT)
     run("sync")
-    yield
+    yield where
     run("umount", MOUNTPOINT, check=False)
     if where != "device":
         dmsetup_remove(LOWER_NAME)
 
 
 def create_file_and_fsync():
-    """A new file makes the journal commit, whose commit block is a FUA write."""
+    """A new file makes the journal commit, whose commit block is a FUA write.
+
+    Then it waits longer than the cache of the driver keeps dirty data: a FUA write left in it
+    would be written back meanwhile, with no flush after it.
+    """
     fd = os.open(os.path.join(MOUNTPOINT, "file"), os.O_WRONLY | os.O_CREAT, 0o644)
     try:
         os.write(fd, os.urandom(64 * 1024))
         os.fsync(fd)
     finally:
         os.close(fd)
+    time.sleep(CACHE_AGE_SECONDS * 2)
 
 
 @pytest.mark.parametrize(
@@ -162,8 +169,12 @@ def create_file_and_fsync():
 def test_fsync_on_ext4_leaves_nothing_in_the_cache(ext4):
     """Every write of the fsync is FUA or flushed, the metadata of the chunks included.
 
-    On the lower device it is the control: the checker passes there, and sees FUA writes.
+    On the lower device it is the control: the checker passes there, and sees the FUA write of the
+    journal commit. The cache of the driver turns a FUA write into a write back and a flush.
     """
     bios = bios_on_test_disk(create_file_and_fsync)
-    assert any(bio.fua for bio in bios), "no FUA write: the journal commit was not seen"
+    if ext4 == "device":
+        assert any(bio.preflush for bio in bios), "no flush: the journal commit was not seen"
+    else:
+        assert any(bio.fua for bio in bios), "no FUA write: the journal commit was not seen"
     assert not writes_left_in_the_cache(bios)

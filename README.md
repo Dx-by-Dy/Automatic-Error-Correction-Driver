@@ -52,33 +52,41 @@ Each chunk contains:
         ...
 ```
 
+### Cache
+
+Every write goes through a write back cache of 64 MiB per device, allocated when the target is created: one
+entry per chunk of data, with a page, a mask of the sectors written into it, a place in a tree ordered by chunk
+and a place in a list ordered by age. Device mapper splits requests at chunk boundaries, so each piece of a
+write is copied into the entry of its chunk and completes at once. The code is in `src/cache.c`.
+
+A worker writes the entries back: those older than 1 second, as many as keep at least 55% of the entries
+free once more than half are in use, and all of them for a flush, a FUA write or a suspend. Writes to an
+entry under write back, and writes that find no free entry, wait in `dm_map`. An entry whose write back
+failed keeps its data and is tried again on the next flush, suspend or write to it. If every entry has failed,
+new writes fail.
+
 ### Write Path
 
 1. Splitting the request into chunks;
-2. Initializing request structures;
-3. Calculating checksums;
-4. Generating device requests;
-5. Exclusively locking affected chunks;
-6. Writing data and metadata;
-7. Unlocking affected chunks;
-8. Completing the request.
+2. Copying each piece into the entry of its chunk in the cache, and completing it;
+3. Writing back the entry later: one lower write per run of its dirty sectors, which takes the lock of the
+   chunk, calculates the checksums, writes the data and the metadata, and for a partial chunk merges the old
+   checksums of the other sectors.
 
 ### Read Path
 
 1. Splitting the request into chunks;
-2. Initializing request structures;
-3. Generating requests to the device;
-4. Locking affected chunks together;
-5. Reading data and metadata;
-6. Unlocking affected chunks;
-7. Calculating and verifying checksums;
-8. Completing the request.
+2. Copying the sectors held in the cache, and completing them;
+3. For the others: locking the chunk together with other readers, reading data and metadata, unlocking,
+   calculating and verifying the checksums, completing the request.
 
 ### Flushes
 
-The device reports a write cache with FUA. An empty flush goes to the lower device as it is: a write completes
-only once its data and its metadata have, so the flush covers every write completed before it. A FUA write
-makes both its data and its metadata FUA. Any other operation, such as discard, is refused.
+The device reports a write cache with FUA. An empty flush and a FUA write go to the worker of the cache, which
+writes back everything dirty, waits for it, and flushes the lower device. The flush fails while any entry has
+failed to write back, as it would promise data that is not on the device. A suspend writes back everything
+too, so a table reload or a removal loses nothing, except chunks that still fail to write: they are named
+in the kernel log. Any other operation, such as discard, is refused.
 
 ### Synchronization
 
@@ -89,11 +97,13 @@ The driver uses chunk-level synchronization based on:
 
 This approach allows concurrent reads while preventing conflicting write operations, and taking a lock never allocates memory. Chunks that share a lock sometimes wait for each other, which cannot deadlock, as a part holds one lock at a time. A part that has to wait does not hold a worker: the part that releases the lock queues the next one.
 
+The lock of a chunk keeps reads from the lower device apart from write backs of the same chunk. The cache itself has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O.
+
 ### Memory
 
-Nothing on the I/O path can fail to allocate. A part lives in the per-bio data of its bio, with its metadata structure and its metadata bio embedded in it, and the page for the metadata sector comes from a mempool with a reserve of 128 pages. When memory is short, `dm_map` waits for a page that another part gives back; workers never wait for memory, as they run the completions that give it back.
+Nothing on the I/O path can fail to allocate. The cache, with its pages and 256 write back jobs, is allocated when the target is created. A part lives in the per-bio data of its bio, or in a write back job, with its metadata structure and its metadata bio embedded in it, and the page for the metadata sector comes from a mempool with a reserve of 128 pages. When memory is short, `dm_map` or the worker of the cache waits for a page that another part gives back; the workers of `transform_wq` never wait, as they run the completions that give it back.
 
-At most 4096 parts are in flight per device. A bio-based device has no request queue with tags, so `dm_map` waits for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
+At most 4096 parts, reads and write back jobs, are in flight per device. A bio-based device has no request queue with tags, so `dm_map` and the worker wait for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
 
 ## Building
 
@@ -149,7 +159,7 @@ Show the counters:
 dmsetup status corrdm
 ```
 
-After the usual `<start> <length> corrdm`, it prints how many times `dm_map` waited for a place among the parts in flight.
+After the usual `<start> <length> corrdm`, it prints five counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, the entries holding data not yet on the lower device, and the entries whose write back failed.
 
 ## Usage
 
