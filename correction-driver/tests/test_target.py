@@ -59,6 +59,7 @@ def test_target_may_start_after_sector_0(lower):
     below = BlockDevice(path)
     try:
         upper.write(start, data)
+        upper.flush()
         assert below.read(0, DATA_SECTORS) == data
     finally:
         upper.close()

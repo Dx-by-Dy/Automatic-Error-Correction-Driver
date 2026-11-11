@@ -52,10 +52,16 @@ class FaultyStack:
         self.upper.close()
 
 
+def flushed_write(device, start, data):
+    """A write that has reached the lower device, or an error if it could not."""
+    device.write(start, data)
+    device.flush()
+
+
 @pytest.fixture
 def faulty():
     stack = FaultyStack()
-    stack.upper.write(0, pattern("before", AREA))
+    flushed_write(stack.upper, 0, pattern("before", AREA))
     yield stack
     stack.close()
     for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
@@ -108,7 +114,7 @@ def test_whole_chunk_write_over_a_failed_metadata_sector_needs_no_read(faulty):
     faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
     assert fails_with_eio(lambda: faulty.upper.read(BAD_CHUNK * DATA_SECTORS)), "the failure is not on"
     new = pattern("after", DATA_SECTORS)
-    faulty.upper.write(BAD_CHUNK * DATA_SECTORS, new)
+    flushed_write(faulty.upper, BAD_CHUNK * DATA_SECTORS, new)
     assert faulty.upper.read(BAD_CHUNK * DATA_SECTORS, DATA_SECTORS) == new
     assert not unreadable_sectors(faulty.upper)
 
@@ -120,7 +126,7 @@ def test_partial_write_fails_when_the_old_metadata_does_not_read(faulty):
     TODO.md; here only the error and the other chunks are checked.
     """
     faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
-    assert fails_with_eio(lambda: faulty.upper.write(BAD_CHUNK * DATA_SECTORS + 2, pattern("after", 1)))
+    assert fails_with_eio(lambda: flushed_write(faulty.upper, BAD_CHUNK * DATA_SECTORS + 2, pattern("after", 1)))
     faulty.heal()
     readable = [sector for sector in range(AREA) if sector not in chunk_sectors(BAD_CHUNK)]
     assert not set(unreadable_sectors(faulty.upper)) & set(readable)
@@ -136,17 +142,19 @@ def test_partial_write_fails_when_the_old_metadata_does_not_read(faulty):
     ids=["data of a whole chunk", "metadata of a whole chunk", "data of one sector"],
 )
 def test_failed_write_is_reported(faulty, lower_sector, start, sectors):
-    """A write whose data or metadata fails to reach the lower device fails, and the device goes on.
+    """A write whose data or metadata fails to reach the lower device reports it, and the device goes on.
+
+    The error may come from the write or from the flush after it.
 
     A failed metadata write of a partial write is in test_writes_fail_while_reads_go_on: dm-dust
     would fail its read of the old metadata first.
     """
     faulty.fail(lower_sector, writes=1)
-    assert fails_with_eio(lambda: faulty.upper.write(start, pattern("after", sectors)))
+    assert fails_with_eio(lambda: flushed_write(faulty.upper, start, pattern("after", sectors)))
 
     faulty.heal()
     new = pattern("again", sectors)
-    faulty.upper.write(start, new)
+    flushed_write(faulty.upper, start, new)
     assert faulty.upper.read(start, sectors) == new
     others = [sector for sector in range(AREA) if sector not in chunk_sectors(BAD_CHUNK)]
     assert not set(unreadable_sectors(faulty.upper)) & set(others)
@@ -159,10 +167,10 @@ def test_writes_fail_while_reads_go_on(faulty):
     """
     faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
     for start, sectors in [(0, DATA_SECTORS), (BAD_CHUNK * DATA_SECTORS + 2, 1), (5, 6)]:
-        assert fails_with_eio(lambda: faulty.upper.write(start, pattern("after", sectors))), (start, sectors)
+        assert fails_with_eio(lambda: flushed_write(faulty.upper, start, pattern("after", sectors))), (start, sectors)
     assert faulty.upper.read(0, AREA) == pattern("before", AREA)
 
     faulty.load(f"linear {faulty.lower} 0")
     assert faulty.upper.read(0, AREA) == pattern("before", AREA)
-    faulty.upper.write(0, pattern("again", AREA))
+    flushed_write(faulty.upper, 0, pattern("again", AREA))
     assert faulty.upper.read(0, AREA) == pattern("again", AREA)

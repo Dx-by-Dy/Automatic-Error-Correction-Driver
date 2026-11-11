@@ -36,6 +36,8 @@ third layer between the two: `test_crash.py` puts `dm-log-writes` there (`corrdm
 **I/O.** `BlockDevice` in `harness.py` reads and writes whole sectors with `O_DIRECT`. The page cache
 would hide reads from the driver, and a buffered write to the lower device writes a whole 4 KiB block
 back, damaging its neighbours. Tests damage data through `stack.lower` and use it through `stack.upper`.
+A write through the driver is sure to be on the lower device only after `flush()`, so a test that looks at the
+lower device, or damages it, flushes first. A failed write may be reported by the write or by the flush.
 
 **Layout.** `harness.py` has its own copy of the on-disk layout: 8 data sectors, then 1 metadata sector
 with 8 CRCs of 8 bytes each. A change of layout has to be made there as well.
@@ -138,8 +140,8 @@ Three chunks are written first, and the middle one gets the failures.
 | `test_failed_metadata_sector_fails_only_its_chunk` | 1 | Every sector of the chunk fails, the other two chunks read |
 | `test_device_works_again_once_the_sector_reads` | 1 | A failed data and metadata sector, then cleared: everything reads back, no error state stays in the driver |
 | `test_whole_chunk_write_over_a_failed_metadata_sector_needs_no_read` | 1 | The chunk does not read, then a write of it succeeds, as it does not read the old metadata, and the chunk reads back |
-| `test_partial_write_fails_when_the_old_metadata_does_not_read` | 1 | The write fails with `EIO`; the other chunks read. What the chunk holds after it is open |
-| `test_failed_write_is_reported` | 3 | The data or the metadata of a whole chunk, the data of one sector fails to write once: the write fails with `EIO`, the next one succeeds, the other chunks read |
+| `test_partial_write_fails_when_the_old_metadata_does_not_read` | 1 | The write or its flush fails with `EIO`; the other chunks read. What the chunk holds after it is open |
+| `test_failed_write_is_reported` | 3 | The data or the metadata of a whole chunk, the data of one sector fails to write once: the write or its flush fails with `EIO`, the next one succeeds, the other chunks read |
 | `test_writes_fail_while_reads_go_on` | 1 | `dm-flakey` with `error_writes`: whole, partial and crossing writes fail, the data from before reads back, and once `dm-linear` is back the device takes writes again |
 
 ### `test_lifecycle.py`: the device and the module come and go (4 tests)

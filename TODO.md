@@ -82,6 +82,8 @@ Carried over from the previous list.
 - **Use preallocation where possible.**
 - **Use the Crypto API to speed up CRC64.**
 - **Cache hot metadata blocks** (a lock on the cache and a state machine).
+- **A write to a chunk under write back waits.** By decision, for simplicity: a hot chunk stalls its writers
+  for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does.
 
 ## Documentation
 

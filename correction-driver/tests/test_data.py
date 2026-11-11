@@ -37,6 +37,7 @@ def test_roundtrip(stack, start, sectors):
 def test_data_lands_at_the_layout_position(stack):
     data = pattern("layout", 3 * DATA_SECTORS)
     stack.upper.write(0, data)
+    stack.upper.flush()
     for logical in range(3 * DATA_SECTORS):
         expected = data[logical * SECTOR_SIZE:][:SECTOR_SIZE]
         assert stack.lower.read(physical_sector(logical)) == expected, f"sector {logical}"
@@ -44,6 +45,7 @@ def test_data_lands_at_the_layout_position(stack):
 
 def test_metadata_is_written_outside_the_data(stack):
     stack.upper.write(0, pattern("metadata", DATA_SECTORS))
+    stack.upper.flush()
     assert stack.lower.read(metadata_sector(0)) != ZERO_SECTOR
     assert stack.lower.read(metadata_sector(DATA_SECTORS)) == ZERO_SECTOR
 
@@ -61,8 +63,10 @@ def test_partial_write_to_an_empty_chunk(stack, sector):
 def test_partial_write_keeps_the_crcs_of_its_neighbours(stack, sector):
     original = pattern("original", DATA_SECTORS)
     stack.upper.write(0, original)
+    stack.upper.flush()
     update = pattern("update", 1)
     stack.upper.write(sector, update)
+    stack.upper.flush()
     expected = bytearray(original)
     expected[sector * SECTOR_SIZE : (sector + 1) * SECTOR_SIZE] = update
     # Each sector is read on its own, as its own CRC must match.

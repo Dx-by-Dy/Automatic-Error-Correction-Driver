@@ -132,6 +132,10 @@ class BlockDevice:
             )
         assert done == len(data), f"short write: {done} of {len(data)} bytes"
 
+    def flush(self):
+        """Makes the writes so far durable; only then are they sure to be on the device below."""
+        os.fsync(self.fd)
+
     def flip_bit(self, sector, byte=0, bit=0):
         """Flips one bit of a sector, leaving the rest of the device untouched."""
         data = bytearray(self.read(sector))

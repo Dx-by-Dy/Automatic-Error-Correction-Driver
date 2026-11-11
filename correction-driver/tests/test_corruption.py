@@ -22,6 +22,7 @@ def written(stack):
     """Three written chunks, returning their expected contents, starting at `FIRST - 8`."""
     data = pattern("written", 3 * DATA_SECTORS)
     stack.upper.write(FIRST - DATA_SECTORS, data)
+    stack.upper.flush()
     return data
 
 
@@ -84,6 +85,7 @@ def test_rewriting_a_corrupted_sector_clears_the_error(stack, written):
     stack.lower.flip_bit(physical_sector(FIRST))
     update = pattern("rewritten", 1)
     stack.upper.write(FIRST, update)
+    stack.upper.flush()
     assert stack.upper.read(FIRST) == update
 
 
@@ -91,6 +93,7 @@ def test_write_to_a_neighbour_does_not_hide_corruption(stack, written):
     stack.lower.flip_bit(physical_sector(FIRST))
     update = pattern("neighbour", 1)
     stack.upper.write(FIRST + 1, update)
+    stack.upper.flush()
     assert stack.upper.read(FIRST + 1) == update
     assert_read_fails(stack.upper, FIRST)
 

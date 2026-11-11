@@ -159,6 +159,13 @@ complexity and bugs.
   measuring the cache and two CRCs on it.
 - **A failed write back:** the error is per chunk, not for the device. The data stays in RAM, and the cache has one
   place where a reserved area can be plugged in later. When such chunks fill the cache, new writes are refused.
+  Every flush fails while such chunks remain, as a flush that succeeds promises the data is on the device.
+- **A partial chunk** keeps a mask of its dirty sectors. Write back writes only those and reads the old metadata;
+  the rest of the chunk is not read.
+- **A write to a chunk under write back waits in `dm_map`** for now, and the waits are counted. A second copy of
+  the chunk, as in `dm-writecache`, is the likely final answer and is left for the optimization stage.
+- **Defaults are constants for now:** 64 MiB of cache per device, write back from 50% used down to 45%, an age of
+  1 s. They are to be tuned later.
 
 
 **Proposed**, requirements:
@@ -192,7 +199,6 @@ complexity and bugs.
   that matter for the filesystem, then becomes read only. A write back that found a slot does not fail the next
   flush. It needs a superblock, so it waits for the format. See
   [RESEARCH.md](RESEARCH.md#a-failed-write-back-a-reserved-area).
-- **The size of the cache** and the values of its watermarks and age.
 
 ## Errors
 
@@ -233,3 +239,4 @@ it counts.
 | 2026-11-11 | The cache is a structure of our own in the shape of `dm-writecache` pmem, without `dm-bufio`, a chunk as its unit, keeping only dirty data for now | Write back stays under our control; [comparison](RESEARCH.md#caches-and-integrity-in-device-mapper) |
 | 2026-11-11 | Two CRCs are tried first for a write cut short by a crash, no journal | No blind spot, no double write, fits the format; [what it requires](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs) |
 | 2026-11-11 | The layout stays 8+1 until measured; a failed write back stays in RAM, with a place to plug in a reserved area later | Numbers first; the area needs a superblock, so it waits for the format |
+| 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |
