@@ -136,24 +136,24 @@ def kmemleak_reports_of_the_driver():
     return [leak for leak in leaks if f"[{MODULE}]" in leak]
 
 
-def resources_of_the_driver():
-    """What a device of the driver holds that can be seen from outside.
+RESCUERS = ("kworker/R-transformation_wq", "kworker/R-corrdm_write_back")
 
-    The vmalloc areas it allocated (the lock table) and the rescuer threads of its workqueues.
-    Other kworkers keep the name of the last workqueue they served, so only rescuers count.
+
+def resources_of_the_driver():
+    """What a device of the driver holds that can be seen from outside: the rescuer threads of its
+    two workqueues. Other kworkers keep the name of the last workqueue they served, so only rescuers
+    count. Its tables are small enough for kmalloc, so they are not in /proc/vmallocinfo.
     """
-    with open("/proc/vmallocinfo") as file:
-        areas = sum(1 for line in file if f"[{MODULE}]" in line and " dm_init+" not in line)
-    rescuers = run("ps", "-eo", "comm").stdout.split().count("kworker/R-transformation_wq")
-    return areas, rescuers
+    comms = run("ps", "-eo", "comm").stdout.split()
+    return tuple(comms.count(name) for name in RESCUERS)
 
 
 @pytest.mark.slow
 def test_nothing_leaks(make_stack):
     """A device that did I/O leaves nothing behind once removed.
 
-    The lock table and the workqueue are seen directly, and must be there while the device is.
-    kmemleak looks for the rest, but it misses a leaked context: freed bios keep a pointer to it
+    The workqueues are seen directly, and must be there while the device is. kmemleak looks for
+    the rest, but it misses a leaked context and the pages of the cache, which it does not track: freed bios keep a pointer to it
     in their per-bio data, and reused ones still hold it. Checked while the module is loaded, as
     the names of its functions are gone once it is unloaded.
     """

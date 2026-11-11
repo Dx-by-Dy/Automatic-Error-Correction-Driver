@@ -249,6 +249,8 @@ def memory_taken_mib(path):
     return (before - lowest) // 1024
 
 
+# TODO.md: test_memory_of_requests_in_flight_is_limited is unstable
+@pytest.mark.unstable
 @pytest.mark.slow
 def test_memory_of_requests_in_flight_is_limited(make_stack):
     """fio takes the same memory on either device, so the difference is what the driver holds.

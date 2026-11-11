@@ -3,17 +3,22 @@
 import errno
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from conftest import UPPER_NAME
-from harness import DATA_SECTORS, SECTOR_SIZE, pattern, physical_sector, run
+from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, make_lower
+from harness import DATA_SECTORS, SECTOR_SIZE, BlockDevice, metadata_sector, pattern, physical_sector, run
 
 CHUNK = 5
 FIRST = CHUNK * DATA_SECTORS
 CACHE_MIB = 64
 AGE_SECONDS = 1
 WAIT_SECONDS = 10
+# The metadata sector of CHUNK answers reads this late on the delayed stack, and writes at once.
+METADATA_READ_DELAY_MS = 1000
+# Time for an I/O started in a thread to reach the lower device, well below the delay.
+SETTLE_SECONDS = 0.3
 
 
 def on_lower(stack, logical=FIRST, count=DATA_SECTORS):
@@ -136,3 +141,91 @@ def test_writes_larger_than_the_cache_go_through(make_stack):
     stack.upper.flush()
     for index, block in enumerate(blocks):
         assert stack.upper.read(index * 2048, 2048) == block, f"MiB {index}"
+
+
+class DelayedStack:
+    """The driver on dm-delay, which holds back reads of the metadata sector of CHUNK.
+
+    The rest of the lower device is dm-linear, and writes to that sector go down at once. A read
+    of the chunk from the lower device gets its data at once and its CRCs a second later, so a write
+    back that does not wait for the read lands in between, and a write back of a partial chunk reads
+    the old CRCs for a second.
+    """
+
+    def __init__(self, lower_mib=4):
+        sectors = lower_mib * 2048
+        lower = make_lower(sectors)
+        slow = metadata_sector(FIRST)
+        table = (
+            f"0 {slow} linear {lower} 0\n"
+            f"{slow} 1 delay {lower} {slow} {METADATA_READ_DELAY_MS} {lower} {slow} 0\n"
+            f"{slow + 1} {sectors - slow - 1} linear {lower} {slow + 1}\n"
+        )
+        run("dmsetup", "create", FAULTY_NAME, stdin=table)
+        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+        self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+        self.threads = ThreadPoolExecutor(max_workers=1)
+        self.original = pattern("original", DATA_SECTORS)
+        self.upper.write(FIRST, self.original)  # a whole chunk: its old CRCs are not read
+        self.upper.flush()
+
+    def in_background(self, action):
+        """Starts an I/O in another thread and gives it time to reach the lower device."""
+        future = self.threads.submit(action)
+        time.sleep(SETTLE_SECONDS)
+        assert not future.done(), "the I/O did not wait for the delayed sector"
+        return future
+
+    def remove(self):
+        self.threads.shutdown()
+        self.upper.close()
+        for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
+            dmsetup_remove(name)
+
+
+@pytest.fixture
+def delayed():
+    stack = DelayedStack()
+    yield stack
+    stack.remove()
+
+
+def test_a_write_back_waits_for_a_read_in_flight(delayed):
+    """A read of the chunk holds off its write back until it has both its data and its CRCs.
+
+    Without that, the write back lands between them: the read gets the old data and the new CRCs.
+    """
+    read = delayed.in_background(lambda: delayed.upper.read(FIRST, DATA_SECTORS))
+    new = pattern("new", DATA_SECTORS)
+    delayed.upper.write(FIRST, new)
+    delayed.upper.flush()
+    assert read.result() == delayed.original
+    assert delayed.upper.read(FIRST, DATA_SECTORS) == new
+
+
+def test_the_write_backs_of_a_chunk_go_one_at_a_time(delayed):
+    """Sectors 1 and 5 are written back by two lower writes, each merging its CRC into the old ones.
+
+    At once, both would read the old CRCs and the later one would undo the earlier.
+    """
+    one, five = pattern("one", 1), pattern("five", 1)
+    delayed.upper.write(FIRST + 1, one)
+    delayed.upper.write(FIRST + 5, five)
+    delayed.upper.flush()
+    expected = with_sectors(delayed.original, [(1, one), (5, five)])
+    assert delayed.upper.read(FIRST, DATA_SECTORS) == expected
+
+
+def test_a_read_of_a_clean_sector_waits_for_the_write_back(delayed):
+    """Sector 5 is not written back, but a read of it waits until the write back of sector 1 ends.
+
+    Otherwise a stream of reads of the chunk could hold its write back off for ever.
+    """
+    one = pattern("one", 1)
+    delayed.upper.write(FIRST + 1, one)
+    flush = delayed.in_background(delayed.upper.flush)
+    before = device_status()["read_waits"]
+    assert delayed.upper.read(FIRST + 5) == delayed.original[5 * SECTOR_SIZE :][:SECTOR_SIZE]
+    assert device_status()["read_waits"] == before + 1
+    flush.result()
+    assert delayed.upper.read(FIRST, DATA_SECTORS) == with_sectors(delayed.original, [(1, one)])

@@ -123,10 +123,11 @@ device, so the cache can read or write them in one request, and no seek separate
 - The number of requests in flight is bounded.
 
 **Current.** Device mapper splits each bio at chunk boundaries (`max_io_len` of 8 sectors). A write is copied
-into the cache and completes. The worker writes an entry back as one part per run of its dirty sectors: the part
-takes the lock of its chunk and goes to the lower device as a data bio and a metadata bio, and a partial chunk
-reads the old metadata first. A read takes the sectors the cache holds from it; the rest is a part in the
-per-bio data of its bio, which reads from the lower device and checks the CRC in a worker. Details are in
+into the cache and completes. The worker writes an entry back as one part per run of its dirty sectors, one at a
+time, once no read of the chunk is in flight: the part goes to the lower device as a data bio and a metadata
+bio, and a partial chunk reads the old metadata first. A read takes the sectors the cache holds from it; the
+rest is a part in the per-bio data of its bio, registered in the tree of reads of the cache while in flight,
+which reads from the lower device and checks the CRC in a worker. Details are in
 [README.md](README.md).
 
 **Decided**, why this has to change: upper bios are tied to lower bios one chunk at a time. A large request
@@ -175,10 +176,11 @@ complexity and bugs.
   its own.
 - **A suspend cannot fail**, so a chunk that still fails to write when the device is suspended for a removal or
   a reload is lost, with its number in the kernel log. The reserved area will give it somewhere to go.
-- **The lock of a chunk moves into the cache**, after the first version of the cache and before runs: a read of
+- **The lock of a chunk moved into the cache**, after the first version of the cache and before runs: a read of
   the lower device registers its range in the tree of the cache while in flight, and a write back waits for the
   reads in flight on its chunks, while new reads of their clean sectors wait for it. A run spans many chunks, and
-  a part may not hold many chunk locks.
+  a part may not hold many chunk locks. The lower writes of one entry go one at a time, as each merges its CRCs
+  into the same metadata sector.
 - **Defaults are constants for now:** 64 MiB of cache per device, write back from 50% used down to 45%, an age of
   1 s. They are to be tuned later.
 

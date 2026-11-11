@@ -42,8 +42,9 @@ def compete_for_the_same_chunks(make_stack, bs, numjobs, rw):
     """All jobs use the same area, as the competitive benchmarks in the README do.
 
     Their writes overlap, so fio cannot verify the contents, but each chunk must still hold
-    data matching its CRC, as a chunk lock keeps a write's data and CRC together. A read that
-    meets a write in a chunk would fail with a CRC mismatch without the lock, and fio reports it.
+    data matching its CRC, and fio reports a read that fails with a CRC mismatch. Before the cache
+    this caught a read meeting a write of its chunk; with the cache such a meeting is rare, and
+    test_a_write_back_waits_for_a_read_in_flight in test_cache.py makes it happen every time.
     """
     stack = make_stack(LOWER_MIB)
     fio(
@@ -71,7 +72,7 @@ def test_jobs_competing_within_the_worker_limit(make_stack, bs, numjobs, rw):
 
 
 # Readers and writers must exclude each other: without that, a read sees the data of a write
-# and the CRC from before it.
+# and the CRC from before it. See compete_for_the_same_chunks for what this still catches.
 @pytest.mark.slow
 @pytest.mark.parametrize("bs", ["512", "4k", "32k"])
 def test_reads_and_writes_competing(make_stack, bs):

@@ -53,7 +53,7 @@ def device_exists(name):
     return run("dmsetup", "info", name, check=False).returncode == 0
 
 
-STATUS_FIELDS = ("map_waits", "free_waits", "busy_waits", "dirty", "failed")
+STATUS_FIELDS = ("map_waits", "free_waits", "busy_waits", "read_waits", "dirty", "failed")
 
 
 def device_status(name=UPPER_NAME):
@@ -62,6 +62,7 @@ def device_status(name=UPPER_NAME):
     map_waits: reads that waited in dm_map for a place among the parts in flight;
     free_waits: writes that waited for a free entry of the cache;
     busy_waits: writes that waited for an entry under write back;
+    read_waits: reads of the lower device that waited for the write back of their chunk;
     dirty: entries with data not yet on the lower device; failed: entries whose write back failed.
     """
     fields = run("dmsetup", "status", name).stdout.split()

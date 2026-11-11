@@ -6,7 +6,7 @@
 #include <linux/list.h>
 
 #include "corrdm.h"
-#include "locker.h"
+#include "cache.h"
 #include "alignment.h"
 #include "trn_mw_rq.h"
 #include "trn_mr_rq.h"
@@ -24,12 +24,8 @@ enum trn_p_type
 /// @brief Lifecycle state of trn_p_rq
 enum trn_p_state
 {
-    /// @brief Structure is created, chunk lock is not held, bios are not yet submitted.
-    /// The part may be waiting for the lock on its list.
-    INITIALIZED,
-
-    /// @brief Chunk lock is acquired; bios are about to be submitted or are in flight.
-    LOCKED,
+    /// @brief The data bio and the first metadata bio are about to be submitted or are in flight.
+    SUBMITTED,
 
     /// @brief (TRANSFORM_WRITE only) the old metadata has been read;
     /// local CRC is being updated in meta.write.page and on disk via meta_bio.
@@ -56,10 +52,13 @@ union trn_m_rq
 /// metadata bio are embedded in it, and the metadata page comes from a mempool,
 /// so nothing on the I/O path can fail to allocate.
 ///
+/// A part does not keep other parts of its chunk away by itself: the cache does.
+/// A read is in the tree of reads of the cache while in flight, a write back of
+/// the chunk waits for it, and the write back jobs of one chunk go one at a time.
+///
 /// Lifecycle:
 ///   1. trn_p_rq_init         — bio and metadata initialization
-///   2. submit_work           — acquiring chunk lock, or waiting for it on its list and running
-///                              again when it is granted; submitting bios to the underlying device
+///   2. submit_work           — submitting bios to the underlying device
 ///   3. complete_work         — see details of the complete_work field
 ///
 /// The pending counter tracks the number of outstanding bios:
@@ -67,18 +66,15 @@ union trn_m_rq
 /// When both complete via trn_p_rq_end_io, complete_work is invoked.
 struct trn_p_rq
 {
-    /// @brief Work item for acquiring the lock and submitting bios to the underlying device
+    /// @brief Work item for submitting bios to the underlying device
     struct work_struct submit_work;
 
-    /// @brief List node among waiters of the chunk lock
-    /// @details In lock->waiters while waiting for the lock, protected by lock->wait_lock.
-    struct list_head list;
-
     /// @brief Work item for advancing the state machine and eventually finalizing the structure lifecycle
-    /// @details For TRANSFORM_READ: releases the lock and triggers CRC verification (check_crc), followed by resource cleanup.
+    /// @details For TRANSFORM_READ: leaves the tree of reads of the cache and triggers CRC verification
+    ///          (check_crc), followed by resource cleanup.
     ///          For TRANSFORM_WRITE (old metadata read): triggers local CRC update (update_crc_local)
     ///          and submits meta_bio again to write the metadata.
-    ///          For TRANSFORM_WRITE (metadata written): triggers lock release and resource cleanup.
+    ///          For TRANSFORM_WRITE (metadata written): triggers resource cleanup.
     struct work_struct complete_work;
 
     /// @brief Driver context
@@ -97,8 +93,8 @@ struct trn_p_rq
     /// @brief Chunk index (physical sector of the start of the chunk data area)
     unsigned long index;
 
-    /// @brief Chunk lock acquired before submitting bios
-    struct lock *lock;
+    /// @brief (TRANSFORM_READ only) the read in the tree of reads of the cache, see cache_read
+    struct cache_range range;
 
     /// @brief Counter of outstanding bios: data bio + metadata bio
     /// @details Initialized to 2. When it reaches 0, complete_work is invoked.

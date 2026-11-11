@@ -5,7 +5,34 @@
 
 #include "corrdm.h"
 #include "cache.h"
+#include "trn_p_rq.h"
 #include "macros.h"
+
+/// @brief Lower write of one run of dirty sectors of an entry
+/// @details
+/// The bio goes through the same path as a write did before the cache: a part
+/// in trn_p_rq writes the data and the metadata, merging the CRCs of the other
+/// sectors for a partial chunk. Jobs come from a table allocated in cache_create.
+struct cache_job
+{
+    /// @brief Part that writes the bio, as the per-bio data of device mapper would hold it
+    struct trn_p_rq part;
+
+    /// @brief Bio over the page of the entry
+    struct bio bio;
+
+    /// @brief The only segment of bio
+    struct bio_vec bvec;
+
+    /// @brief Entry written back
+    struct cache_entry *entry;
+
+    /// @brief Cache of the entry
+    struct cache *cache;
+
+    /// @brief Node in the list of free jobs, or in the queued list of the entry
+    struct list_head list;
+};
 
 /// @brief Free entries below which the worker writes back under pressure
 #define CACHE_START_FREE (CACHE_ENTRIES * (100 - CACHE_START_PERCENT) / 100)
@@ -70,6 +97,46 @@ static void cache_insert(struct cache *cache, struct cache_entry *entry)
 
     rb_link_node(&entry->node, parent, link);
     rb_insert_color(&entry->node, &cache->tree);
+}
+
+/// @brief Puts a read of a chunk into the tree of reads in flight; the lock must be held
+static void cache_insert_read(struct cache *cache, struct cache_range *range, sector_t chunk)
+{
+    struct rb_node **link = &cache->reads.rb_node;
+    struct rb_node *parent = NULL;
+
+    range->chunk = chunk;
+
+    while (*link)
+    {
+        struct cache_range *other = rb_entry(*link, struct cache_range, node);
+
+        parent = *link;
+        link = range->chunk < other->chunk ? &(*link)->rb_left : &(*link)->rb_right;
+    }
+
+    rb_link_node(&range->node, parent, link);
+    rb_insert_color(&range->node, &cache->reads);
+}
+
+/// @brief Whether a read of a chunk is in flight; the lock must be held
+static bool cache_reads_on(struct cache *cache, sector_t chunk)
+{
+    struct rb_node *node = cache->reads.rb_node;
+
+    while (node)
+    {
+        struct cache_range *range = rb_entry(node, struct cache_range, node);
+
+        if (chunk < range->chunk)
+            node = node->rb_left;
+        else if (chunk > range->chunk)
+            node = node->rb_right;
+        else
+            return true;
+    }
+
+    return false;
 }
 
 /// @brief Records that waiters may go on; the lock must be held, wake them after dropping it
@@ -247,36 +314,54 @@ void cache_write(struct cache *cache, struct bio *bio)
 /// start that are all in the cache or all not in it; device mapper sends the
 /// rest as another bio. A run in the cache is copied and completed here.
 ///
-/// A run not in the cache goes to the device below by the caller, where the
-/// lock of the chunk keeps it apart from a write back of other sectors of the
-/// same chunk. A write of those sectors that comes meanwhile is concurrent with
-/// the read, so the read may return the data from before it.
+/// A run not in the cache goes to the device below by the caller. It is put
+/// into the tree of reads first, under the same hold of the lock, and stays
+/// there until cache_read_done, so a write back of the chunk waits for it. If
+/// the chunk is under write back already, the read waits for it to end
+/// instead: the sectors are not written back, but a stream of such reads would
+/// otherwise keep the write back waiting for ever. A write of those sectors
+/// that comes meanwhile is concurrent with the read, so the read may return the
+/// data from before it.
 ///
-/// Expected execution context - dm_map.
+/// Expected execution context - dm_map, may sleep.
 /// @param cache The cache of the device
 /// @param bio   Read with bi_sector relative to the start of the target
+/// @param range Free node in the per-bio data of the bio, used if it is read from below
 /// @return true if the bio was completed, false if it has to be read from below
-bool cache_read(struct cache *cache, struct bio *bio)
+bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range)
 {
     sector_t chunk = bio->bi_iter.bi_sector / DATA_SIZE_SECTORS;
     unsigned int first = bio->bi_iter.bi_sector % DATA_SIZE_SECTORS;
     unsigned int sectors = bio_sectors(bio);
     struct cache_entry *entry;
-    unsigned int run;
-    bool cached;
+    unsigned int run = sectors;
+    bool cached = false;
+    bool waited = false;
 
     spin_lock(&cache->lock);
-    entry = cache_find(cache, chunk);
-    if (!entry)
+    for (;;)
     {
-        spin_unlock(&cache->lock);
-        return false;
+        entry = cache_find(cache, chunk);
+        if (!entry)
+            break;
+
+        cached = entry->mask & BIT(first);
+        if (cached || entry->state != CACHE_WRITING)
+        {
+            run = run_length(entry->mask, first, sectors, cached);
+            break;
+        }
+
+        if (!waited)
+            atomic64_inc(&cache->read_waits);
+        waited = true;
+        cache_wait(cache);
     }
 
-    cached = entry->mask & BIT(first);
-    run = run_length(entry->mask, first, sectors, cached);
     if (cached)
         copy_from_entry(entry, bio, first, run);
+    else
+        cache_insert_read(cache, range, chunk);
     spin_unlock(&cache->lock);
 
     if (run < sectors)
@@ -285,6 +370,31 @@ bool cache_read(struct cache *cache, struct bio *bio)
         bio_endio(bio);
 
     return cached;
+}
+
+/// @brief Takes a read of the device below out of the tree of reads in flight
+/// @details
+/// Wakes the worker only if the chunk is under write back, as only then it may
+/// wait for the read.
+///
+/// Expected execution context - process, complete_work of the read.
+/// @param cache The cache of the device
+/// @param range The node cache_read put into the tree
+void cache_read_done(struct cache *cache, struct cache_range *range)
+{
+    struct cache_entry *entry;
+    bool wake;
+
+    spin_lock(&cache->lock);
+    rb_erase(&range->node, &cache->reads);
+    entry = cache_find(cache, range->chunk);
+    wake = entry && entry->state == CACHE_WRITING;
+    if (wake)
+        cache_event(cache);
+    spin_unlock(&cache->lock);
+
+    if (wake)
+        wake_up_all(&cache->wait);
 }
 
 /// @brief Hands an empty flush to the worker, which completes it
@@ -322,8 +432,9 @@ static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
 
 /// @brief Completion of a write back job
 /// @details
-/// complete_work of the part calls it through bio_endio, after the lock of the
-/// chunk is released. The last job of an entry frees it, or marks it failed.
+/// complete_work of the part calls it through bio_endio, as the last thing it
+/// does. Starts the next job of the entry, if one is queued. The last job of
+/// an entry frees it, or marks it failed.
 ///
 /// Expected execution context - process, a worker of transform_wq.
 static void cache_job_end_io(struct bio *bio)
@@ -332,6 +443,8 @@ static void cache_job_end_io(struct bio *bio)
     struct cache_entry *entry = job->entry;
     struct cache *cache = job->cache;
     blk_status_t status = bio->bi_status;
+    sector_t chunk = entry->chunk;
+    struct cache_job *next;
 
     bio_uninit(bio);
 
@@ -340,6 +453,12 @@ static void cache_job_end_io(struct bio *bio)
         entry->status = status;
     list_add(&job->list, &cache->jobs);
 
+    next = list_first_entry_or_null(&entry->queued, struct cache_job, list);
+    if (next)
+        list_del_init(&next->list);
+    else
+        entry->job_in_flight = false;
+
     if (!--entry->jobs)
         cache_finish_entry(cache, entry);
 
@@ -347,9 +466,11 @@ static void cache_job_end_io(struct bio *bio)
     spin_unlock(&cache->lock);
     wake_up_all(&cache->wait);
 
+    if (next)
+        queue_work(cache->dm_ctx->transform_wq, &next->part.submit_work);
+
     if (status)
-        DM_ERR_LIMIT("write back of chunk %llu failed, status=%d\n",
-                     (unsigned long long)entry->chunk, status);
+        DM_ERR_LIMIT("write back of chunk %llu failed, status=%d\n", (unsigned long long)chunk, status);
 }
 
 /// @brief Takes a free job, waiting for one if needed
@@ -369,12 +490,19 @@ static struct cache_job *cache_get_job(struct cache *cache)
 }
 
 /// @brief Writes back one run of sectors of an entry
+/// @details
+/// The jobs of an entry go one after another: a partial chunk reads its old
+/// metadata, merges the CRCs of its own sectors and writes it back, so two jobs
+/// of one chunk at once would lose the CRCs of one of them. The job starts at
+/// once if no job of the entry is in flight, and is queued on the entry
+/// otherwise; the end of the job before it starts it.
 static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
                              unsigned int first, unsigned int sectors)
 {
     struct dm_context *dm_ctx = cache->dm_ctx;
     struct cache_job *job = cache_get_job(cache);
     struct bio *bio = &job->bio;
+    bool start;
 
     job->entry = entry;
     job->cache = cache;
@@ -387,13 +515,26 @@ static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
     // The worker may wait here: the completions that give places back run in transform_wq.
     down(&dm_ctx->parts_in_flight);
     trn_p_rq_init(&job->part, bio, dm_ctx, TRANSFORM_WRITE);
-    queue_work(dm_ctx->transform_wq, &job->part.submit_work);
+
+    spin_lock(&cache->lock);
+    start = !entry->job_in_flight;
+    if (start)
+        entry->job_in_flight = true;
+    else
+        list_add_tail(&job->list, &entry->queued);
+    spin_unlock(&cache->lock);
+
+    if (start)
+        queue_work(dm_ctx->transform_wq, &job->part.submit_work);
 }
 
 /// @brief Writes back an entry in CACHE_WRITING, one job per run of its sectors
 /// @details
 /// Writes to the entry wait until it leaves CACHE_WRITING, so its mask and its
-/// page do not change while the jobs are in flight.
+/// page do not change while the jobs are in flight. So do new reads of its
+/// clean sectors, so the reads of the chunk already in flight are waited for
+/// before the first job: a read that met a job could see the data of one
+/// version of a sector and the CRC of another.
 static void cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
 {
     u8 mask = entry->mask;
@@ -411,6 +552,8 @@ static void cache_write_back_entry(struct cache *cache, struct cache_entry *entr
     spin_lock(&cache->lock);
     entry->jobs = jobs;
     entry->status = BLK_STS_OK;
+    while (cache_reads_on(cache, entry->chunk))
+        cache_wait(cache);
     spin_unlock(&cache->lock);
 
     for (first = 0; first < DATA_SIZE_SECTORS; first += run)
@@ -464,7 +607,8 @@ static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes
 /// entry to come of age.
 ///
 /// It runs on an ordered workqueue of its own, never in transform_wq, so it may
-/// wait for jobs and places among the parts in flight: their completions run there.
+/// wait for jobs, for places among the parts in flight and for reads in flight:
+/// their completions run there.
 static void cache_write_back(struct work_struct *work)
 {
     struct cache *cache = container_of(to_delayed_work(work), struct cache, write_back);
@@ -605,6 +749,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
 
     spin_lock_init(&cache->lock);
     cache->tree = RB_ROOT;
+    cache->reads = RB_ROOT;
     INIT_LIST_HEAD(&cache->free);
     INIT_LIST_HEAD(&cache->dirty);
     INIT_LIST_HEAD(&cache->failed);
@@ -615,6 +760,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     cache->dm_ctx = dm_ctx;
     atomic64_set(&cache->free_waits, 0);
     atomic64_set(&cache->busy_waits, 0);
+    atomic64_set(&cache->read_waits, 0);
 
     cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
     cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);
@@ -630,6 +776,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
         if (!entry->page)
             goto error;
         RB_CLEAR_NODE(&entry->node);
+        INIT_LIST_HEAD(&entry->queued);
         entry->state = CACHE_FREE;
         list_add_tail(&entry->list, &cache->free);
     }
@@ -658,7 +805,7 @@ void cache_destroy(struct cache *cache)
 
     cancel_delayed_work_sync(&cache->write_back);
 
-    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes));
+    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !RB_EMPTY_ROOT(&cache->reads));
     list_for_each_entry(entry, &cache->dirty, list)
         DM_ERR_LIMIT("chunk %llu is lost: it was never written back\n", (unsigned long long)entry->chunk);
     list_for_each_entry(entry, &cache->failed, list)

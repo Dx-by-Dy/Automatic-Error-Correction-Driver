@@ -16,9 +16,9 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// each REQ_PREFLUSH, and the data of such a bio comes afterwards without the flag.
 ///
 /// A write goes into the cache, see cache_write. A read takes from the cache
-/// what it holds, see cache_read; for the rest it takes a place among the parts
-/// in flight, initializes the trn_p_rq in the per-bio data of the bio and
-/// processes it asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in
+/// what it holds, see cache_read; for the rest it is put into the tree of reads
+/// of the cache, takes a place among the parts in flight, initializes the
+/// trn_p_rq in the per-bio data of the bio and processes it asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in
 /// flight, or for memory, which blocks the submitter as a full request queue of
 /// a disk would. Waiting belongs here and in the worker of the cache, never in
 /// transform_wq: its workers run the complete_work that gives places and
@@ -55,7 +55,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
     switch (bio_op(bio))
     {
     case REQ_OP_READ:
-        if (cache_read(dm_ctx->cache, bio))
+        if (cache_read(dm_ctx->cache, bio, &part->range))
             return DM_MAPIO_SUBMITTED;
         break;
 
@@ -84,7 +84,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 /// Expects a single argument argv[0] — path to the lower-level device.
 ///
 /// Sequentially allocates and initializes all resources:
-/// lock table, work queue, metadata page pool, and lower-level device.
+/// work queue, metadata page pool, lower-level device and the cache.
 ///
 /// On error at any stage, frees all previously allocated resources
 /// in reverse order of allocation.
@@ -112,14 +112,6 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         ti->error = "dm_context alloc failed";
         DM_ERR("kzalloc dm_context failed\n");
         return -ENOMEM;
-    }
-
-    r = locker_init(&dm_ctx->locker);
-    if (r)
-    {
-        ti->error = "locker alloc failed";
-        DM_ERR("locker_init failed, err=%d\n", r);
-        goto error_locker_init;
     }
 
     dm_ctx->transform_wq = alloc_workqueue("transformation_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
@@ -186,8 +178,6 @@ error_dm_get_device:
 error_page_pool:
     destroy_workqueue(dm_ctx->transform_wq);
 error_alloc_workqueue:
-    locker_exit(&dm_ctx->locker);
-error_locker_init:
     kfree(dm_ctx);
     return r;
 }
@@ -207,7 +197,6 @@ static void dm_dtr(struct dm_target *ti)
     cache_destroy(dm_ctx->cache);
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
-    locker_exit(&dm_ctx->locker);
     dm_put_device(ti, dm_ctx->dev);
     mempool_destroy(dm_ctx->page_pool);
     kfree(dm_ctx);
@@ -239,8 +228,8 @@ static void dm_target_resume(struct dm_target *ti)
 /// STATUSTYPE_INFO (dmsetup status) gives the counters, in this order: waits of
 /// reads in dm_map for a place among the parts in flight, waits of writes for a
 /// free entry of the cache, waits of writes for an entry under write back,
-/// entries holding data not yet on the lower device, entries whose write back
-/// failed.
+/// reads that waited for the write back of their chunk, entries holding data
+/// not yet on the lower device, entries whose write back failed.
 /// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
@@ -258,10 +247,11 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %lu %lu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->read_waits),
                dirty, failed);
         break;
     case STATUSTYPE_TABLE:

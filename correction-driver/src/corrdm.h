@@ -15,7 +15,6 @@
 #include <linux/semaphore.h>
 #include <linux/atomic.h>
 
-#include "locker.h"
 #include "bio_helper.h"
 #include "trn_p_rq.h"
 
@@ -37,7 +36,7 @@ struct cache;
 /// @details
 /// Created in dm_ctr and stored in ti->private.
 /// Contains all resources necessary for request processing:
-/// lower-level device, work queue, metadata page pool, chunk lock table and the cache.
+/// lower-level device, work queue, metadata page pool and the cache.
 struct dm_context
 {
     /// @brief Write back cache that every write goes through
@@ -51,9 +50,6 @@ struct dm_context
 
     /// @brief Pages for chunk metadata, one per part
     mempool_t *page_pool;
-
-    /// @brief Chunk lock table
-    struct locker locker;
 
     /// @brief Free places for parts in flight, MAX_PARTS_IN_FLIGHT at most
     /// @details Taken in dm_map, given back in complete_work before bio_endio.

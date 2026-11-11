@@ -2,13 +2,14 @@
 #define CACHE_H
 
 #include <linux/bio.h>
+#include <linux/blkdev.h>
 #include <linux/list.h>
 #include <linux/rbtree.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
-#include "trn_p_rq.h"
+#include "alignment.h"
 
 /// @brief Size of the data the cache holds, allocated whole in dm_ctr
 #define CACHE_SIZE_BYTES (64UL << 20)
@@ -29,6 +30,7 @@
 #define CACHE_JOBS 256
 
 struct dm_context;
+struct cache_job;
 
 /// @brief State of a cache entry
 enum cache_state
@@ -39,7 +41,8 @@ enum cache_state
     /// @brief Holds data not yet written back, on the dirty list in order of age
     CACHE_DIRTY,
 
-    /// @brief Its data is being written back; writes to it wait, reads still use it
+    /// @brief Its data is being written back; writes to it and reads of its clean sectors wait,
+    /// reads of its dirty sectors still use it
     CACHE_WRITING,
 
     /// @brief Its write back failed; the data stays, and a flush retries it
@@ -72,8 +75,14 @@ struct cache_entry
     /// @brief Bit i is set if sector i of the chunk holds data written from above
     u8 mask;
 
-    /// @brief Write back jobs of the entry still in flight
+    /// @brief Write back jobs of the entry not yet done
     u8 jobs;
+
+    /// @brief A job of the entry is in flight; the others wait in queued
+    bool job_in_flight;
+
+    /// @brief Jobs of the entry waiting for the one in flight, see cache_submit_job
+    struct list_head queued;
 
     /// @brief State of the entry
     enum cache_state state;
@@ -82,31 +91,18 @@ struct cache_entry
     blk_status_t status;
 };
 
-/// @brief Lower write of one run of dirty sectors of an entry
+/// @brief A read of the device below in flight, in the tree of reads of the cache
 /// @details
-/// The bio goes through the same path as a write did before the cache: a part
-/// in trn_p_rq takes the lock of the chunk, writes the data and the metadata,
-/// merging the CRCs of the other sectors for a partial chunk. Jobs come from a
-/// table allocated in dm_ctr.
-struct cache_job
+/// Lives in the per-bio data of the read, so registering it allocates nothing.
+/// A write back of the chunk waits until no read of it is in flight, so that
+/// a read never sees the data of one version and the CRC of another.
+struct cache_range
 {
-    /// @brief Part that writes the bio, as the per-bio data of device mapper would hold it
-    struct trn_p_rq part;
+    /// @brief Node in the tree of reads, ordered by chunk; chunks may repeat
+    struct rb_node node;
 
-    /// @brief Bio over the page of the entry
-    struct bio bio;
-
-    /// @brief The only segment of bio
-    struct bio_vec bvec;
-
-    /// @brief Entry written back
-    struct cache_entry *entry;
-
-    /// @brief Cache of the entry
-    struct cache *cache;
-
-    /// @brief Node in the list of free jobs
-    struct list_head list;
+    /// @brief Number of the chunk read
+    sector_t chunk;
 };
 
 /// @brief Write back cache of a device
@@ -115,7 +111,7 @@ struct cache_job
 /// back to the device below. Everything that can be needed on the I/O path is
 /// allocated in cache_create.
 ///
-/// The spinlock protects the tree, the lists, the counters and the entries.
+/// The spinlock protects the trees, the lists, the counters and the entries.
 /// It is held only for a lookup and a copy of at most one chunk, never across
 /// I/O or a wait. Whoever has to wait (dm_map for an entry, the worker for a
 /// job) records events, drops the lock and waits for events to change.
@@ -126,6 +122,9 @@ struct cache
 
     /// @brief Entries that are not free, by chunk
     struct rb_root tree;
+
+    /// @brief Reads of the device below in flight, struct cache_range by chunk
+    struct rb_root reads;
 
     /// @brief Free entries
     struct list_head free;
@@ -153,7 +152,8 @@ struct cache
     /// @brief The device is suspended: the worker does not schedule itself
     bool suspended;
 
-    /// @brief Changes whenever an entry or a job is given back or changes state
+    /// @brief Changes whenever an entry or a job is given back or changes state, and when a
+    /// read of a chunk under write back completes
     u64 events;
 
     /// @brief Woken when events changes
@@ -177,14 +177,18 @@ struct cache
     /// @brief How many times dm_map waited for a free entry
     atomic64_t free_waits;
 
-    /// @brief How many times dm_map waited for an entry under write back
+    /// @brief How many times a write in dm_map waited for an entry under write back
     atomic64_t busy_waits;
+
+    /// @brief How many reads in dm_map waited for the write back of their chunk
+    atomic64_t read_waits;
 };
 
 struct cache *cache_create(struct dm_context *dm_ctx);
 void cache_destroy(struct cache *cache);
 void cache_write(struct cache *cache, struct bio *bio);
-bool cache_read(struct cache *cache, struct bio *bio);
+bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range);
+void cache_read_done(struct cache *cache, struct cache_range *range);
 void cache_flush(struct cache *cache, struct bio *bio);
 void cache_suspend(struct cache *cache);
 void cache_resume(struct cache *cache);

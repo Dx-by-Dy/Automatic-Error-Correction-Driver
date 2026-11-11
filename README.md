@@ -61,7 +61,8 @@ write is copied into the entry of its chunk and completes at once. The code is i
 
 A worker writes the entries back: those older than 1 second, as many as keep at least 55% of the entries
 free once more than half are in use, and all of them for a flush, a FUA write or a suspend. Writes to an
-entry under write back, and writes that find no free entry, wait in `dm_map`. An entry whose write back
+entry under write back, and writes that find no free entry, wait in `dm_map`. Reads of the clean sectors of an entry under write back wait there too,
+so that a stream of them cannot hold the write back off. An entry whose write back
 failed keeps its data and is tried again on the next flush, suspend or write to it. If every entry has failed,
 new writes fail.
 
@@ -69,15 +70,15 @@ new writes fail.
 
 1. Splitting the request into chunks;
 2. Copying each piece into the entry of its chunk in the cache, and completing it;
-3. Writing back the entry later: one lower write per run of its dirty sectors, which takes the lock of the
-   chunk, calculates the checksums, writes the data and the metadata, and for a partial chunk merges the old
-   checksums of the other sectors.
+3. Writing back the entry later, once no read of the chunk is in flight: one lower write per run of its dirty
+   sectors, one after another, each of which calculates the checksums, writes the data and the metadata, and
+   for a partial chunk merges the old checksums of the other sectors.
 
 ### Read Path
 
 1. Splitting the request into chunks;
 2. Copying the sectors held in the cache, and completing them;
-3. For the others: locking the chunk together with other readers, reading data and metadata, unlocking,
+3. For the others: registering the read in the cache, reading data and metadata, unregistering it,
    calculating and verifying the checksums, completing the request.
 
 ### Flushes
@@ -90,14 +91,21 @@ in the kernel log. Any other operation, such as discard, is refused.
 
 ### Synchronization
 
-The driver uses chunk-level synchronization based on:
+Only reads from the lower device and write backs of the cache reach the lower device, and the cache keeps
+them apart, the way `dm-integrity` keeps its ranges in flight:
 
-* A lock of its own: state under a spinlock and a list of waiting parts, in order of arrival
-* A fixed table of 65536 such locks, allocated when the target is created: chunk n uses lock n modulo 65536
+* A read from the lower device is put into a tree of reads in flight of the cache, ordered by chunk, before it
+  is sent, and taken out when it completes. The node is in the per-bio data of the read, so this allocates
+  nothing.
+* A write back of an entry waits in the worker of the cache until no read of its chunk is in flight. A read
+  that met it could get the data of one version of a sector and the checksum of another, and fail.
+* New reads of the clean sectors of an entry under write back wait in `dm_map`, so the reads of a chunk end.
+  Reads of its dirty sectors are copied from the cache.
+* The lower writes of one entry go one at a time, as each merges its checksums into the metadata sector of the
+  chunk: the end of one starts the next, without a worker waiting.
 
-This approach allows concurrent reads while preventing conflicting write operations, and taking a lock never allocates memory. Chunks that share a lock sometimes wait for each other, which cannot deadlock, as a part holds one lock at a time. A part that has to wait does not hold a worker: the part that releases the lock queues the next one.
-
-The lock of a chunk keeps reads from the lower device apart from write backs of the same chunk. The cache itself has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O.
+The cache has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O. Every
+read from the lower device takes it twice.
 
 ### Memory
 
@@ -159,7 +167,7 @@ Show the counters:
 dmsetup status corrdm
 ```
 
-After the usual `<start> <length> corrdm`, it prints five counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, the entries holding data not yet on the lower device, and the entries whose write back failed.
+After the usual `<start> <length> corrdm`, it prints six counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, and the entries whose write back failed.
 
 ## Usage
 
