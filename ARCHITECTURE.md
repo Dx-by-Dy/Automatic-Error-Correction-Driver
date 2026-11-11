@@ -2,7 +2,7 @@
 
 Draft. This file holds the global decisions: what the driver protects against, what it promises to the layer
 above, the on-disk format and the shape of the I/O path. How the driver works today is in [README.md](README.md),
-what is not done yet is in [TODO.md](TODO.md).
+what is not done yet is in [TODO.md](TODO.md), the reasons behind the decisions are in [RESEARCH.md](RESEARCH.md).
 
 Each point is marked:
 
@@ -99,9 +99,11 @@ device, so the cache can read or write them in one request, and no seek separate
 - **Proportions.** How much data one metadata block covers: 4 KiB per sector of metadata today. A larger unit
   means less overhead and fewer metadata requests, but more read amplification for small reads, and it sets
   the unit of the cache and of ECC. To be measured after the cache, against the baseline. It also has to fit a
-  lower device with 4 KiB logical blocks.
+  lower device with 4 KiB logical blocks. Two CRCs make the metadata durable before the data, so with 8 data
+  sectors to 1 of metadata a run is no longer one request, see
+  [RESEARCH.md](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs).
 - **CRC unit.** Per 512-byte sector, as now, tells which sector is bad, which helps correction. Per 4 KiB takes
-  less space.
+  less space. With two CRCs it cannot be larger than what the drive writes atomically.
 - **ECC.** The code, the unit it corrects (bits, a sector, a run), how much space it takes, where the redundancy
   lives (next to the data it may fail along with it), and how it combines with the CRC.
 - **Seed and position** in the CRC: after the threat research, see above.
@@ -131,8 +133,8 @@ complexity and bugs.
 
 ## Cache
 
-**Draft.** The next large piece of work, after the test base. Only its purpose is decided; the rest is to be
-discussed before it is designed.
+**Draft.** The next large piece of work, after the test base. How other targets do this, and what it costs, is in
+[RESEARCH.md](RESEARCH.md#caches-and-integrity-in-device-mapper).
 
 **Decided:**
 
@@ -142,9 +144,22 @@ discussed before it is designed.
   when it reads from it.
 - **Pages are copied**, so a page changed by the layer above after it was submitted no longer matters. This
   closes "Pages can change after their CRC is computed" in `TODO.md`.
-**Open**, whether a journal is needed. The user's view: with flushes and FUA handled correctly, the
-filesystem journal decides which writes survive a crash, so the cache needs no journal of its own. That holds
-for the order of writes, but point 3 of the contract stays with the driver, see the first open question below.
+
+**Decided** for now, on 2026-11-11, and may be revised once it is built:
+
+- **A structure of our own**, in the shape of the pmem mode of `dm-writecache`: a pool allocated up front, a tree
+  by position, an LRU, two watermarks and an age for write back, neighbours written as one bio.
+- **No `dm-bufio` for data**, so that write back stays under the control of the driver.
+- **The unit is a chunk.**
+- **Reads:** only dirty data is served from the cache, clean data is not kept.
+- **A write cut short by a crash: two CRCs are tried first**, so the cache has no journal of its own. The
+  filesystem journal decides which writes survive; point 3 of the contract stays with the driver. What this
+  requires is in [RESEARCH.md](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs).
+- **The layout stays 8 data sectors to 1 of metadata**; a larger metadata block is considered only after
+  measuring the cache and two CRCs on it.
+- **A failed write back:** the error is per chunk, not for the device. The data stays in RAM, and the cache has one
+  place where a reserved area can be plugged in later. When such chunks fill the cache, new writes are refused.
+
 
 **Proposed**, requirements:
 
@@ -161,7 +176,8 @@ for the order of writes, but point 3 of the contract stays with the driver, see 
 **Open:**
 
 - **A write cut short by a crash** (point 3 of the contract). The cache does not remove the problem: data and
-  metadata are still separate writes, and a drive is atomic only per sector. The options known so far:
+  metadata are still separate writes, and a drive is atomic only per sector. Two CRCs go first; the other
+  options stay in case they do not work out:
 
   | Option | How | Cost |
   | --- | --- | --- |
@@ -169,16 +185,14 @@ for the order of writes, but point 3 of the contract stays with the driver, see 
   | Two CRCs | Write metadata with both the old and the new CRC, flush, write the data. A read takes either | Keeps detection; ECC would need both the old and the new redundancy |
   | Journal | Every write goes to a journal first, then to its place | Every write twice |
 
-  The choice depends on the design of ECC. The write back of the cache has to leave room for this step; the
-  decision is due before correction.
-- **What happens to dirty data whose write back failed**: kept in RAM and retried, or dropped once the error is
-  reported. It matters for the goal of moving data off a failing drive.
-- **The unit of the cache**, its size, and when it writes back: on a flush, by age, by the share of dirty pages,
-  under memory pressure.
-- **Reads.** The page cache above already caches data, so the cache serves reads mainly to stay coherent with
-  dirty data and to read whole runs. Whether clean data is kept after a read is open.
-- **`dm-bufio`**, the device mapper library for caching metadata blocks: whether it fits, or the cache is a
-  structure of its own.
+  ECC may still change the choice. The write back of the cache has to leave room for a step before and after
+  writing a batch.
+- **A reserved area for failed write backs.** Proposed, not decided: such a chunk moves to a slot on the lower
+  device, with a table that redirects later access. As slots run out the device warns, then accepts only writes
+  that matter for the filesystem, then becomes read only. A write back that found a slot does not fail the next
+  flush. It needs a superblock, so it waits for the format. See
+  [RESEARCH.md](RESEARCH.md#a-failed-write-back-a-reserved-area).
+- **The size of the cache** and the values of its watermarks and age.
 
 ## Errors
 
@@ -201,7 +215,7 @@ it counts.
   replaying a prefix of it to a clean device gives the state after a crash at that point. A crash right after
   an `fsync` must keep everything the filesystem made durable. A crash at any flush or FUA write, while other
   writes are in flight, and a crash between the data and the metadata of one write, are strict `xfail` until
-  the open question in [Cache](#cache) is decided.
+  the two CRCs of [Cache](#cache) are written.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
   chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes that are dropped
   silently wait for the threat model, as lost writes are an open threat.
@@ -216,3 +230,6 @@ it counts.
 | 2026-11-10 | The cache copies data and aggregates writes; CRC and ECC are computed only towards the lower device | Performance at large volumes, and the stable page problem goes away |
 | 2026-11-10 | Metadata stays next to the data; the proportions are measured later | One request for data and metadata; the right proportion needs the cache and the baseline |
 | 2026-11-10 | Seed, position in the CRC and the "never written" state wait for research on drive failures | Not clear how real the threat of zeroed regions is for a degrading drive |
+| 2026-11-11 | The cache is a structure of our own in the shape of `dm-writecache` pmem, without `dm-bufio`, a chunk as its unit, keeping only dirty data for now | Write back stays under our control; [comparison](RESEARCH.md#caches-and-integrity-in-device-mapper) |
+| 2026-11-11 | Two CRCs are tried first for a write cut short by a crash, no journal | No blind spot, no double write, fits the format; [what it requires](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs) |
+| 2026-11-11 | The layout stays 8+1 until measured; a failed write back stays in RAM, with a place to plug in a reserved area later | Numbers first; the area needs a superblock, so it waits for the format |
