@@ -42,6 +42,11 @@ in a run, **From reading** means it was only found in the code.
   operation other than read, write and an empty flush. Discard needs the "never written" state,
   so that a discarded chunk does not fail its check.
 
+- **A failed metadata sector fails 8 chunks.** By design of the layout: a metadata sector holds the entries of
+  8 chunks, so when it cannot be read, the reads of all of them fail, and so do the write backs, which read it
+  first. Fix: the copy of the metadata in the next region, which the layout has room for; reads fall back to it,
+  and every change of metadata costs a second write.
+
 ## Device Mapper integration
 
 - **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 corrdm` with no
@@ -77,7 +82,12 @@ Carried over from the previous list.
 - **Move `first_sector` and `nr_sectors` into `struct trn_p_rq`.**
 - **Use preallocation where possible.**
 - **Use the Crypto API to speed up CRC64.**
-- **Cache hot metadata blocks** (a lock on the cache and a state machine).
+- **Metadata is not kept in RAM.** From reading: the cache holds only dirty data. A read of sectors not in the
+  cache reads the metadata sector of the chunk along with the data, also right after a write back, as a written
+  entry is freed at once (`cache_finish_entry`). Every write back reads the metadata sector first, as it holds
+  the entries of 8 chunks, so the metadata write waits for a lower read, and the write backs of the chunks of one
+  sector go one at a time. Two CRCs need the old CRCs of every chunk written back as well. Fix: keep metadata
+  sectors in RAM, clean and dirty, kept in step with write back; the next step of the cache.
 - **A write to a chunk under write back waits.** By decision, for simplicity: a hot chunk stalls its writers
   for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does. A cheaper partial
   fix: a mask of the sectors under write back, so that only writes to those sectors wait.
@@ -98,6 +108,10 @@ Carried over from the previous list.
   waits. Something the earlier tests leave lets the write back keep up with fio; not found what. Marked
   `unstable`, so it runs only on request. Fix: find the cause, then check the waits deterministically, with the
   cache over a lower device with slow writes, and keep this test about memory only.
+- **Waits for free entries of the cache are not checked.** Confirmed: `test_suspend_and_resume_under_load`
+  checked them under fio, and on `90bbfcf`, run alone 5 times, it got no wait twice and 35 and 36 where counted;
+  with metadata in areas per region none in three runs, as the write back keeps up with fio. The check was
+  removed from it. Fix: with the item above, check the waits on a lower device with slow writes.
 
 ## Documentation
 
@@ -112,9 +126,9 @@ Carried over from the previous list.
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
 2. **Cache.** Designed in `ARCHITECTURE.md`. Written so far: the cache with a write back of one chunk
-   at a time, kept apart from reads by the tree of reads in flight instead of chunk locks. Left:
-   neighbouring chunks written back as one bio, a place to plug in the reserved area, two CRCs, then the
-   cause of the unstable test of memory.
+   at a time, kept apart from reads by the tree of reads in flight instead of chunk locks. Left, in this
+   order: metadata in an area per region, metadata in RAM, two CRCs, neighbouring chunks written back as
+   one bio, a place to plug in the reserved area, then the cause of the unstable test of memory.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
    write backs.

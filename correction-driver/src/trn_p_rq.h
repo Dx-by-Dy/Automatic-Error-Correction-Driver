@@ -27,7 +27,7 @@ enum trn_p_state
     /// @brief The data bio and the first metadata bio are about to be submitted or are in flight.
     SUBMITTED,
 
-    /// @brief (TRANSFORM_WRITE only) the old metadata has been read;
+    /// @brief (TRANSFORM_WRITE only) the old metadata sector has been read;
     /// local CRC is being updated in meta.write.page and on disk via meta_bio.
     CRC_UPDATE,
 };
@@ -72,7 +72,7 @@ struct trn_p_rq
     /// @brief Work item for advancing the state machine and eventually finalizing the structure lifecycle
     /// @details For TRANSFORM_READ: leaves the tree of reads of the cache and triggers CRC verification
     ///          (check_crc), followed by resource cleanup.
-    ///          For TRANSFORM_WRITE (old metadata read): triggers local CRC update (update_crc_local)
+    ///          For TRANSFORM_WRITE (old metadata sector read): triggers local CRC update (update_crc_local)
     ///          and submits meta_bio again to write the metadata.
     ///          For TRANSFORM_WRITE (metadata written): triggers resource cleanup.
     struct work_struct complete_work;
@@ -93,6 +93,12 @@ struct trn_p_rq
     /// @brief Chunk index (physical sector of the start of the chunk data area)
     unsigned long index;
 
+    /// @brief Physical sector that holds the metadata of the chunk, shared with its neighbours
+    sector_t metadata_sector;
+
+    /// @brief Offset in bytes of the entry of the chunk in its metadata sector
+    unsigned int metadata_offset;
+
     /// @brief (TRANSFORM_READ only) the read in the tree of reads of the cache, see cache_read
     struct cache_range range;
 
@@ -112,7 +118,7 @@ struct trn_p_rq
     union trn_m_rq meta;
 
     /// @brief Bio for the metadata sector of the chunk
-    /// @details Set up by metadata_bio_init. A partial write reads the old metadata
+    /// @details Set up by metadata_bio_init. A write reads the old metadata sector
     /// with it, then sets it up again to write the new one.
     struct bio meta_bio;
 

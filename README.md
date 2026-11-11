@@ -26,31 +26,24 @@ The project serves as a foundation for future implementation of Error Correcting
 The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
 [ARCHITECTURE.md](ARCHITECTURE.md). This section describes the driver as it is.
 
-The virtual device is divided into fixed-size chunks.
-
-Each chunk contains:
-
-* User data region
-* Metadata region containing CRC64 checksums
+The virtual device is divided into chunks of 4 KiB, 8 sectors, and the chunks into regions of 1024 chunks,
+4 MiB of data, as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per
+sector, 64 bytes; a metadata sector holds the entries of 8 neighbouring chunks.
 
 ### Layout
 
 ```text
-+--------------------+
-| Chunk 0 Data       |
-+--------------------+
-| Chunk 0 CRC64      |
-+--------------------+
-| Chunk 1 Data       |
-+--------------------+
-| Chunk 1 CRC64      |
-+--------------------+
-| Chunk 2 Data       |
-+--------------------+
-| Chunk 2 CRC64      |
-+--------------------+
-        ...
+region 0                                  region 1
++-----------+-----------+-------------+   +-----------+-----------+-------------+
+| copy of   | metadata  | data        |   | copy of   | metadata  | data        |
+| region N  | region 0  | 1024 chunks |   | region 0  | region 1  | 1024 chunks | ...
+| 128 sect. | 128 sect. | 8192 sect.  |   | 128 sect. | 128 sect. | 8192 sect.  |
++-----------+-----------+-------------+   +-----------+-----------+-------------+
 ```
+
+The metadata of a region and its data are one contiguous range, and the data stays aligned to 4 KiB. The
+copy of the metadata is not written yet; its place is kept. The last region may be shorter: it keeps its whole
+metadata area and as many whole chunks as fit.
 
 ### Cache
 
@@ -71,8 +64,8 @@ new writes fail.
 1. Splitting the request into chunks;
 2. Copying each piece into the entry of its chunk in the cache, and completing it;
 3. Writing back the entry later, once no read of the chunk is in flight: one lower write per run of its dirty
-   sectors, one after another, each of which calculates the checksums, writes the data and the metadata, and
-   for a partial chunk merges the old checksums of the other sectors.
+   sectors, each of which calculates the checksums, writes the data, reads the metadata sector of the chunk,
+   merges the new checksums into it and writes it back.
 
 ### Read Path
 
@@ -101,8 +94,9 @@ them apart, the way `dm-integrity` keeps its ranges in flight:
   that met it could get the data of one version of a sector and the checksum of another, and fail.
 * New reads of the clean sectors of an entry under write back wait in `dm_map`, so the reads of a chunk end.
   Reads of its dirty sectors are copied from the cache.
-* The lower writes of one entry go one at a time, as each merges its checksums into the metadata sector of the
-  chunk: the end of one starts the next, without a worker waiting.
+* The lower writes of the chunks of one metadata sector go one at a time, those of one entry and of its
+  neighbours alike, as each merges its checksums into that sector: the end of one starts the next, without a
+  worker waiting.
 
 The cache has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O. Every
 read from the lower device takes it twice.
@@ -204,6 +198,7 @@ see [deploy/README.md](deploy/README.md). The tests are described in
 ### Write and Read Benchmarks
 
 Uncompetitive write benchmark:
+
 ```bash
 fio --name=test                               \
     --filename=/dev/mapper/corrdm             \
@@ -218,6 +213,7 @@ fio --name=test                               \
 ```
 
 Competitive write benchmark:
+
 ```bash
 fio --name=test                               \
     --filename=/dev/mapper/corrdm             \
@@ -232,6 +228,7 @@ fio --name=test                               \
 ```
 
 Uncompetitive read benchmark:
+
 ```bash
 fio --name=test                               \
     --filename=/dev/mapper/corrdm             \
@@ -246,6 +243,7 @@ fio --name=test                               \
 ```
 
 Competitive read benchmark:
+
 ```bash
 fio --name=test                               \
     --filename=/dev/mapper/corrdm             \
@@ -298,4 +296,3 @@ Alexey Smirnov
 This project was developed as part of a research effort focused on block-level data integrity mechanisms for Linux storage subsystems.
 
 The current implementation provides integrity verification and serves as a foundation for future ECC-based error correction capabilities.
-

@@ -6,8 +6,8 @@
 /// @details
 /// Traverses all bio segments byte-by-byte, accumulating CRC64 (big-endian)
 /// for each data sector. Upon completion of each sector, writes
-/// the final CRC to the corresponding place in meta->page, determined
-/// by the index meta->first_sector.
+/// the final CRC to the corresponding place in meta->page: the entry of the
+/// chunk at part->metadata_offset, and in it the index meta->first_sector.
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure for write
@@ -17,7 +17,8 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->first_sector, meta->nr_sectors);
 
-    struct chunk_metadata *md = kmap_local_page(meta->page);
+    void *base = kmap_local_page(meta->page);
+    struct chunk_metadata *md = base + meta->part->metadata_offset;
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
     unsigned int in_sector_pos = 0;
@@ -55,7 +56,7 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
         kunmap_local(addr);
     }
 
-    kunmap_local((void *)md);
+    kunmap_local(base);
     flush_dcache_page(meta->page);
 }
 
@@ -64,16 +65,13 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 /// Takes a page for the metadata from the page pool, with its first sector
 /// cleared, as only the CRCs are filled in before it goes to disk.
 ///
-/// For partial write (chunk_full == false) sets up part->meta_bio to read
-/// old metadata into the second half of the page, to later
-/// preserve CRC for unmodified sectors. complete_work sets it up again to write
-/// updated metadata from the first half of the page.
+/// Sets up part->meta_bio to read the old metadata sector into the second
+/// half of the page, to later preserve the CRCs of the neighbouring chunks
+/// and of the unmodified sectors. complete_work sets it up again to write
+/// updated metadata from the first half of the page. This holds for a write
+/// of a whole chunk as well, as its metadata sector is shared.
 ///
-/// For full write (chunk_full == true) the old metadata is not read —
-/// part->meta_bio is set up to write all recalculated CRCs at once.
-///
-/// In both cases, calls bio_crc_calc to calculate new CRCs
-/// from data in part->bio.
+/// Calls bio_crc_calc to calculate new CRCs from data in part->bio.
 ///
 /// Expected execution context - process, may sleep: waits for a page
 /// from the pool if memory is short, and never fails.
@@ -86,23 +84,17 @@ void trn_mw_rq_init(struct trn_mw_rq *meta,
 {
     DM_DEBUG("part=%p\n", part);
 
-    meta->chunk_full = (bio_sectors(part->bio) == DATA_SIZE_SECTORS);
     meta->first_sector = (u8)(align_data_sector(part->bio->bi_iter.bi_sector) - part->index);
     meta->nr_sectors = (u8)bio_sectors(part->bio);
     meta->part = part;
     meta->page = mempool_alloc(dm_ctx->page_pool, GFP_NOIO);
-    memzero_page(meta->page, 0, METADATA_SIZE_SECTORS * SECTOR_SIZE);
-
-    if (meta->chunk_full)
-        metadata_bio_init(part, meta->page, 0, metadata_write_opf(part->bio));
-    else
-        metadata_bio_init(part, meta->page, METADATA_SIZE_SECTORS * SECTOR_SIZE, REQ_OP_READ);
+    memzero_page(meta->page, 0, SECTOR_SIZE);
+    metadata_bio_init(part, meta->page, SECTOR_SIZE, REQ_OP_READ);
 
     bio_crc_calc(meta, part->bio);
 
-    DM_DEBUG("meta=%p, chunk_full=%d, first_sector=%u, nr_sectors=%u\n",
+    DM_DEBUG("meta=%p, first_sector=%u, nr_sectors=%u\n",
              meta,
-             meta->chunk_full,
              meta->first_sector,
              meta->nr_sectors);
     DM_DEBUG_BIO(&part->meta_bio);
@@ -116,9 +108,8 @@ void trn_mw_rq_init(struct trn_mw_rq *meta,
 /// @param meta Metadata transformation structure
 void complete_trn_mw_rq(struct trn_mw_rq *meta)
 {
-    DM_DEBUG("meta=%p chunk_full=%d first_sector=%u nr_sectors=%u\n",
-             meta, meta->chunk_full,
-             meta->first_sector, meta->nr_sectors);
+    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+             meta, meta->first_sector, meta->nr_sectors);
 
     bio_uninit(&meta->part->meta_bio);
     mempool_free(meta->page, meta->part->dm_ctx->page_pool);
@@ -128,9 +119,10 @@ void complete_trn_mw_rq(struct trn_mw_rq *meta)
 /// @details
 /// Runs after successful old metadata read via part->meta_bio.
 ///
-/// Copies CRCs for sectors unaffected by the current write request
-/// from old metadata (second half of page) to new
-/// (first half of page). CRCs for affected sectors were already
+/// Copies from the old metadata sector (second half of page) to the new one
+/// (first half of page) every CRC but those of the sectors of the current
+/// write request: the entries of the neighbouring chunks, and the CRCs of the
+/// other sectors of this chunk. CRCs for affected sectors were already
 /// calculated in bio_crc_calc during initialization.
 ///
 /// Expected execution context - process.
@@ -140,12 +132,13 @@ void update_crc_local(struct trn_mw_rq *meta)
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->first_sector, meta->nr_sectors);
 
-    struct chunk_metadata *new_md = page_address(meta->page);
-    struct chunk_metadata *old_md = (struct chunk_metadata *)(page_address(meta->page) + METADATA_SIZE_SECTORS * SECTOR_SIZE);
+    __le64 *new_crc = page_address(meta->page);
+    __le64 *old_crc = new_crc + SECTOR_SIZE / sizeof(*new_crc);
+    unsigned int first = meta->part->metadata_offset / sizeof(*new_crc) + meta->first_sector;
 
-    for (int i = 0; i < DATA_SIZE_SECTORS; i++)
+    for (unsigned int i = 0; i < SECTOR_SIZE / sizeof(*new_crc); i++)
     {
-        if (i < meta->first_sector || i >= meta->first_sector + meta->nr_sectors)
-            new_md->crc[i] = old_md->crc[i];
+        if (i < first || i >= first + meta->nr_sectors)
+            new_crc[i] = old_crc[i];
     }
 }

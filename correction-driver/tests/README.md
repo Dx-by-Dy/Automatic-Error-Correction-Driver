@@ -39,8 +39,10 @@ back, damaging its neighbours. Tests damage data through `stack.lower` and use i
 A write through the driver is sure to be on the lower device only after `flush()`, so a test that looks at the
 lower device, or damages it, flushes first. A failed write may be reported by the write or by the flush.
 
-**Layout.** `harness.py` has its own copy of the on-disk layout: 8 data sectors, then 1 metadata sector
-with 8 CRCs of 8 bytes each. A change of layout has to be made there as well.
+**Layout.** `harness.py` has its own copy of the on-disk layout: regions of 1024 chunks, each with 128
+sectors for the copy of the metadata of the region before, 128 sectors of its own metadata and 8192 sectors
+of data; an entry of 8 CRCs of 8 bytes per chunk, 8 entries to a metadata sector. A change of layout has to be
+made there as well. `test_layout_of_the_first_chunks_of_two_regions` spells the positions out apart from it.
 
 **Kernel log.** Each test reads the kernel log it caused. An unknown `BUG`, `WARNING`, `Oops`, KASAN,
 UBSAN, lockdep or hung task report fails the test. `KNOWN_KERNEL_REPORTS` in `conftest.py` lists the
@@ -67,15 +69,17 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 
 ## What is tested
 
-### `test_data.py`: data reads back unchanged and lands where the layout says (76 tests)
+### `test_data.py`: data reads back unchanged and lands where the layout says (79 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_capacity_excludes_metadata` | 1 | The device size is the lower size without metadata |
+| `test_capacity_excludes_metadata` | 1 | The device size on 16 MiB: 3 whole regions and a short one, without metadata |
+| `test_layout_of_the_first_chunks_of_two_regions` | 1 | The first chunks of regions 0 and 1 at the positions written out by hand: data after 256 sectors, the entry first in the metadata sector at 128, the rest of the sector and the area of the copy zero |
 | `test_fresh_device_reads_zeros` | 1 | A zeroed lower device reads as zeros, without CRC errors |
 | `test_roundtrip` | 50 | Write and read back, 10 sizes from 1 to 2048 sectors at 5 start positions |
-| `test_data_lands_at_the_layout_position` | 1 | Every sector is at its expected place on the lower device |
-| `test_metadata_is_written_outside_the_data` | 1 | The chunk's metadata sector changes, the next chunk's does not |
+| `test_data_lands_at_the_layout_position` | 2 | Every sector of 4 chunks is at its expected place on the lower device, at the start of a region and across the boundary of two |
+| `test_the_last_chunk_of_a_short_region` | 1 | The last chunk of the device, in the short last region, lands where it should and reads back |
+| `test_metadata_is_written_outside_the_data` | 1 | Only the entry of the chunk changes in its metadata sector, the next metadata sector does not |
 | `test_partial_write_to_an_empty_chunk` | 8 | A one-sector write, for each sector of a chunk; the rest stays zero |
 | `test_partial_write_keeps_the_crcs_of_its_neighbours` | 8 | After a one-sector write, each sector still reads on its own |
 | `test_write_across_a_chunk_boundary` | 1 | The write lands correctly, the data around it is intact |
@@ -85,15 +89,17 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 | `test_data_survives_recreating_the_device` | 1 | Data and CRCs persist after `dmsetup remove` and `create` |
 | `test_random_writes_match_a_reference_copy` | 1 | 1500 random overlapping reads and writes against a copy in memory, fixed seed |
 
-### `test_cache.py`: the write back cache (11 tests)
+### `test_cache.py`: the write back cache (12 tests)
 
 What reaches the lower device and when, and what reads see before it does. The chunk under test is written
 and flushed first where the lower device has to hold it.
 
-The last three tests put `dm-delay` under the driver for the metadata sector of that chunk alone: reads of it
-are answered a second late, writes at once, and the rest of the lower device is `dm-linear`. A read of the
-chunk from the lower device then has its data at once and its CRCs a second later, and a write back of part of
-the chunk reads the old CRCs for a second, so the races between reads and write backs happen every time.
+The last four tests put `dm-delay` under the driver for some sectors of the lower device: reads of them are
+answered a second late, writes at once, and the rest of the lower device is `dm-linear`. `dm-delay` holds a bio
+back before it sends it, so a delayed read sees what was written meanwhile. With the data of the chunk delayed,
+a read of it from the lower device has its CRCs at once and its data a second later. With its metadata sector
+delayed, every write back of the chunks of that sector reads the old CRCs for a second. So the races between
+reads and write backs, and between write backs, happen every time.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
@@ -104,22 +110,24 @@ the chunk reads the old CRCs for a second, so the races between reads and write 
 | `test_a_partial_chunk_writes_only_its_sectors` | 1 | Sectors 1 and 5 of a chunk written: the lower device changes only there, and each sector reads with its CRC |
 | `test_a_read_of_a_partly_dirty_chunk` | 1 | One dirty sector comes from the cache, the other seven from the lower device |
 | `test_a_dirty_sector_reads_while_a_clean_one_is_damaged` | 1 | A damaged clean sector fails, the dirty one and the sectors before it read |
-| `test_writes_larger_than_the_cache_go_through` | 1 | `slow`: 96 MiB through a cache of 64 MiB, without a flush in between, all read back. Waits for free entries are checked under fio, in `test_lifecycle.py` and `test_memory.py` |
-| `test_a_write_back_waits_for_a_read_in_flight` | 1 | A read of the chunk waits for its CRCs while the chunk is written and flushed: the read gets the old data without an error, then the new data reads |
-| `test_the_write_backs_of_a_chunk_go_one_at_a_time` | 1 | Sectors 1 and 5 written back by two lower writes, each reading the old CRCs: after the flush the whole chunk reads |
-| `test_a_read_of_a_clean_sector_waits_for_the_write_back` | 1 | A read of sector 5 while sector 1 is written back waits for it, counted in `read_waits`, and reads the old data |
+| `test_writes_larger_than_the_cache_go_through` | 1 | `slow`: 96 MiB through a cache of 64 MiB, without a flush in between, all read back. Waits for free entries are not checked deterministically yet, see `TODO.md` |
+| `test_a_write_back_waits_for_a_read_in_flight` | 1 | Data delayed: a read of the chunk waits for its data while the chunk is written and flushed: the read gets the old data without an error, then the new data reads |
+| `test_the_write_backs_of_a_chunk_go_one_at_a_time` | 1 | Metadata delayed: sectors 1 and 5 written back by two lower writes, each reading the old CRCs: after the flush the whole chunk reads |
+| `test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
+| `test_a_read_of_a_clean_sector_waits_for_the_write_back` | 1 | Metadata delayed: a read of sector 5 while sector 1 is written back waits for it, counted in `read_waits`, and reads the old data |
 
-### `test_corruption.py`: damage is detected, and only where it is (28 tests)
+### `test_corruption.py`: damage is detected, and only where it is (29 tests)
 
-Three chunks are written, and the damage is done to the middle one.
+Three chunks are written, whose entries share one metadata sector, and the damage is done to the middle one.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_data_corruption_fails_only_that_sector` | 8 | A flipped data bit gives `EIO` for that sector and any read with it; every other sector of the 3 chunks reads correctly |
 | `test_any_bit_of_a_sector_is_covered` | 4 | First and last bytes of a sector, lowest and highest bits |
 | `test_crc_corruption_fails_only_that_sector` | 8 | A flipped bit in a stored CRC fails only the sector it belongs to |
-| `test_zeroed_metadata_is_detected` | 1 | The scenario of the old `tests.py`; the next chunk stays readable |
-| `test_unused_metadata_bytes_are_not_checked` | 1 | Damage after the 8 CRCs does not affect reads; documents the format |
+| `test_zeroed_metadata_is_detected` | 1 | The scenario of the old `tests.py`, with the entry of the chunk zeroed; the next chunk stays readable |
+| `test_a_zeroed_metadata_sector_fails_every_chunk_it_covers` | 1 | The whole sector zeroed: all three chunks fail |
+| `test_the_entry_of_a_neighbour_does_not_cover_this_chunk` | 1 | A flipped bit in the entry of the next chunk fails that chunk only |
 | `test_restoring_the_data_clears_the_error` | 1 | No error state is kept in the driver |
 | `test_rewriting_a_corrupted_sector_clears_the_error` | 1 | A write of that sector gives it a new, correct CRC |
 | `test_write_to_a_neighbour_does_not_hide_corruption` | 1 | A partial write keeps the old CRC of the damaged sector |
@@ -158,16 +166,15 @@ The format is that of `replay-log` from xfstests, which is not needed.
 
 `dm-dust` with 512-byte blocks fails reads of chosen sectors of the lower device, and writes to them a
 chosen number of times; a write to such a sector clears it. One test loads `dm-flakey` in its place.
-Three chunks are written first, and the middle one gets the failures.
+16 chunks are written first, whose entries fill two metadata sectors, and the second chunk gets the failures.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_failed_data_sector_fails_only_its_reads` | 2 | First and last data sector: read one at a time, only that sector fails; a read over all three chunks fails; the first chunk reads correctly |
-| `test_failed_metadata_sector_fails_only_its_chunk` | 1 | Every sector of the chunk fails, the other two chunks read |
+| `test_failed_data_sector_fails_only_its_reads` | 2 | First and last data sector: read one at a time, only that sector fails; a read over all the chunks fails; the first chunk reads correctly |
+| `test_failed_metadata_sector_fails_only_the_chunks_it_covers` | 1 | Every sector of the 8 chunks of that metadata sector fails, the other 8 chunks read |
 | `test_device_works_again_once_the_sector_reads` | 1 | A failed data and metadata sector, then cleared: everything reads back, no error state stays in the driver |
-| `test_whole_chunk_write_over_a_failed_metadata_sector_needs_no_read` | 1 | The chunk does not read, then a write of it succeeds, as it does not read the old metadata, and the chunk reads back |
-| `test_partial_write_fails_when_the_old_metadata_does_not_read` | 1 | The write or its flush fails with `EIO`; the other chunks read. What the chunk holds after it is open |
-| `test_failed_write_is_reported` | 3 | The data or the metadata of a whole chunk, the data of one sector fails to write once: the write or its flush fails with `EIO`, the next one succeeds, the other chunks read |
+| `test_write_fails_when_the_old_metadata_does_not_read` | 3 | A whole chunk, one sector, and a whole neighbouring chunk with its entry in the same sector: the write or its flush fails with `EIO`, as it reads the sector first; the other chunks read. What the chunk holds after it is open |
+| `test_failed_write_is_reported` | 2 | The data of a whole chunk or of one sector fails to write once: the write or its flush fails with `EIO`, the next one succeeds, the other chunks read. A failed metadata write needs `dm-flakey`, as `dm-dust` fails the read of the sector first |
 | `test_writes_fail_while_reads_go_on` | 1 | `dm-flakey` with `error_writes`: whole, partial and crossing writes fail on their flush and stay in the cache, so they read back, and every flush fails; once `dm-linear` is back a flush writes them back and the device takes writes again |
 | `test_a_cache_full_of_failed_chunks_refuses_writes` | 1 | `dm-flakey` with `error_writes` under a device larger than the cache: writes of 1 MiB are taken in until every entry has failed, at most 64 MiB, then refused with `EIO`; what was taken in reads back, and reaches the lower device once `dm-linear` is back |
 
@@ -175,7 +182,7 @@ Three chunks are written first, and the middle one gets the failures.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds, so writes wait in `dm_map` for a free entry, which is checked |
+| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds. Whether writes wait in `dm_map` for a free entry depends on the speed of the write back and is not checked, see `TODO.md` |
 | `test_table_reload_under_load` | 1 | `slow`: the same with `dmsetup reload` and `resume`, which builds a new target and destroys the old one |
 | `test_module_unloads_only_without_devices` | 1 | `rmmod` fails while a device exists, succeeds without one; loaded again, the device works |
 | `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: the rescuer threads of its two workqueues are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
@@ -327,6 +334,15 @@ The cache, with `test_cache.py` and the tests changed for it:
 | The whole chunk counts as dirty | Failed, 2 | `test_a_partial_chunk_writes_only_its_sectors`, `test_a_read_of_a_partly_dirty_chunk`; only since the fixture writes another chunk after the original, as a freed entry comes back with its page unchanged |
 | A read copies the whole bio from the cache | Failed, 2 | `test_a_read_of_a_partly_dirty_chunk`, `test_a_dirty_sector_reads_while_a_clean_one_is_damaged` |
 | A flush does not try failed chunks again | Failed, 2 | `test_writes_fail_while_reads_go_on`, `test_a_cache_full_of_failed_chunks_refuses_writes` |
+
+Metadata in an area per region, with the tests changed for it:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The write backs go one at a time per chunk, not per metadata sector | Failed, `Input/output error` | `test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time`; `test_the_write_backs_of_a_chunk_go_one_at_a_time` passed, as it should |
+| `update_crc_local` keeps only the entry of its own chunk, the neighbours lose theirs | Failed, 39 | `test_corruption.py`, `test_cache.py`, `test_lower_errors.py` |
+| The data ignores the regions, at `256 + s`, the metadata does not | Failed, 3 | `test_layout_of_the_first_chunks_of_two_regions`, `test_data_lands_at_the_layout_position[across regions]`, `test_the_last_chunk_of_a_short_region` |
+| The write back does not wait for the reads in flight on its chunk, with the data delayed now | Failed, `Input/output error` | `test_a_write_back_waits_for_a_read_in_flight` |
 
 A read cut to 0 sectors by `dm_accept_partial_bio` makes device mapper send it again and again, until the
 write back by age frees the entry and the read goes to the lower device, with the right data. The read tests

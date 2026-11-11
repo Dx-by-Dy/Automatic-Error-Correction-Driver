@@ -62,3 +62,6 @@ correction-driver/.*
 correction-driver/benchmarks/figures/
 correction-driver/benchmarks/results/
 correction-driver/vdb
+
+# Python
+__pycache__/

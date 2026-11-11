@@ -7,7 +7,7 @@
 ///
 /// Submits data bio and meta_bio, which trn_mr_rq_init or trn_mw_rq_init set up:
 ///   - TRANSFORM_READ:  reads the metadata
-///   - TRANSFORM_WRITE: writes the metadata (chunk_full) or reads the old one (partial write)
+///   - TRANSFORM_WRITE: reads the old metadata sector, shared with the neighbouring chunks
 ///
 /// Expected execution context - process.
 /// @param work Pointer to work_struct embedded in part->submit_work
@@ -32,11 +32,11 @@ static void submit_work(struct work_struct *work)
 ///   check_crc with subsequent resource cleanup.
 ///
 /// TRANSFORM_WRITE:
-///   If chunk_full == false — updates CRC locally and
-///   submits meta_bio again to update CRC on disk.
+///   If the data was written and the old metadata sector read, merges the new
+///   CRCs into it and submits meta_bio again to write it.
 ///   Transitions state to CRC_UPDATE.
 ///
-///   If chunk_full == true, or after CRC_UPDATE — frees metadata.
+///   After CRC_UPDATE, or on an error — frees metadata.
 ///
 /// Finally gives back the place of the part among the parts in flight, and
 /// hands bio back to device mapper with the status of the part.
@@ -60,7 +60,7 @@ static void complete_work(struct work_struct *work)
         complete_trn_mr_rq(&part->meta.read);
         break;
     case TRANSFORM_WRITE:
-        if (part->state == SUBMITTED && !part->meta.write.chunk_full && !part->status)
+        if (part->state == SUBMITTED && !part->status)
         {
             part->state = CRC_UPDATE;
             update_crc_local(&part->meta.write);
@@ -107,6 +107,8 @@ void trn_p_rq_init(struct trn_p_rq *part,
     DM_DEBUG("part=%p, bio=%p, type=%d\n", part, bio, type);
 
     part->index = start_data_sector(bio->bi_iter.bi_sector);
+    part->metadata_sector = metadata_sector(bio->bi_iter.bi_sector);
+    part->metadata_offset = metadata_offset(bio->bi_iter.bi_sector);
     part->dm_ctx = dm_ctx;
     part->bio = bio;
     part->type = type;

@@ -3,7 +3,7 @@
 import pytest
 
 from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
-from harness import DATA_SECTORS, BlockDevice, capacity, pattern, run
+from harness import DATA_SECTORS, BlockDevice, capacity, pattern, physical_sector, run
 
 
 @pytest.fixture
@@ -60,7 +60,7 @@ def test_target_may_start_after_sector_0(lower):
     try:
         upper.write(start, data)
         upper.flush()
-        assert below.read(0, DATA_SECTORS) == data
+        assert below.read(physical_sector(0), DATA_SECTORS) == data
     finally:
         upper.close()
         below.close()

@@ -13,8 +13,8 @@ struct dm_context;
 
 /// @brief Representation of one chunk's metadata stored on disk
 /// @details
-/// Located in the metadata sector immediately after DATA_SIZE_SECTORS
-/// data sectors of the chunk. Contains CRC64 for each data sector,
+/// An entry in the metadata sector of the chunk, at metadata_offset, next to
+/// the entries of its neighbours. Contains CRC64 for each data sector,
 /// computed in order of increasing sector index.
 struct chunk_metadata
 {
@@ -22,21 +22,23 @@ struct chunk_metadata
     __le64 crc[DATA_SIZE_SECTORS];
 };
 
+static_assert(sizeof(struct chunk_metadata) == METADATA_ENTRY_SIZE, "the entry of a chunk has a fixed size");
+
 /// @brief Structure representing chunk metadata transformation on write
 /// @details
 /// Part of trn_p_rq for write operations.
 ///
-/// For partial write (chunk_full == false) before writing new
-/// metadata, it's necessary to read the old metadata to update CRC only for the
-/// needed sectors. For this, the page is divided into two parts:
-///   - [0, METADATA_SIZE_SECTORS * SECTOR_SIZE)                                                — new metadata (written)
-///   - [METADATA_SIZE_SECTORS * SECTOR_SIZE, 2 * METADATA_SIZE_SECTORS * SECTOR_SIZE)          — old metadata (read)
+/// The metadata sector holds the entries of the neighbouring chunks as well,
+/// and a partial write keeps the CRCs of the other sectors of its own chunk,
+/// so the old sector is read first and only the CRCs of the written sectors
+/// change. For this, the page is divided into two parts:
+///   - [0, SECTOR_SIZE)               — new metadata sector (written)
+///   - [SECTOR_SIZE, 2 * SECTOR_SIZE) — old metadata sector (read)
 ///
 /// part->meta_bio first reads the old metadata, then is set up again to write
-/// the new metadata, so only one metadata bio is in flight at a time.
-///
-/// For full write (chunk_full == true) the old metadata is not read,
-/// as all CRCs of the chunk are recalculated and written directly.
+/// the new metadata, so only one metadata bio is in flight at a time. Two
+/// writes of the same metadata sector must not be in flight at once, or one
+/// would lose the CRCs of the other: the cache sends them one at a time.
 struct trn_mw_rq
 {
     /// @brief Reference to the parent struct trn_p_rq for chunk transformation
@@ -50,16 +52,11 @@ struct trn_mw_rq
     /// Used to compute corresponding metadata for the request.
     u8 nr_sectors;
 
-    /// @brief Memory page to store chunk metadata, from dm_context->page_pool
-    /// @details When chunk_full == false the page is divided into two parts:
+    /// @brief Memory page to store the metadata sector, from dm_context->page_pool
+    /// @details The page is divided into two parts:
     /// first — new metadata for writing,
     /// second — old metadata read from disk.
     struct page *page;
-
-    /// @brief Flag indicating full chunk write
-    /// @details If true — request covers all DATA_SIZE_SECTORS sectors of the chunk,
-    /// otherwise — false.
-    bool chunk_full;
 };
 
 /// @brief Operation and flags of the bio that writes the metadata of a chunk

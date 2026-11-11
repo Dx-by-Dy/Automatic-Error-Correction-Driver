@@ -30,8 +30,17 @@ struct cache_job
     /// @brief Cache of the entry
     struct cache *cache;
 
-    /// @brief Node in the list of free jobs, or in the queued list of the entry
+    /// @brief Node in the list of free jobs, or in the queued list of the job in flight on its sector
     struct list_head list;
+
+    /// @brief Node in the tree of jobs in flight of the cache, while in flight
+    struct rb_node node;
+
+    /// @brief Number of the metadata sector of the chunk: the chunk divided by CHUNKS_PER_METADATA_SECTOR
+    sector_t sector;
+
+    /// @brief While in flight, jobs of the same metadata sector waiting for it, see cache_submit_job
+    struct list_head queued;
 };
 
 /// @brief Free entries below which the worker writes back under pressure
@@ -137,6 +146,53 @@ static bool cache_reads_on(struct cache *cache, sector_t chunk)
     }
 
     return false;
+}
+
+/// @brief Finds the job in flight on a metadata sector; the lock must be held
+static struct cache_job *cache_find_sector(struct cache *cache, sector_t sector)
+{
+    struct rb_node *node = cache->sectors.rb_node;
+
+    while (node)
+    {
+        struct cache_job *job = rb_entry(node, struct cache_job, node);
+
+        if (sector < job->sector)
+            node = node->rb_left;
+        else if (sector > job->sector)
+            node = node->rb_right;
+        else
+            return job;
+    }
+
+    return NULL;
+}
+
+/// @brief Puts a job into the tree of jobs in flight; the lock must be held and its sector must not be there
+static void cache_insert_sector(struct cache *cache, struct cache_job *job)
+{
+    struct rb_node **link = &cache->sectors.rb_node;
+    struct rb_node *parent = NULL;
+
+    while (*link)
+    {
+        struct cache_job *other = rb_entry(*link, struct cache_job, node);
+
+        parent = *link;
+        link = job->sector < other->sector ? &(*link)->rb_left : &(*link)->rb_right;
+    }
+
+    rb_link_node(&job->node, parent, link);
+    rb_insert_color(&job->node, &cache->sectors);
+}
+
+/// @brief Hands the place of a job in the tree of jobs in flight to the first job queued on it
+/// @details The lock must be held. The other queued jobs go on waiting for next.
+static void cache_pass_sector(struct cache *cache, struct cache_job *job, struct cache_job *next)
+{
+    list_del_init(&next->list);
+    list_splice_init(&job->queued, &next->queued);
+    rb_replace_node(&job->node, &next->node, &cache->sectors);
 }
 
 /// @brief Records that waiters may go on; the lock must be held, wake them after dropping it
@@ -433,8 +489,9 @@ static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
 /// @brief Completion of a write back job
 /// @details
 /// complete_work of the part calls it through bio_endio, as the last thing it
-/// does. Starts the next job of the entry, if one is queued. The last job of
-/// an entry frees it, or marks it failed.
+/// does. Starts the next job of the metadata sector, if one is queued, which
+/// takes its place in the tree of jobs in flight. The last job of an entry
+/// frees it, or marks it failed.
 ///
 /// Expected execution context - process, a worker of transform_wq.
 static void cache_job_end_io(struct bio *bio)
@@ -453,11 +510,11 @@ static void cache_job_end_io(struct bio *bio)
         entry->status = status;
     list_add(&job->list, &cache->jobs);
 
-    next = list_first_entry_or_null(&entry->queued, struct cache_job, list);
+    next = list_first_entry_or_null(&job->queued, struct cache_job, list);
     if (next)
-        list_del_init(&next->list);
+        cache_pass_sector(cache, job, next);
     else
-        entry->job_in_flight = false;
+        rb_erase(&job->node, &cache->sectors);
 
     if (!--entry->jobs)
         cache_finish_entry(cache, entry);
@@ -491,21 +548,26 @@ static struct cache_job *cache_get_job(struct cache *cache)
 
 /// @brief Writes back one run of sectors of an entry
 /// @details
-/// The jobs of an entry go one after another: a partial chunk reads its old
-/// metadata, merges the CRCs of its own sectors and writes it back, so two jobs
-/// of one chunk at once would lose the CRCs of one of them. The job starts at
-/// once if no job of the entry is in flight, and is queued on the entry
-/// otherwise; the end of the job before it starts it.
+/// The jobs of one metadata sector go one after another: a job reads the
+/// sector, merges the CRCs of its own sectors and writes it back, so two jobs
+/// of one sector at once would lose the CRCs of one of them. This holds for
+/// the jobs of one entry and for those of the neighbouring chunks that share
+/// the sector. The job starts at once if no job of its sector is in flight,
+/// and is queued on the job in flight otherwise; the end of the job before it
+/// starts it.
 static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
                              unsigned int first, unsigned int sectors)
 {
     struct dm_context *dm_ctx = cache->dm_ctx;
     struct cache_job *job = cache_get_job(cache);
     struct bio *bio = &job->bio;
+    struct cache_job *head;
     bool start;
 
     job->entry = entry;
     job->cache = cache;
+    job->sector = entry->chunk / CHUNKS_PER_METADATA_SECTOR;
+    INIT_LIST_HEAD(&job->queued);
 
     bio_init(bio, dm_ctx->dev->bdev, &job->bvec, 1, REQ_OP_WRITE);
     bio->bi_iter.bi_sector = entry->chunk * DATA_SIZE_SECTORS + first;
@@ -517,11 +579,12 @@ static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
     trn_p_rq_init(&job->part, bio, dm_ctx, TRANSFORM_WRITE);
 
     spin_lock(&cache->lock);
-    start = !entry->job_in_flight;
+    head = cache_find_sector(cache, job->sector);
+    start = !head;
     if (start)
-        entry->job_in_flight = true;
+        cache_insert_sector(cache, job);
     else
-        list_add_tail(&job->list, &entry->queued);
+        list_add_tail(&job->list, &head->queued);
     spin_unlock(&cache->lock);
 
     if (start)
@@ -750,6 +813,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     spin_lock_init(&cache->lock);
     cache->tree = RB_ROOT;
     cache->reads = RB_ROOT;
+    cache->sectors = RB_ROOT;
     INIT_LIST_HEAD(&cache->free);
     INIT_LIST_HEAD(&cache->dirty);
     INIT_LIST_HEAD(&cache->failed);
@@ -776,7 +840,6 @@ struct cache *cache_create(struct dm_context *dm_ctx)
         if (!entry->page)
             goto error;
         RB_CLEAR_NODE(&entry->node);
-        INIT_LIST_HEAD(&entry->queued);
         entry->state = CACHE_FREE;
         list_add_tail(&entry->list, &cache->free);
     }
@@ -805,7 +868,8 @@ void cache_destroy(struct cache *cache)
 
     cancel_delayed_work_sync(&cache->write_back);
 
-    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !RB_EMPTY_ROOT(&cache->reads));
+    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !RB_EMPTY_ROOT(&cache->reads) ||
+            !RB_EMPTY_ROOT(&cache->sectors));
     list_for_each_entry(entry, &cache->dirty, list)
         DM_ERR_LIMIT("chunk %llu is lost: it was never written back\n", (unsigned long long)entry->chunk);
     list_for_each_entry(entry, &cache->failed, list)

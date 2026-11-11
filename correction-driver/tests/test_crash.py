@@ -89,8 +89,8 @@ def apply(image, writes):
         image[sector * 512 : sector * 512 + len(data)] = data
 
 
-# Whole chunks, a partial write and a write across a chunk boundary, so both ways of writing
-# metadata are in the log.
+# Whole chunks, a partial write and a write across a chunk boundary, of chunks that share metadata
+# sectors.
 STEPS = {
     "first": [(0, pattern("a", 16 * DATA_SECTORS))],
     "second": [(3, pattern("b", 2)), (5 * DATA_SECTORS + 6, pattern("c", 4)), (9 * DATA_SECTORS, pattern("d", DATA_SECTORS))],

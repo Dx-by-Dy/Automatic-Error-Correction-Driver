@@ -82,26 +82,44 @@ flush until the chunk is written.
 
 **Current.** Not final: there is no superblock and no version, so a change of format needs no migration.
 
-- The lower device is a sequence of chunks of 9 sectors: 8 data sectors, then 1 metadata sector. The logical
-  sector `s` is at `s / 8 * 9 + s % 8` on the lower device. The capacity is `lower / 9 * 8`, rounded down.
-- The metadata sector holds 8 `__le64` values, `crc64_be` of each data sector with a zero seed, in order. The
-  other 448 bytes are zero and unused.
+- A chunk is 8 data sectors, 4 KiB. Its metadata is an entry of 64 bytes: 8 `__le64` values, `crc64_be` of
+  each data sector with a zero seed, in order. A metadata sector holds the entries of 8 neighbouring chunks.
+- The lower device is a sequence of regions, as in `dm-integrity`. A region holds 1024 chunks, 4 MiB of data,
+  and is laid out as `[copy of the metadata of the region before | metadata of this region | data]`: 128
+  sectors, 128 sectors, 8192 sectors, 8448 in all. The copy of the last region goes into region 0. The
+  metadata and the data of a region are one contiguous range, and the data stays aligned to 4 KiB.
+- The copy is not written yet: its sectors stay as they were. A failed metadata sector fails the reads of
+  its 8 chunks, and the writes to them, as a write has to read the other entries of the sector first.
+- The last region may be shorter: it keeps its whole metadata area and as many whole chunks as fit. The
+  capacity is 8192 sectors per whole region, plus the chunks of the last one.
 - There is no "never written" state. A device has to be zeroed before use; a chunk of zeros with zero metadata
   passes the check.
 - Only a lower device with 512-byte logical blocks works, as metadata is written as one 512-byte sector.
 - The tests have their own copy of the layout in `correction-driver/tests/harness.py`.
 
-**Decided.** Metadata stays next to its data. A run of data and its metadata are neighbours on the lower
-device, so the cache can read or write them in one request, and no seek separates them.
+**Decided** on 2026-11-11, replacing metadata next to each chunk. The driver is for SSDs and HDDs both, so the
+metadata lives in areas of its own, one per region, as in `dm-integrity`:
+
+- **Two CRCs** make the metadata durable before the data. With metadata after every chunk a run became a row of
+  scattered metadata writes and then the data; with an area per region it is two sequential requests.
+- **Alignment.** Chunks at `9k` were not aligned to 4 KiB, so a drive with 4 KiB physical sectors did a
+  read-modify-write in firmware for every chunk, and a lower device with 4 KiB logical blocks could not work at all.
+- **Density.** A metadata sector per chunk used 64 of its 512 bytes, 12.5% of the device. Packed, the metadata is
+  1.6%, 3.1% with its copy, and small enough to keep its hot part in RAM.
+- **Locality.** A region of 4 MiB keeps the metadata near its data on an HDD; one area for the whole device
+  would put a seek between them.
+- **The copy** in the next region guards against a failed metadata sector, which now covers 8 chunks. Writing it
+  costs a second request for every change of metadata; the trade-off is to be settled when it is written.
+- **The cost:** a write of the metadata of one chunk has to read the other entries of its sector first, until
+  metadata is kept in RAM, and the writes of the chunks of one sector go one at a time.
 
 **Open:**
 
-- **Proportions.** How much data one metadata block covers: 4 KiB per sector of metadata today. A larger unit
+- **Proportions.** How much data one metadata block covers: 32 KiB per sector of metadata today. A larger unit
   means less overhead and fewer metadata requests, but more read amplification for small reads, and it sets
   the unit of the cache and of ECC. To be measured after the cache, against the baseline. It also has to fit a
-  lower device with 4 KiB logical blocks. Two CRCs make the metadata durable before the data, so with 8 data
-  sectors to 1 of metadata a run is no longer one request, see
-  [RESEARCH.md](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs).
+  lower device with 4 KiB logical blocks: then the metadata is written in blocks of 4 KiB, 64 chunks to a
+  block. Two CRCs take 128 bytes per chunk instead of 64.
 - **CRC unit.** Per 512-byte sector, as now, tells which sector is bad, which helps correction. Per 4 KiB takes
   less space. With two CRCs it cannot be larger than what the drive writes atomically.
 - **ECC.** The code, the unit it corrects (bits, a sector, a run), how much space it takes, where the redundancy
@@ -123,9 +141,10 @@ device, so the cache can read or write them in one request, and no seek separate
 - The number of requests in flight is bounded.
 
 **Current.** Device mapper splits each bio at chunk boundaries (`max_io_len` of 8 sectors). A write is copied
-into the cache and completes. The worker writes an entry back as one part per run of its dirty sectors, one at a
-time, once no read of the chunk is in flight: the part goes to the lower device as a data bio and a metadata
-bio, and a partial chunk reads the old metadata first. A read takes the sectors the cache holds from it; the
+into the cache and completes. The worker writes an entry back as one part per run of its dirty sectors, once no read
+of the chunk is in flight: the part goes to the lower device as a data bio and a metadata bio, which reads the
+metadata sector first and writes it back with the new CRCs merged in. The parts of the chunks of one metadata
+sector go one at a time. A read takes the sectors the cache holds from it; the
 rest is a part in the per-bio data of its bio, registered in the tree of reads of the cache while in flight,
 which reads from the lower device and checks the CRC in a worker. Details are in
 [README.md](README.md).
@@ -160,8 +179,8 @@ complexity and bugs.
 - **A write cut short by a crash: two CRCs are tried first**, so the cache has no journal of its own. The
   filesystem journal decides which writes survive; point 3 of the contract stays with the driver. What this
   requires is in [RESEARCH.md](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs).
-- **The layout stays 8 data sectors to 1 of metadata**; a larger metadata block is considered only after
-  measuring the cache and two CRCs on it.
+- **The layout:** metadata in an area per region, see [On-disk format](#on-disk-format), decided on 2026-11-11.
+  Its proportions are revisited only after measuring the cache and two CRCs on it.
 - **A failed write back:** the error is per chunk, not for the device. The data stays in RAM, and the cache has one
   place where a reserved area can be plugged in later. When such chunks fill the cache, new writes are refused.
   Every flush fails while such chunks remain, as a flush that succeeds promises the data is on the device.
@@ -179,8 +198,8 @@ complexity and bugs.
 - **The lock of a chunk moved into the cache**, after the first version of the cache and before runs: a read of
   the lower device registers its range in the tree of the cache while in flight, and a write back waits for the
   reads in flight on its chunks, while new reads of their clean sectors wait for it. A run spans many chunks, and
-  a part may not hold many chunk locks. The lower writes of one entry go one at a time, as each merges its CRCs
-  into the same metadata sector.
+  a part may not hold many chunk locks. The lower writes of the chunks of one metadata sector go one at a time,
+  as each merges its CRCs into that sector.
 - **Defaults are constants for now:** 64 MiB of cache per device, write back from 50% used down to 45%, an age of
   1 s. They are to be tuned later.
 
@@ -258,4 +277,5 @@ it counts.
 | 2026-11-11 | The layout stays 8+1 until measured; a failed write back stays in RAM, with a place to plug in a reserved area later | Numbers first; the area needs a superblock, so it waits for the format |
 | 2026-11-11 | FUA goes the way of a flush; a failed chunk is retried on a flush, a suspend or a new write; a chunk that fails on a suspend is lost with a log line | One path of code first; a suspend cannot fail, and the reserved area is not there yet |
 | 2026-11-11 | The lock of a chunk is replaced by ranges in flight in the tree of the cache, before runs | A run spans many chunks; one state machine in the driver instead of two |
+| 2026-11-11 | Metadata moves into an area per region of 4 MiB, packed 8 chunks to a sector, with room for a copy in the next region; it replaces metadata next to each chunk | SSDs and HDDs both; two CRCs keep a run two sequential requests; data aligned to 4 KiB; 1.6% instead of 12.5% |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |

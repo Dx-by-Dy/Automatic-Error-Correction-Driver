@@ -78,12 +78,6 @@ struct cache_entry
     /// @brief Write back jobs of the entry not yet done
     u8 jobs;
 
-    /// @brief A job of the entry is in flight; the others wait in queued
-    bool job_in_flight;
-
-    /// @brief Jobs of the entry waiting for the one in flight, see cache_submit_job
-    struct list_head queued;
-
     /// @brief State of the entry
     enum cache_state state;
 
@@ -125,6 +119,9 @@ struct cache
 
     /// @brief Reads of the device below in flight, struct cache_range by chunk
     struct rb_root reads;
+
+    /// @brief Write back jobs in flight, at most one per metadata sector, by the number of the sector
+    struct rb_root sectors;
 
     /// @brief Free entries
     struct list_head free;

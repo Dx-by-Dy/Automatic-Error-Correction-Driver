@@ -6,8 +6,12 @@ import pytest
 
 from harness import (
     CHUNK_SIZE,
+    CHUNKS_PER_METADATA_SECTOR,
     DATA_SECTORS,
+    METADATA_ENTRY_SIZE,
+    REGION_DATA_SECTORS,
     SECTOR_SIZE,
+    metadata_offset,
     metadata_sector,
     pattern,
     physical_sector,
@@ -18,8 +22,27 @@ ZERO_SECTOR = bytes(SECTOR_SIZE)
 
 
 def test_capacity_excludes_metadata(stack):
+    """16 MiB below: 3 whole regions of 8448 sectors, then 7424 sectors, of which 256 are metadata."""
+    assert stack.lower_sectors == 32768
     reported = int(run("blockdev", "--getsz", stack.upper_path).stdout)
-    assert reported == stack.lower_sectors // 9 * 8
+    assert reported == 3 * 8192 + 7168
+
+
+def test_layout_of_the_first_chunks_of_two_regions(stack):
+    """The positions spelled out, apart from harness.py: data after 256 sectors of metadata, the
+    metadata after 128 sectors kept for the copy of the region before, regions of 8448 sectors."""
+    first, second = pattern("region 0", DATA_SECTORS), pattern("region 1", DATA_SECTORS)
+    stack.upper.write(0, first)
+    stack.upper.write(8192, second)
+    stack.upper.flush()
+    assert stack.lower.read(256, DATA_SECTORS) == first
+    assert stack.lower.read(8448 + 256, DATA_SECTORS) == second
+    for metadata in (128, 8448 + 128):
+        sector = stack.lower.read(metadata)
+        assert sector[:METADATA_ENTRY_SIZE] != bytes(METADATA_ENTRY_SIZE), f"sector {metadata}"
+        assert sector[METADATA_ENTRY_SIZE:] == bytes(SECTOR_SIZE - METADATA_ENTRY_SIZE), f"sector {metadata}"
+    assert stack.lower.read(0, 128) == bytes(128 * SECTOR_SIZE), "the copy is not written yet"
+    assert stack.lower.read(8448, 128) == bytes(128 * SECTOR_SIZE), "the copy is not written yet"
 
 
 def test_fresh_device_reads_zeros(stack):
@@ -34,20 +57,39 @@ def test_roundtrip(stack, start, sectors):
     assert stack.upper.read(start, sectors) == data
 
 
-def test_data_lands_at_the_layout_position(stack):
-    data = pattern("layout", 3 * DATA_SECTORS)
-    stack.upper.write(0, data)
+@pytest.mark.parametrize(
+    "start", [0, REGION_DATA_SECTORS - 2 * DATA_SECTORS - 3], ids=["start of a region", "across regions"]
+)
+def test_data_lands_at_the_layout_position(stack, start):
+    sectors = 4 * DATA_SECTORS
+    data = pattern("layout", sectors)
+    stack.upper.write(start, data)
     stack.upper.flush()
-    for logical in range(3 * DATA_SECTORS):
-        expected = data[logical * SECTOR_SIZE:][:SECTOR_SIZE]
+    for logical in range(start, start + sectors):
+        expected = data[(logical - start) * SECTOR_SIZE :][:SECTOR_SIZE]
         assert stack.lower.read(physical_sector(logical)) == expected, f"sector {logical}"
+    assert stack.upper.read(start, sectors) == data
+
+
+def test_the_last_chunk_of_a_short_region(stack):
+    last = stack.sectors - DATA_SECTORS
+    data = pattern("last", DATA_SECTORS)
+    stack.upper.write(last, data)
+    stack.upper.flush()
+    assert stack.lower.read(physical_sector(last), DATA_SECTORS) == data
+    assert stack.upper.read(last, DATA_SECTORS) == data
 
 
 def test_metadata_is_written_outside_the_data(stack):
-    stack.upper.write(0, pattern("metadata", DATA_SECTORS))
+    """The entry of the chunk changes in its sector, the other entries and the next sector do not."""
+    chunk = 3
+    stack.upper.write(chunk * DATA_SECTORS, pattern("metadata", DATA_SECTORS))
     stack.upper.flush()
-    assert stack.lower.read(metadata_sector(0)) != ZERO_SECTOR
-    assert stack.lower.read(metadata_sector(DATA_SECTORS)) == ZERO_SECTOR
+    sector = stack.lower.read(metadata_sector(chunk * DATA_SECTORS))
+    offset = metadata_offset(chunk * DATA_SECTORS)
+    assert sector[offset : offset + METADATA_ENTRY_SIZE] != bytes(METADATA_ENTRY_SIZE)
+    assert sector[:offset] + sector[offset + METADATA_ENTRY_SIZE :] == bytes(SECTOR_SIZE - METADATA_ENTRY_SIZE)
+    assert stack.lower.read(metadata_sector(CHUNKS_PER_METADATA_SECTOR * DATA_SECTORS)) == ZERO_SECTOR
 
 
 @pytest.mark.parametrize("sector", range(DATA_SECTORS))

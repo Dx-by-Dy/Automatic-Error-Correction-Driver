@@ -64,7 +64,8 @@ void check_crc(struct trn_mr_rq *meta)
     DM_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
              part, meta->first_sector, meta->nr_sectors);
 
-    struct chunk_metadata *md = kmap_local_page(meta->metadata_page);
+    void *base = kmap_local_page(meta->metadata_page);
+    struct chunk_metadata *md = base + part->metadata_offset;
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
     u64 expected_crc = 0;
@@ -112,7 +113,7 @@ void check_crc(struct trn_mr_rq *meta)
     }
 
 out:
-    kunmap_local((void *)md);
+    kunmap_local(base);
 
     if (crc_error)
     {

@@ -15,8 +15,8 @@ FIRST = CHUNK * DATA_SECTORS
 CACHE_MIB = 64
 AGE_SECONDS = 1
 WAIT_SECONDS = 10
-# The metadata sector of CHUNK answers reads this late on the delayed stack, and writes at once.
-METADATA_READ_DELAY_MS = 1000
+# A delayed sector answers reads this late on the delayed stack, and writes at once.
+READ_DELAY_MS = 1000
 # Time for an I/O started in a thread to reach the lower device, well below the delay.
 SETTLE_SECONDS = 0.3
 
@@ -130,8 +130,8 @@ def test_a_dirty_sector_reads_while_a_clean_one_is_damaged(stack, original):
 def test_writes_larger_than_the_cache_go_through(make_stack):
     """More data than the cache holds, written without a flush, all arrives.
 
-    One writer of 1 MiB at a time does not outrun the write back, so whether writes wait for free
-    entries is checked under fio in test_lifecycle.py and test_memory.py.
+    One writer of 1 MiB at a time does not outrun the write back. Whether writes wait for free
+    entries is not checked deterministically yet, see TODO.md.
     """
     stack = make_stack(2 * CACHE_MIB)
     mib = 3 * CACHE_MIB // 2
@@ -144,29 +144,32 @@ def test_writes_larger_than_the_cache_go_through(make_stack):
 
 
 class DelayedStack:
-    """The driver on dm-delay, which holds back reads of the metadata sector of CHUNK.
+    """The driver on dm-delay, which holds back reads of some sectors of the lower device.
 
-    The rest of the lower device is dm-linear, and writes to that sector go down at once. A read
-    of the chunk from the lower device gets its data at once and its CRCs a second later, so a write
-    back that does not wait for the read lands in between, and a write back of a partial chunk reads
-    the old CRCs for a second.
+    The rest of the lower device is dm-linear, and writes to those sectors go down at once.
+    dm-delay holds a bio back before it sends it, so a delayed read sees what was written meanwhile.
+
+    With the metadata sector of CHUNK delayed, every write back of the chunks of that sector reads
+    their old CRCs for a second. With the data of CHUNK delayed, a read of the chunk gets its CRCs
+    at once and its data a second later, so a write back that does not wait for the read lands in
+    between.
     """
 
-    def __init__(self, lower_mib=4):
+    def __init__(self, slow, count, lower_mib=4):
         sectors = lower_mib * 2048
         lower = make_lower(sectors)
-        slow = metadata_sector(FIRST)
+        end = slow + count
         table = (
             f"0 {slow} linear {lower} 0\n"
-            f"{slow} 1 delay {lower} {slow} {METADATA_READ_DELAY_MS} {lower} {slow} 0\n"
-            f"{slow + 1} {sectors - slow - 1} linear {lower} {slow + 1}\n"
+            f"{slow} {count} delay {lower} {slow} {READ_DELAY_MS} {lower} {slow} 0\n"
+            f"{end} {sectors - end} linear {lower} {end}\n"
         )
         run("dmsetup", "create", FAULTY_NAME, stdin=table)
         run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
         self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
         self.threads = ThreadPoolExecutor(max_workers=1)
         self.original = pattern("original", DATA_SECTORS)
-        self.upper.write(FIRST, self.original)  # a whole chunk: its old CRCs are not read
+        self.upper.write(FIRST, self.original)
         self.upper.flush()
 
     def in_background(self, action):
@@ -185,16 +188,26 @@ class DelayedStack:
 
 @pytest.fixture
 def delayed():
-    stack = DelayedStack()
+    """Reads of the metadata sector of CHUNK are delayed."""
+    stack = DelayedStack(metadata_sector(FIRST), 1)
     yield stack
     stack.remove()
 
 
-def test_a_write_back_waits_for_a_read_in_flight(delayed):
+@pytest.fixture
+def delayed_data():
+    """Reads of the data of CHUNK are delayed."""
+    stack = DelayedStack(physical_sector(FIRST), DATA_SECTORS)
+    yield stack
+    stack.remove()
+
+
+def test_a_write_back_waits_for_a_read_in_flight(delayed_data):
     """A read of the chunk holds off its write back until it has both its data and its CRCs.
 
-    Without that, the write back lands between them: the read gets the old data and the new CRCs.
+    Without that, the write back lands between them: the read gets the old CRCs and the new data.
     """
+    delayed = delayed_data
     read = delayed.in_background(lambda: delayed.upper.read(FIRST, DATA_SECTORS))
     new = pattern("new", DATA_SECTORS)
     delayed.upper.write(FIRST, new)
@@ -214,6 +227,20 @@ def test_the_write_backs_of_a_chunk_go_one_at_a_time(delayed):
     delayed.upper.flush()
     expected = with_sectors(delayed.original, [(1, one), (5, five)])
     assert delayed.upper.read(FIRST, DATA_SECTORS) == expected
+
+
+def test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time(delayed):
+    """CHUNK and the chunk after it keep their CRCs in one sector, and each write back merges into it.
+
+    At once, both would read the old sector and the later one would undo the CRCs of the earlier.
+    """
+    neighbour = pattern("neighbour", DATA_SECTORS)
+    one = pattern("one", 1)
+    delayed.upper.write(FIRST + 1, one)
+    delayed.upper.write(FIRST + DATA_SECTORS, neighbour)
+    delayed.upper.flush()
+    assert delayed.upper.read(FIRST, DATA_SECTORS) == with_sectors(delayed.original, [(1, one)])
+    assert delayed.upper.read(FIRST + DATA_SECTORS, DATA_SECTORS) == neighbour
 
 
 def test_a_read_of_a_clean_sector_waits_for_the_write_back(delayed):

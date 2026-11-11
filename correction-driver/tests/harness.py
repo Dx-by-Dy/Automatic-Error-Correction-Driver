@@ -12,25 +12,41 @@ FIO_SECONDS = 300
 
 SECTOR_SIZE = 512
 DATA_SECTORS = 8
-METADATA_SECTORS = 1
-CHUNK_SECTORS = DATA_SECTORS + METADATA_SECTORS
 CHUNK_SIZE = DATA_SECTORS * SECTOR_SIZE
 CRC_SIZE = 8
+# The metadata of a chunk: a CRC per data sector, CHUNKS_PER_METADATA_SECTOR chunks to a sector.
+METADATA_ENTRY_SIZE = DATA_SECTORS * CRC_SIZE
+CHUNKS_PER_METADATA_SECTOR = SECTOR_SIZE // METADATA_ENTRY_SIZE
+# A region: [copy of the metadata of the region before | its metadata | its data].
+REGION_CHUNKS = 1024
+REGION_METADATA_SECTORS = REGION_CHUNKS // CHUNKS_PER_METADATA_SECTOR
+REGION_DATA_SECTORS = REGION_CHUNKS * DATA_SECTORS
+REGION_DATA_OFFSET = 2 * REGION_METADATA_SECTORS
+REGION_SECTORS = REGION_DATA_OFFSET + REGION_DATA_SECTORS
 
 
 def physical_sector(logical):
     """Sector on the lower device that holds a logical data sector."""
-    return logical // DATA_SECTORS * CHUNK_SECTORS + logical % DATA_SECTORS
+    region, in_region = divmod(logical, REGION_DATA_SECTORS)
+    return region * REGION_SECTORS + REGION_DATA_OFFSET + in_region
 
 
 def metadata_sector(logical):
-    """Sector on the lower device that holds the CRCs for a logical data sector."""
-    return logical // DATA_SECTORS * CHUNK_SECTORS + DATA_SECTORS
+    """Sector on the lower device that holds the CRCs for a logical data sector, among other chunks."""
+    region, in_region = divmod(logical, REGION_DATA_SECTORS)
+    return region * REGION_SECTORS + REGION_METADATA_SECTORS + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+
+
+def metadata_offset(logical):
+    """Offset in bytes of the entry of the chunk of a logical sector in its metadata sector."""
+    return logical // DATA_SECTORS % CHUNKS_PER_METADATA_SECTOR * METADATA_ENTRY_SIZE
 
 
 def capacity(lower_sectors):
     """Logical size in sectors of a device on top of a lower device of this size."""
-    return lower_sectors // CHUNK_SECTORS * DATA_SECTORS
+    regions, rest = divmod(lower_sectors, REGION_SECTORS)
+    last = max(rest - REGION_DATA_OFFSET, 0) // DATA_SECTORS * DATA_SECTORS
+    return regions * REGION_DATA_SECTORS + last
 
 
 def pattern(seed, sectors):
@@ -136,6 +152,13 @@ class BlockDevice:
     def flush(self):
         """Makes the writes so far durable; only then are they sure to be on the device below."""
         os.fsync(self.fd)
+
+    def patch(self, sector, offset, data):
+        """Replaces bytes inside one sector, leaving the rest of the device untouched."""
+        contents = bytearray(self.read(sector))
+        contents[offset : offset + len(data)] = data
+        assert len(contents) == SECTOR_SIZE, "a patch must stay inside the sector"
+        self.write(sector, bytes(contents))
 
     def flip_bit(self, sector, byte=0, bit=0):
         """Flips one bit of a sector, leaving the rest of the device untouched."""
