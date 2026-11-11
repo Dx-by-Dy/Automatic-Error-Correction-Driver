@@ -20,17 +20,6 @@ static inline sector_t align_data_sector(sector_t sector)
     return (sector / DATA_SIZE_SECTORS) * (CHUNK_SIZE_SECTORS) + (sector % DATA_SIZE_SECTORS);
 }
 
-/// @brief Calculates the number of sectors until the end of the current data chunk (without metadata)
-/// @details
-/// Used when splitting bio into parts such that
-/// each part does not cross chunk boundaries.
-/// @param sector Logical sector
-/// @return Number of sectors until the end of the current data chunk
-static inline sector_t sectors_until_datachunk_end(sector_t sector)
-{
-    return DATA_SIZE_SECTORS - (sector % DATA_SIZE_SECTORS);
-}
-
 /// @brief Calculates the start of the data area of a chunk
 /// @details
 /// For a given logical sector, determines the physical sector
@@ -40,6 +29,7 @@ static inline sector_t sectors_until_datachunk_end(sector_t sector)
 static inline sector_t start_data_sector(sector_t sector)
 {
     sector_t align_sector = align_data_sector(sector);
+
     return align_sector - (align_sector % CHUNK_SIZE_SECTORS);
 }
 

@@ -2,60 +2,31 @@
 #include "corrdm.h"
 #include "macros.h"
 
-/// @brief Initializes bio for working with chunk metadata
+/// @brief Sets up the metadata bio of a part
 /// @details
-/// Creates a new bio from the driver's bioset, binds it to
-/// the specified device sector, and adds a page with metadata
-/// as the only data segment.
+/// part->meta_bio is embedded in the part, so it cannot fail to allocate. It is
+/// bound to the metadata sector of the chunk, with a single segment of length
+/// SECTOR_SIZE at offset within page, and completes to trn_p_rq_end_io.
 ///
-/// Adds a single segment of length SECTOR_SIZE to the bio,
-/// starting at offset within the page.
-///
-/// If an error occurs, frees all allocated resources.
+/// A bio set up before must be released with bio_uninit first.
 ///
 /// Expected execution context - process.
-/// @param bio Pointer to store the created bio
-/// @param page Memory page to bind to bio
-/// @param offset Offset within the page
-/// @param dm_ctx Driver context
-/// @param private_data User data for bi_private
-/// @param sector Metadata sector to bind to bio
-/// @param opf Operation type and additional flags for bio
-/// @return 0 on success, negative error code on failure
-int metadata_bio_init(struct bio **bio,
-                      struct page *page,
-                      unsigned int offset,
-                      struct dm_context *dm_ctx,
-                      void *private_data,
-                      sector_t sector,
-                      blk_opf_t opf)
+/// @param part   Part whose metadata bio is set up
+/// @param page   Memory page to bind to bio
+/// @param offset Position within the page
+/// @param opf    Operation type and additional flags for bio
+void metadata_bio_init(struct trn_p_rq *part,
+                       struct page *page,
+                       unsigned int offset,
+                       blk_opf_t opf)
 {
-    DM_DEBUG("page=%p offset=%u sector=%llu opf=0x%x\n",
-             page,
-             offset,
-             (unsigned long long)sector,
-             opf);
+    struct bio *bio = &part->meta_bio;
 
-    *bio = bio_alloc_bioset(dm_ctx->dev->bdev, 1, opf, GFP_NOIO, dm_ctx->transform_bs);
-    if (!*bio)
-    {
-        DM_ERR("bio_alloc_bioset failed\n");
-        return -ENOMEM;
-    }
+    DM_DEBUG("part=%p page=%p offset=%u opf=0x%x\n", part, page, offset, opf);
 
-    (*bio)->bi_iter.bi_sector = sector;
-    (*bio)->bi_private = private_data;
-
-    if (bio_add_page(*bio, page, SECTOR_SIZE, offset) != SECTOR_SIZE)
-    {
-        DM_ERR("bio_add_page failed\n");
-
-        bio_put(*bio);
-        *bio = NULL;
-        return -ENOMEM;
-    }
-
-    DM_DEBUG("bio=%p\n", *bio);
-
-    return 0;
+    bio_init(bio, part->dm_ctx->dev->bdev, &part->meta_bvec, 1, opf);
+    bio->bi_iter.bi_sector = part->index + DATA_SIZE_SECTORS;
+    bio->bi_end_io = trn_p_rq_end_io;
+    bio->bi_private = part;
+    __bio_add_page(bio, page, SECTOR_SIZE, offset);
 }

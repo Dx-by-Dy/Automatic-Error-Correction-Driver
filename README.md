@@ -23,6 +23,9 @@ The project serves as a foundation for future implementation of Error Correcting
 
 ## Architecture
 
+The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
+[ARCHITECTURE.md](ARCHITECTURE.md). This section describes the driver as it is.
+
 The virtual device is divided into fixed-size chunks.
 
 Each chunk contains:
@@ -71,15 +74,26 @@ Each chunk contains:
 7. Calculating and verifying checksums;
 8. Completing the request.
 
+### Flushes
+
+The device reports a write cache with FUA. An empty flush goes to the lower device as it is: a write completes
+only once its data and its metadata have, so the flush covers every write completed before it. A FUA write
+makes both its data and its metadata FUA. Any other operation, such as discard, is refused.
+
 ### Synchronization
 
 The driver uses chunk-level synchronization based on:
 
-* `rw_semaphore`
-* `xarray`
-* Lazy lock allocation
+* A lock of its own: state under a spinlock and a list of waiting parts, in order of arrival
+* A fixed table of 65536 such locks, allocated when the target is created: chunk n uses lock n modulo 65536
 
-This approach allows concurrent reads while preventing conflicting write operations and minimizing memory consumption.
+This approach allows concurrent reads while preventing conflicting write operations, and taking a lock never allocates memory. Chunks that share a lock sometimes wait for each other, which cannot deadlock, as a part holds one lock at a time. A part that has to wait does not hold a worker: the part that releases the lock queues the next one.
+
+### Memory
+
+Nothing on the I/O path can fail to allocate. A part lives in the per-bio data of its bio, with its metadata structure and its metadata bio embedded in it, and the page for the metadata sector comes from a mempool with a reserve of 128 pages. When memory is short, `dm_map` waits for a page that another part gives back; workers never wait for memory, as they run the completions that give it back.
+
+At most 4096 parts are in flight per device. A bio-based device has no request queue with tags, so `dm_map` waits for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
 
 ## Building
 
@@ -129,6 +143,14 @@ Verify device creation:
 ls -l /dev/mapper/corrdm
 ```
 
+Show the counters:
+
+```bash
+dmsetup status corrdm
+```
+
+After the usual `<start> <length> corrdm`, it prints how many times `dm_map` waited for a place among the parts in flight.
+
 ## Usage
 
 Create a filesystem:
@@ -156,6 +178,10 @@ dmsetup remove corrdm
 ```
 
 ## Testing
+
+The driver is built, loaded and tested only in a development VM with a debug kernel, never on the host:
+see [deploy/README.md](deploy/README.md). The tests are described in
+[correction-driver/tests/README.md](correction-driver/tests/README.md).
 
 ### Write and Read Benchmarks
 

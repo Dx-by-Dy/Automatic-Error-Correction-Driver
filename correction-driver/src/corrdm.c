@@ -7,18 +7,28 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 
 /// @brief Handles incoming bio requests
 /// @details
-/// Called by the DM subsystem for each incoming bio.
-/// For read and write operations, creates a trn_rq, which splits the bio
-/// by chunk boundaries and asynchronously processes each part.
+/// Called by the DM subsystem for each incoming bio. DM splits requests at chunk
+/// boundaries, so the bio stays within one chunk.
 ///
-/// For other operations (FLUSH, DISCARD, etc.) forwards the bio
-/// directly to the lower-level device.
+/// An empty flush goes to the lower device as it is. Device mapper sends one
+/// for each REQ_PREFLUSH, and the data of such a bio comes afterwards without
+/// the flag. A write completes only once its data and metadata have, so the
+/// flush covers every write completed before it.
 ///
-/// On trn_rq initialization error, the incoming bio is already completed with BLK_STS_IOERR.
+/// For read and write operations, takes a place among the parts in flight,
+/// initializes the trn_p_rq in the per-bio data of the bio and processes it
+/// asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in flight, or for
+/// memory, which blocks the submitter as a full request queue of a disk would.
+/// The waiting belongs here and never in a worker: workers run the complete_work
+/// that gives places and memory back.
+///
+/// Other operations are refused: device mapper sends none of them, as the
+/// target does not offer them, and remapping one would bypass the CRC.
 /// @param ti  DM target
 /// @param bio Incoming bio request
 /// @return DM_MAPIO_SUBMITTED for READ, WRITE.
-///         DM_MAPIO_REMAPPED for FLUSH, DISCARD, etc.
+///         DM_MAPIO_REMAPPED for an empty flush.
+///         DM_MAPIO_KILL for anything else.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
     DM_DEBUG("bio=%p op=%u sector=%llu size=%u\n",
@@ -27,23 +37,21 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
              (unsigned long long)bio->bi_iter.bi_sector,
              bio->bi_iter.bi_size);
 
-    struct trn_rq *req;
     struct dm_context *dm_ctx = ti->private;
+    struct trn_p_rq *part = dm_per_bio_data(bio, ti->per_io_data_size);
+    sector_t sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     enum trn_p_type type;
+
+    if (bio->bi_opf & REQ_PREFLUSH)
+    {
+        if (WARN_ON_ONCE(bio_has_data(bio)))
+            return DM_MAPIO_KILL;
+        bio_set_dev(bio, dm_ctx->dev->bdev);
+        return DM_MAPIO_REMAPPED;
+    }
 
     switch (bio_op(bio))
     {
-    case REQ_OP_FLUSH:
-        flush_workqueue(dm_ctx->transform_wq);
-        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
-
-    case REQ_OP_DISCARD:
-        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
-
     case REQ_OP_READ:
         type = TRANSFORM_READ;
         break;
@@ -54,22 +62,18 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 
     default:
         DM_ERR("unsupported bio op=%u\n", bio_op(bio));
-        bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
-        bio_set_dev(bio, dm_ctx->dev->bdev);
-        return DM_MAPIO_REMAPPED;
+        return DM_MAPIO_KILL;
     }
 
-    req = trn_rq_init(bio, dm_ctx, type);
-    if (!req)
+    if (down_trylock(&dm_ctx->parts_in_flight))
     {
-        DM_ERR("trn_rq_init failed, op=%u sector=%llu, type=%d\n",
-               bio_op(bio),
-               (unsigned long long)bio->bi_iter.bi_sector,
-               type);
-        return DM_MAPIO_SUBMITTED;
+        atomic64_inc(&dm_ctx->map_waits);
+        down(&dm_ctx->parts_in_flight);
     }
 
-    trn_rq_submit(req);
+    bio->bi_iter.bi_sector = sector;
+    trn_p_rq_init(part, bio, dm_ctx, type);
+    queue_work(dm_ctx->transform_wq, &part->submit_work);
     return DM_MAPIO_SUBMITTED;
 }
 
@@ -78,7 +82,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 /// Expects a single argument argv[0] — path to the lower-level device.
 ///
 /// Sequentially allocates and initializes all resources:
-/// lock table, work queue, bioset, and lower-level device.
+/// lock table, work queue, metadata page pool, and lower-level device.
 ///
 /// On error at any stage, frees all previously allocated resources
 /// in reverse order of allocation.
@@ -100,7 +104,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     struct dm_context *dm_ctx;
     int r;
 
-    dm_ctx = kzalloc(sizeof(*dm_ctx), GFP_KERNEL);
+    dm_ctx = kzalloc_obj(*dm_ctx, GFP_KERNEL);
     if (!dm_ctx)
     {
         ti->error = "dm_context alloc failed";
@@ -108,16 +112,13 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         return -ENOMEM;
     }
 
-    dm_ctx->locker = kzalloc(sizeof(*dm_ctx->locker), GFP_KERNEL);
-    if (!dm_ctx->locker)
+    r = locker_init(&dm_ctx->locker);
+    if (r)
     {
         ti->error = "locker alloc failed";
-        DM_ERR("kzalloc locker failed\n");
-        r = -ENOMEM;
-        goto error_locker_alloc;
+        DM_ERR("locker_init failed, err=%d\n", r);
+        goto error_locker_init;
     }
-
-    locker_init(dm_ctx->locker);
 
     dm_ctx->transform_wq = alloc_workqueue("transformation_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!dm_ctx->transform_wq)
@@ -128,22 +129,27 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_alloc_workqueue;
     }
 
-    dm_ctx->transform_bs = kzalloc(sizeof(struct bio_set), GFP_KERNEL);
-    if (!dm_ctx->transform_bs)
+    dm_ctx->page_pool = mempool_create_page_pool(PAGE_POOL_RESERVE, 0);
+    if (!dm_ctx->page_pool)
     {
-        ti->error = "bio_set alloc failed";
-        DM_ERR("kzalloc bio_set failed\n");
+        ti->error = "page pool alloc failed";
+        DM_ERR("mempool_create_page_pool failed\n");
         r = -ENOMEM;
-        goto error_alloc_bioset;
+        goto error_page_pool;
     }
 
-    r = bioset_init(dm_ctx->transform_bs, 128, 0, BIOSET_NEED_BVECS | BIOSET_NEED_RESCUER);
+    sema_init(&dm_ctx->parts_in_flight, MAX_PARTS_IN_FLIGHT);
+    atomic64_set(&dm_ctx->map_waits, 0);
+
+    r = dm_set_target_max_io_len(ti, DATA_SIZE_SECTORS);
     if (r)
     {
-        ti->error = "bioset_init failed";
-        DM_ERR("bioset_init failed, err=%d\n", r);
-        goto error_bioset_init;
+        DM_ERR("dm_set_target_max_io_len failed, err=%d\n", r);
+        goto error_dm_get_device;
     }
+    ti->per_io_data_size = sizeof(struct trn_p_rq);
+    ti->num_flush_bios = 1;
+    ti->flush_supported = true;
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)
@@ -164,15 +170,12 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     return 0;
 
 error_dm_get_device:
-    bioset_exit(dm_ctx->transform_bs);
-error_bioset_init:
-    kfree(dm_ctx->transform_bs);
-error_alloc_bioset:
+    mempool_destroy(dm_ctx->page_pool);
+error_page_pool:
     destroy_workqueue(dm_ctx->transform_wq);
 error_alloc_workqueue:
-    locker_exit(dm_ctx->locker);
-    kfree(dm_ctx->locker);
-error_locker_alloc:
+    locker_exit(&dm_ctx->locker);
+error_locker_init:
     kfree(dm_ctx);
     return r;
 }
@@ -191,12 +194,38 @@ static void dm_dtr(struct dm_target *ti)
 
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
-    locker_exit(dm_ctx->locker);
-    kfree(dm_ctx->locker);
+    locker_exit(&dm_ctx->locker);
     dm_put_device(ti, dm_ctx->dev);
-    bioset_exit(dm_ctx->transform_bs);
-    kfree(dm_ctx->transform_bs);
+    mempool_destroy(dm_ctx->page_pool);
     kfree(dm_ctx);
+}
+
+/// @brief Reports the state of the target to dmsetup
+/// @details
+/// STATUSTYPE_INFO (dmsetup status) gives the counters: for now the number of
+/// times dm_map waited for a place among the parts in flight.
+/// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
+/// @param ti           DM target
+/// @param type         What to report
+/// @param status_flags Flags of the request, unused
+/// @param result       Buffer for the text
+/// @param maxlen       Size of the buffer
+static void dm_status(struct dm_target *ti, status_type_t type,
+                      unsigned int status_flags, char *result, unsigned int maxlen)
+{
+    struct dm_context *dm_ctx = ti->private;
+    unsigned int sz = 0;
+
+    switch (type)
+    {
+    case STATUSTYPE_INFO:
+        DMEMIT("%llu", (unsigned long long)atomic64_read(&dm_ctx->map_waits));
+        break;
+    case STATUSTYPE_TABLE:
+    case STATUSTYPE_IMA:
+        result[0] = '\0';
+        break;
+    }
 }
 
 static struct target_type target = {
@@ -206,6 +235,7 @@ static struct target_type target = {
     .ctr = dm_ctr,
     .dtr = dm_dtr,
     .map = dm_map,
+    .status = dm_status,
 };
 
 /// @brief Registers the DM target on module load
