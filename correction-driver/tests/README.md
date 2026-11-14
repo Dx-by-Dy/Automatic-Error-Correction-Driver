@@ -1,6 +1,6 @@
 # Driver tests
 
-199 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+221 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 198 tests but the unstable one
-deploy/vm.sh test -m "not slow"                       # the fast ones: 159 tests, about 5 minutes
+deploy/vm.sh test                                     # all 220 tests but the unstable one
+deploy/vm.sh test -m "not slow"                       # the fast ones: 181 tests, about 5 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -162,7 +162,7 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
 | `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: the journal commit is seen, as a FUA write on the lower device alone and as a flush through the driver, whose cache turns FUA into a write back and a flush; and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
-### `test_crash.py`: the device after a crash (11 tests)
+### `test_crash.py`: the device after a crash (12 tests)
 
 `dm-log-writes` logs every write that reaches the disk below the driver, with its flushes and FUA, in
 the order the data reaches the disk itself. `logwrites.py` reads the log and replays a prefix of it to the
@@ -177,6 +177,7 @@ is started again from the state of a replay, and the entries of both run in a ro
 | `test_flushed_writes_survive_a_crash` | 1 | Whole chunks, partial writes and a write across a chunk, each step flushed and marked, then a write left unflushed: at each mark the device holds exactly what was written before it |
 | `test_the_leading_copy_is_durable_before_the_data` | 2 | A whole chunk and one sector: between two flushes, the leading metadata sector of the chunk is a FUA write and comes before its data in the log |
 | `test_a_write_cut_between_data_and_metadata_reads_old_or_new` | 2 | A whole chunk and one sector: a crash at every entry between the two flushes leaves the chunk with its old or its new data |
+| `test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each` | 1 | Three chunks of region 0, two of them in one metadata sector, one written anew in one sector only: a crash at every entry between the two flushes leaves each sector old or new, some points leave one chunk new and another old, and after the last flush both copies of the metadata are equal |
 | `test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions` | 1 | A chunk written back by age twice without a flush from above: one barrier, and a crash at every entry leaves one of its three versions |
 | `test_a_second_crash_after_one_between_the_copies` | 2 | A crash after the leading copy (old data left) or after the data (new data left), then a write of the chunk, logged anew: one read before the write back, no mismatch, and a second crash at every entry leaves what the first crash left or the newest data |
 | `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
@@ -397,6 +398,7 @@ The two copies as the two CRCs:
 | No read before a write back, with the check of the counters taken out of the crash test | Failed, 4 | `test_a_second_crash_after_one_between_the_copies[data]`, the 3 tests of a read before a write in `test_corruption.py`; the `[leading copy]` case passes, as it should: the trailing copy matches there |
 | The trailing copy written by the read before a write back without FUA | Failed | `test_a_second_crash_after_one_between_the_copies[data]` |
 | The trailing copy takes the whole entry of a chunk, not only the sectors written | Failed | `test_only_the_sectors_written_are_read_first` |
+| A trailing sector takes the CRCs of only the first chunk written back in it | Failed | `test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each`; the tests of one chunk pass |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 

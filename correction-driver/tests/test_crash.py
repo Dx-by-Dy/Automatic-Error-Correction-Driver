@@ -20,7 +20,16 @@ from conftest import (
     make_lower,
     wait_for_write_back,
 )
-from harness import DATA_SECTORS, BlockDevice, capacity, metadata_sector, pattern, physical_sector, run
+from harness import (
+    DATA_SECTORS,
+    BlockDevice,
+    capacity,
+    metadata_sector,
+    metadata_sectors,
+    pattern,
+    physical_sector,
+    run,
+)
 from logwrites import FLUSH, FUA, mark_index, read_log, replay
 
 LOWER_MIB = 32
@@ -205,6 +214,60 @@ def test_a_write_cut_between_data_and_metadata_reads_old_or_new(logged, sectors)
     entries, old, new = write_old_and_new(logged, start, sectors)
     for point in range(mark_index(entries, "old"), mark_index(entries, "new") + 1):
         assert read_after(logged, entries[: point + 1], start) in (old, new), f"after a crash at entry {point}"
+
+
+# (chunk, first sector, sectors) written anew: chunks 3 and 5 share a metadata sector, 13 has another,
+# all in region 0.
+CUT_CHUNKS = [(3, 0, DATA_SECTORS), (5, 2, 1), (13, 0, DATA_SECTORS)]
+
+
+def test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each(logged):
+    """Several chunks of a region written back between two flushes, two of them in one metadata sector.
+
+    A crash at any entry leaves each sector with its old or its new data, whichever reached the disk:
+    the new one is read by the leading copy, the old one by the trailing copy. Some points leave one
+    chunk new and another old, or the test would check nothing. Once flushed, both copies are equal.
+    """
+    old = {chunk: pattern(f"old {chunk}", DATA_SECTORS) for chunk, _, _ in CUT_CHUNKS}
+    writes, new = [], {}
+    for chunk, first, sectors in CUT_CHUNKS:
+        data = pattern(f"new {chunk}", sectors)
+        writes.append((chunk * DATA_SECTORS + first, data))
+        new[chunk] = old[chunk][: first * 512] + data + old[chunk][(first + sectors) * 512 :]
+    write_and_flush(logged.upper_path, [(chunk * DATA_SECTORS, data) for chunk, data in old.items()])
+    logged.mark("old")
+    write_and_flush(logged.upper_path, writes)
+    logged.mark("new")
+    entries = logged.finish()
+
+    mixed = False
+    for point in range(mark_index(entries, "old"), mark_index(entries, "new") + 1):
+        device = logged.replay(entries[: point + 1])
+        try:
+            states = set()
+            for chunk in old:
+                try:
+                    data = device.read(chunk * DATA_SECTORS, DATA_SECTORS)
+                except OSError as error:
+                    pytest.fail(f"chunk {chunk} does not read after a crash at entry {point}: {error}")
+                for index in range(DATA_SECTORS):
+                    sector = data[index * 512 :][:512]
+                    versions = (old[chunk][index * 512 :][:512], new[chunk][index * 512 :][:512])
+                    assert sector in versions, f"chunk {chunk}, sector {index}, after a crash at entry {point}"
+                states.add(data == new[chunk])
+            mixed |= len(states) > 1
+        finally:
+            device.close()
+    assert mixed, "no crash point left one chunk new and another old"
+
+    logged.replay(entries).close()
+    lower = BlockDevice(logged.lower_path)
+    try:
+        for chunk, _, _ in CUT_CHUNKS:
+            lead, trail = metadata_sectors(chunk * DATA_SECTORS, logged.lower_sectors)
+            assert lower.read(lead) == lower.read(trail), f"the copies of the metadata of chunk {chunk} differ"
+    finally:
+        lower.close()
 
 
 def test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions(logged):
