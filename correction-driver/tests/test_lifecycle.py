@@ -76,7 +76,7 @@ def test_suspend_and_resume_under_load(make_stack):
 
     4 jobs of 128 requests of 1 MiB keep 512 MiB in flight, far more than the cache holds, and
     each job has an area of 120 MiB, so that it keeps that many in flight. Whether writes wait for
-    a free entry depends on how fast the write back is, so it is not checked here, see TODO.md.
+    a free entry depends on how fast the write back is, so it is checked in test_cache.py, over dm-delay.
     """
 
     def suspend_and_resume():

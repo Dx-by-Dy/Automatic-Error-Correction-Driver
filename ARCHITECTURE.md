@@ -181,7 +181,7 @@ complexity and bugs.
 
 ## Cache
 
-**Draft.** The next large piece of work, after the test base. How other targets do this, and what it costs, is in
+Written in the cache stage, closed on 2026-11-14; runs have a stage of their own after the format. How other targets do this, and what it costs, is in
 [RESEARCH.md](RESEARCH.md#caches-and-integrity-in-device-mapper).
 
 **Decided:**

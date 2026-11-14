@@ -30,6 +30,8 @@ WAIT_SECONDS = 10
 READ_DELAY_MS = 1000
 # Time for an I/O started in a thread to reach the lower device, well below the delay.
 SETTLE_SECONDS = 0.3
+# Every write to the lower device waits this long on the stack with slow writes.
+WRITE_DELAY_MS = 5
 
 
 def on_lower(stack, logical=FIRST, count=DATA_SECTORS):
@@ -141,8 +143,8 @@ def test_a_dirty_sector_reads_while_a_clean_one_is_damaged(stack, original):
 def test_writes_larger_than_the_cache_go_through(make_stack):
     """More data than the cache holds, written without a flush, all arrives.
 
-    One writer of 1 MiB at a time does not outrun the write back. Whether writes wait for free
-    entries is not checked deterministically yet, see TODO.md.
+    Whether one writer of 1 MiB at a time outruns the write back depends on the speed of the lower
+    device, so the waits for free entries are checked on a slow one, in the next test.
     """
     stack = make_stack(2 * CACHE_MIB)
     mib = 3 * CACHE_MIB // 2
@@ -152,6 +154,38 @@ def test_writes_larger_than_the_cache_go_through(make_stack):
     stack.upper.flush()
     for index, block in enumerate(blocks):
         assert stack.upper.read(index * 2048, 2048) == block, f"MiB {index}"
+
+
+@pytest.fixture
+def slow_writes():
+    """The driver on dm-delay, which holds every write to the lower device back WRITE_DELAY_MS."""
+    sectors = 2 * CACHE_MIB * 2048
+    lower = make_lower(sectors)
+    run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 0 {lower} 0 {WRITE_DELAY_MS}\n")
+    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+    upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+    yield upper
+    upper.close()
+    for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
+        dmsetup_remove(name)
+
+
+@pytest.mark.slow
+def test_writes_larger_than_the_cache_wait_for_free_entries(slow_writes):
+    """More data than the cache holds, written without a flush faster than the lower device takes it.
+
+    A quarter of the cache in, no write has waited; past its size, writes wait in dm_map for free
+    entries, and all the data arrives.
+    """
+    blocks = [os.urandom(1 << 20) for _ in range(3 * CACHE_MIB // 2)]
+    for index, block in enumerate(blocks):
+        if index == CACHE_MIB // 4:
+            assert device_status()["free_waits"] == 0, "a write waited with the cache mostly free"
+        slow_writes.write(index * 2048, block)
+    assert device_status()["free_waits"] > 0
+    slow_writes.flush()
+    for index, block in enumerate(blocks):
+        assert slow_writes.read(index * 2048, 2048) == block, f"MiB {index}"
 
 
 class DelayedStack:

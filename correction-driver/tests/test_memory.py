@@ -1,15 +1,18 @@
-"""I/O when memory is short: failed allocations in the driver, and the memory requests hold.
+"""I/O when memory is short: failed allocations in the driver, and the limit on parts in flight.
 
 Failures come from the kernel's fault injection, limited to one thread and to allocations whose
 stack passes through given code, so nothing else in the system is affected.
 """
 
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from harness import DATA_SECTORS, declare_hang, fio, pattern
+from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, make_lower
+from harness import DATA_SECTORS, REGION_DATA_SECTORS, BlockDevice, declare_hang, fio, pattern, run
 
 FAULTS = "/sys/kernel/debug"
 IO_SECONDS = 15
@@ -18,9 +21,14 @@ STUCK = object()
 
 SECTORS = 64 * DATA_SECTORS
 
-MEMORY_FIO_SECONDS = 15
-MEMORY_LOWER_MIB = 512
-MEMORY_MARGIN_MIB = 512
+# MAX_PARTS_IN_FLIGHT in src/corrdm.h.
+MAX_PARTS_IN_FLIGHT = 4096
+LIMIT_LOWER_MIB = 64
+LIMIT_READ_MIB = 32
+LIMIT_SECONDS = 3
+READ_DELAY_MS = 100
+# A part gives its place back just before its bio completes, so the device may count a few more for a moment.
+COMPLETING = 64
 
 
 def text_symbols():
@@ -171,56 +179,59 @@ def test_write_goes_on_with_only_the_bio_reserve(stack, injection):
     assert not isinstance(outcome, OSError), outcome
 
 
-def available_kib():
-    with open("/proc/meminfo") as meminfo:
-        for line in meminfo:
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1])
-    pytest.fail("no MemAvailable")
-
-
 def test_ordinary_load_does_not_wait(stack):
     """16 requests of 128 KiB at a time are 512 parts, far below the limit, so none waits for it."""
     fio(stack.upper_path, rw="randrw", bs="128k", size="8m", iodepth=16, time_based=1, runtime=5)
     assert stack.map_waits() == 0
 
 
-def memory_taken_mib(path):
-    """How far the available memory falls under a load of many large requests."""
-    before = available_kib()
-    load = threading.Thread(
-        target=fio,
-        args=(path,),
-        kwargs={
-            "rw": "write",
-            "bs": "1m",
-            "size": "256m",
-            "numjobs": 8,
-            "iodepth": 128,
-            "time_based": 1,
-            "runtime": MEMORY_FIO_SECONDS,
-        },
-    )
-    load.start()
-    lowest = before
-    while load.is_alive():
-        lowest = min(lowest, available_kib())
-        time.sleep(0.2)
-    load.join()
-    return (before - lowest) // 1024
+@pytest.fixture
+def slow_reads():
+    """The driver on dm-delay, which holds every read of the lower device back READ_DELAY_MS.
 
-
-# TODO.md: test_memory_of_requests_in_flight_is_limited is unstable
-@pytest.mark.unstable
-@pytest.mark.slow
-def test_memory_of_requests_in_flight_is_limited(make_stack):
-    """fio takes the same memory on either device, so the difference is what the driver holds.
-
-    The load is far above the size of the cache, so writes must have waited for free entries.
+    The metadata of the regions read is in RAM first: a read waits in dm_map for the metadata of its
+    region, so with it read late the load would come to the limit only after it.
     """
-    stack = make_stack(MEMORY_LOWER_MIB)
-    on_lower = memory_taken_mib(stack.lower_path)
-    time.sleep(3)
-    on_upper = memory_taken_mib(stack.upper_path)
-    assert on_upper - on_lower < MEMORY_MARGIN_MIB, f"lower {on_lower} MiB, upper {on_upper} MiB"
-    assert stack.status()["free_waits"] > 0
+    sectors = LIMIT_LOWER_MIB * 2048
+    lower = make_lower(sectors)
+    run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 {READ_DELAY_MS} {lower} 0 0\n")
+    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+    upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+    for region in range(-(-LIMIT_READ_MIB * 2048 // REGION_DATA_SECTORS)):
+        upper.read(region * REGION_DATA_SECTORS)
+    upper.close()
+    yield f"/dev/mapper/{UPPER_NAME}"
+    for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):
+        dmsetup_remove(name)
+
+
+def parts_in_flight():
+    """Parts of the driver in flight, from the statistics of its device in sysfs.
+
+    Device mapper counts a part from the end of dm_map, once it has its place, to its completion. The
+    statistics of dm-delay cannot be used: it counts a bio only once it is sent on after the delay.
+    """
+    name = os.path.basename(os.path.realpath(f"/dev/mapper/{UPPER_NAME}"))
+    with open(f"/sys/block/{name}/inflight") as inflight:
+        return sum(int(count) for count in inflight.read().split())
+
+
+@pytest.mark.slow
+def test_parts_in_flight_stay_under_the_limit(slow_reads):
+    """fio asks for 32 reads of 1 MiB at a time, 8192 parts, from a lower device that answers late.
+
+    The parts in flight come up to the limit and never pass it, and dm_map waits for places. How much memory the driver takes under load is measured with the baseline, on a kernel
+    without KASAN and kmemleak, which hold freed bios back.
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        load = executor.submit(
+            fio, slow_reads, rw="read", bs="1m", size=f"{LIMIT_READ_MIB}m", iodepth=32, time_based=1, runtime=LIMIT_SECONDS
+        )
+        most = 0
+        while not load.done():
+            most = max(most, parts_in_flight())
+            time.sleep(0.02)
+        load.result()
+    assert most > MAX_PARTS_IN_FLIGHT // 2, f"at most {most} in flight, the load did not reach the limit"
+    assert most <= MAX_PARTS_IN_FLIGHT + COMPLETING, f"{most} in flight"
+    assert device_status()["map_waits"] > 0

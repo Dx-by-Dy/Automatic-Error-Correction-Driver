@@ -124,19 +124,6 @@ Carried over from the previous list.
   waits for the reads in flight on one entry before it sends the next, so a slow read of one chunk delays the
   write back of the others. Fix: mark all the picked entries first and send each once its reads are done.
 
-## Tests
-
-- **`test_memory_of_requests_in_flight_is_limited` is unstable.** Confirmed: it checks that writes waited for
-  a free entry of the cache under fio, and none waits when the whole of `test_memory.py` runs (3 runs of 3, also
-  on `2b04bad`, before the tree of reads), while alone or after any part of the file tried it gets 900 to 1200
-  waits. Something the earlier tests leave lets the write back keep up with fio; not found what. Marked
-  `unstable`, so it runs only on request. Fix: find the cause, then check the waits deterministically, with the
-  cache over a lower device with slow writes, and keep this test about memory only.
-- **Waits for free entries of the cache are not checked.** Confirmed: `test_suspend_and_resume_under_load`
-  checked them under fio, and on `90bbfcf`, run alone 5 times, it got no wait twice and 35 and 36 where counted;
-  with metadata in areas per region none in three runs, as the write back keeps up with fio. The check was
-  removed from it. Fix: with the item above, check the waits on a lower device with slow writes.
-
 ## Documentation
 
 - **The README uses the wrong target name.** Confirmed: it says `correction_driver`, the target is
@@ -149,21 +136,18 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Cache.** Designed in `ARCHITECTURE.md`. Written so far: the cache with a write back of one chunk
-   at a time, kept apart from reads by the tree of reads in flight instead of chunk locks, metadata in an
-   area per region, metadata in RAM, and both copies of the metadata written, the trailing one after a flush.
-   The two copies are the two CRCs: the leading one before the data, a flush before a chunk is written back
-   again, and a read of a chunk whose copies differ. Left: the cause of the unstable test of memory.
-3. **Integrity and format.** Superblock and version, seed and
+2. **Integrity and format.** Superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
    write backs, and the place in the cache where it plugs in.
-4. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
+3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
-5. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,
+4. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,
    queue limits, the README.
-6. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
-   the cache and for the cache.
-7. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
+5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
+   the cache and for the cache, with the memory a load takes through the driver against the lower device:
+   on the debug kernel KASAN and kmemleak hold freed bios back, 100 to 535 MiB under `fio` with 1 MiB
+   requests, as device mapper makes a clone per 4 KiB.
+6. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
    implement recovery.
-8. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
+7. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
    flight, guided by the baseline.

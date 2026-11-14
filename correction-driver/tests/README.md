@@ -1,6 +1,6 @@
 # Driver tests
 
-221 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+222 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,7 +8,7 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 220 tests but the unstable one
+deploy/vm.sh test                                     # all 222 tests
 deploy/vm.sh test -m "not slow"                       # the fast ones: 181 tests, about 5 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
@@ -66,8 +66,7 @@ the kernel log (sysrq `w` and `t`):
 During the run `kernel.hung_task_timeout_secs` is lowered to 30.
 
 **Markers.** `slow` takes more than a few seconds. `known_hang` hangs the guest and runs only on request.
-`unstable` fails in some runs for a reason not found yet, named in `TODO.md`, and runs only on request too:
-`deploy/vm.sh test -m unstable`. A `-m` given to pytest replaces the default one, so it runs both kinds.
+A `-m` given to pytest replaces the default one, so `-m known_hang` runs those.
 
 **Known bugs.** A test for a known bug is a strict `xfail`, with the title of its `TODO.md` item as the
 reason: when the bug is fixed the test fails until the mark is removed. A bug that hangs the guest
@@ -95,7 +94,7 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 | `test_data_survives_recreating_the_device` | 1 | Data and CRCs persist after `dmsetup remove` and `create` |
 | `test_random_writes_match_a_reference_copy` | 1 | 1500 random overlapping reads and writes against a copy in memory, fixed seed |
 
-### `test_cache.py`: the write back cache (12 tests)
+### `test_cache.py`: the write back cache (13 tests)
 
 What reaches the lower device and when, and what reads see before it does. The chunk under test is in region 1,
 and is written and flushed first where the lower device has to hold it.
@@ -117,7 +116,8 @@ metadata, happen every time.
 | `test_a_partial_chunk_writes_only_its_sectors` | 1 | Sectors 1 and 5 of a chunk written: the lower device changes only there, and each sector reads with its CRC |
 | `test_a_read_of_a_partly_dirty_chunk` | 1 | One dirty sector comes from the cache, the other seven from the lower device |
 | `test_a_dirty_sector_reads_while_a_clean_one_is_damaged` | 1 | A damaged clean sector fails, the dirty one and the sectors before it read |
-| `test_writes_larger_than_the_cache_go_through` | 1 | `slow`: 96 MiB through a cache of 64 MiB, without a flush in between, all read back. Waits for free entries are not checked deterministically yet, see `TODO.md` |
+| `test_writes_larger_than_the_cache_go_through` | 1 | `slow`: 96 MiB through a cache of 64 MiB, without a flush in between, all read back. Whether writes wait for free entries depends on the speed of the lower device here |
+| `test_writes_larger_than_the_cache_wait_for_free_entries` | 1 | `slow`: the same over `dm-delay` holding every lower write back 5 ms: no write has waited a quarter of the cache in, writes have waited for free entries at the end, and all reads back |
 | `test_a_write_back_waits_for_a_read_in_flight` | 1 | Data delayed: a read of the chunk waits for its data while the chunk is written and flushed: the read gets the old data without an error, then the new data reads |
 | `test_the_write_backs_of_a_chunk_wait_for_its_metadata` | 1 | Metadata delayed: sectors 1 and 5 written back by two lower writes, which wait for the metadata area: after the flush the whole chunk reads |
 | `test_the_write_backs_of_chunks_sharing_a_metadata_sector_wait_for_its_metadata` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
@@ -229,7 +229,7 @@ The fio tests on 512 MiB, 128 regions, drop and read areas again all the time.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds. Whether writes wait in `dm_map` for a free entry depends on the speed of the write back and is not checked, see `TODO.md` |
+| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds. Whether writes wait in `dm_map` for a free entry depends on the speed of the write back and is checked in `test_cache.py` instead |
 | `test_table_reload_under_load` | 1 | `slow`: the same with `dmsetup reload` and `resume`, which builds a new target and destroys the old one |
 | `test_module_unloads_only_without_devices` | 1 | `rmmod` fails while a device exists, succeeds without one; loaded again, the device works |
 | `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: the rescuer threads of its three workqueues are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
@@ -281,7 +281,11 @@ pool of metadata pages were removed with the pool: the I/O path takes no page an
 | `test_io_takes_nothing_from_slab_in_the_driver` | 2 | `read`, `write` and flush of 64 chunks while every slab allocation through the driver fails, for a write in any task, as the write back runs in the worker of the cache: no error and correct data |
 | `test_write_goes_on_with_only_the_bio_reserve` | 1 | `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
 | `test_ordinary_load_does_not_wait` | 1 | `fio` `randrw` with `bs=128k`, `iodepth=16`, at most 512 parts: `dmsetup status` shows no wait for a place among the parts in flight |
-| `test_memory_of_requests_in_flight_is_limited` | 1 | `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device, and writes waited for a free entry of the cache. Measured before the cache: 1074 MiB on the lower device, 1052 MiB through the driver. `unstable`: no write waits when the whole file runs, see `TODO.md` |
+| `test_parts_in_flight_stay_under_the_limit` | 1 | `slow`: over `dm-delay` holding every lower read back 100 ms, with the metadata of the regions read first, `fio` asks for 32 reads of 1 MiB at a time, 8192 parts: the parts in flight, by `/sys/block/<device>/inflight` of the driver, come above half the limit of 4096 and not above it (with 64 for parts completing), and reads waited in `dm_map`. 4096 at most in a run. The statistics of `dm-delay` count a bio only once it is sent on after the delay, so they cannot be used |
+
+The memory a load takes through the driver against the lower device was measured here until 2026-11-14, and
+dropped: on the debug kernel the difference, 100 to 535 MiB, is freed DM clones, one per 4 KiB, that KASAN and
+kmemleak hold back, not memory of the driver. It is left to the baseline, on a kernel without them.
 
 ## What is not tested yet
 
@@ -399,6 +403,14 @@ The two copies as the two CRCs:
 | The trailing copy written by the read before a write back without FUA | Failed | `test_a_second_crash_after_one_between_the_copies[data]` |
 | The trailing copy takes the whole entry of a chunk, not only the sectors written | Failed | `test_only_the_sectors_written_are_read_first` |
 | A trailing sector takes the CRCs of only the first chunk written back in it | Failed | `test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each`; the tests of one chunk pass |
+
+Waits, with the two tests that replaced the unstable test of memory:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The limit on parts in flight is 16384 instead of 4096 | Failed | `test_parts_in_flight_stay_under_the_limit` |
+| A wait for a free entry is not counted | Failed | `test_writes_larger_than_the_cache_wait_for_free_entries` |
+| No write back under pressure, only by age and for a flush | Passed, as it should | `test_writes_larger_than_the_cache_wait_for_free_entries`: writes still wait and all arrive; the test checks the waits, not why the cache drains |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 
