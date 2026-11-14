@@ -10,6 +10,10 @@
 #define DM_WARN(fmt, ...) \
     pr_warn("[WARN] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 
+/// @brief DM_WARN for messages that I/O can repeat
+#define DM_WARN_LIMIT(fmt, ...) \
+    pr_warn_ratelimited("[WARN] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
+
 #define DM_INFO(fmt, ...) \
     pr_info("[INFO] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 

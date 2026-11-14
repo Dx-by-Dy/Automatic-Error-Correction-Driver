@@ -12,7 +12,7 @@ from harness import (
     REGION_DATA_SECTORS,
     SECTOR_SIZE,
     metadata_offset,
-    metadata_sector,
+    metadata_sectors,
     pattern,
     physical_sector,
     run,
@@ -30,19 +30,21 @@ def test_capacity_excludes_metadata(stack):
 
 def test_layout_of_the_first_chunks_of_two_regions(stack):
     """The positions spelled out, apart from harness.py: data after 256 sectors of metadata, the
-    metadata after 128 sectors kept for the copy of the region before, regions of 8448 sectors."""
+    leading copy after the 128 sectors of the trailing copy of the region before, regions of 8448
+    sectors. 16 MiB below make 4 regions, so the trailing copy of the last one is at the start."""
     first, second = pattern("region 0", DATA_SECTORS), pattern("region 1", DATA_SECTORS)
     stack.upper.write(0, first)
     stack.upper.write(8192, second)
-    stack.upper.flush()
+    stack.upper.flush_settled()
     assert stack.lower.read(256, DATA_SECTORS) == first
     assert stack.lower.read(8448 + 256, DATA_SECTORS) == second
     for metadata in (128, 8448 + 128):
         sector = stack.lower.read(metadata)
         assert sector[:METADATA_ENTRY_SIZE] != bytes(METADATA_ENTRY_SIZE), f"sector {metadata}"
         assert sector[METADATA_ENTRY_SIZE:] == bytes(SECTOR_SIZE - METADATA_ENTRY_SIZE), f"sector {metadata}"
-    assert stack.lower.read(0, 128) == bytes(128 * SECTOR_SIZE), "the copy is not written yet"
-    assert stack.lower.read(8448, 128) == bytes(128 * SECTOR_SIZE), "the copy is not written yet"
+    assert stack.lower.read(8448) == stack.lower.read(128), "trailing copy of region 0"
+    assert stack.lower.read(2 * 8448) == stack.lower.read(8448 + 128), "trailing copy of region 1"
+    assert stack.lower.read(0, 128) == bytes(128 * SECTOR_SIZE), "trailing copy of region 3, not written"
 
 
 def test_fresh_device_reads_zeros(stack):
@@ -81,15 +83,19 @@ def test_the_last_chunk_of_a_short_region(stack):
 
 
 def test_metadata_is_written_outside_the_data(stack):
-    """The entry of the chunk changes in its sector, the other entries and the next sector do not."""
+    """The entry of the chunk changes in its sector, in both copies; the other entries and the next sector do not."""
     chunk = 3
     stack.upper.write(chunk * DATA_SECTORS, pattern("metadata", DATA_SECTORS))
-    stack.upper.flush()
-    sector = stack.lower.read(metadata_sector(chunk * DATA_SECTORS))
+    stack.upper.flush_settled()
     offset = metadata_offset(chunk * DATA_SECTORS)
-    assert sector[offset : offset + METADATA_ENTRY_SIZE] != bytes(METADATA_ENTRY_SIZE)
-    assert sector[:offset] + sector[offset + METADATA_ENTRY_SIZE :] == bytes(SECTOR_SIZE - METADATA_ENTRY_SIZE)
-    assert stack.lower.read(metadata_sector(CHUNKS_PER_METADATA_SECTOR * DATA_SECTORS)) == ZERO_SECTOR
+    next_chunk = CHUNKS_PER_METADATA_SECTOR * DATA_SECTORS
+    for lower, following in zip(
+        metadata_sectors(chunk * DATA_SECTORS, stack.lower_sectors), metadata_sectors(next_chunk, stack.lower_sectors)
+    ):
+        sector = stack.lower.read(lower)
+        assert sector[offset : offset + METADATA_ENTRY_SIZE] != bytes(METADATA_ENTRY_SIZE), lower
+        assert sector[:offset] + sector[offset + METADATA_ENTRY_SIZE :] == bytes(SECTOR_SIZE - METADATA_ENTRY_SIZE)
+        assert stack.lower.read(following) == ZERO_SECTOR, following
 
 
 @pytest.mark.parametrize("sector", range(DATA_SECTORS))

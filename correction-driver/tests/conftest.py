@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
@@ -62,6 +63,8 @@ STATUS_FIELDS = (
     "failed",
     "metadata_loads",
     "metadata_waits",
+    "trail_errors",
+    "crowded_flushes",
 )
 
 
@@ -74,7 +77,9 @@ def device_status(name=UPPER_NAME):
     read_waits: reads of the lower device that waited for the write back of their chunk;
     dirty: entries with data not yet on the lower device; failed: entries whose write back failed;
     metadata_loads: metadata areas of regions read from the lower device;
-    metadata_waits: waits for a metadata area to be let go, as all were in use.
+    metadata_waits: waits for a metadata area to be let go, as all were in use;
+    trail_errors: sectors of the trailing copy of the metadata that failed to write;
+    crowded_flushes: flushes the driver made by itself, as too many metadata areas were busy.
     """
     fields = run("dmsetup", "status", name).stdout.split()
     assert fields[2] == "corrdm", fields
@@ -150,6 +155,19 @@ def kernel_log(watchdog):
             unknown.append(message)
     os.close(fd)
     assert not unknown, "kernel reports:\n" + "\n".join(unknown)
+
+
+@contextmanager
+def kernel_messages():
+    """Collects into a list the kernel messages logged while the block runs."""
+    fd = os.open("/dev/kmsg", os.O_RDONLY | os.O_NONBLOCK)
+    os.lseek(fd, 0, os.SEEK_END)
+    messages = []
+    try:
+        yield messages
+    finally:
+        messages.extend(read_kmsg(fd))
+        os.close(fd)
 
 
 def read_kmsg(fd):

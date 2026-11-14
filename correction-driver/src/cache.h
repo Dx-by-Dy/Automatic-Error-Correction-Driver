@@ -140,6 +140,9 @@ struct cache
     unsigned long nr_writing;
     unsigned long nr_failed;
 
+    /// @brief Write back jobs in flight, the queued ones among them
+    unsigned int nr_jobs;
+
     /// @brief Flushes and FUA writes waiting for the worker
     struct bio_list flushes;
 
@@ -179,6 +182,10 @@ struct cache
 
     /// @brief How many reads in dm_map waited for the write back of their chunk
     atomic64_t read_waits;
+
+    /// @brief How many times the worker flushed and wrote the trailing copies of the metadata
+    /// because too many metadata areas were busy, see metadata_crowded
+    atomic64_t crowded_flushes;
 };
 
 struct cache *cache_create(struct dm_context *dm_ctx);

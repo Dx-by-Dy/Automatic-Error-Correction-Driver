@@ -36,16 +36,22 @@ in a run, **From reading** means it was only found in the code.
 - **Data and CRC are not written atomically.** From reading: they are two independent bios, so
   after a power loss a chunk may have new data and an old CRC, and reads fail on data that
   is fine. It is the same when the metadata bio of a write back fails after its data bio
-  succeeded. Confirmed by the crash tests, which are strict `xfail` for it. Two CRCs are to be tried first, see
-  "Cache" in `ARCHITECTURE.md`.
+  succeeded. Confirmed by the crash tests before the trailing copy was written; they pass now, as the leading
+  copy happens to complete first and `dm-log-writes` logs in the order of completion. Fix, under way: the two
+  copies of the metadata as the two CRCs, see "On-disk format" in `ARCHITECTURE.md`. Both copies are written; left: the
+  leading copy durable before the data, a flush before a chunk is written back again, and a read that settles a
+  chunk whose copies differ after a crash.
 - **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
   operation other than read, write and an empty flush. Discard needs the "never written" state,
   so that a discarded chunk does not fail its check.
 
-- **A failed metadata sector fails 8 chunks.** By design of the layout: a metadata sector holds the entries of
-  8 chunks, so when it cannot be read, the reads of all of them fail, and so do the write backs, which read it
-  first. Fix: the copy of the metadata in the next region, which the layout has room for; reads fall back to it,
-  and every change of metadata costs a second write.
+- **A metadata sector failed in both copies fails 8 chunks.** By design of the layout: a metadata sector holds
+  the entries of 8 chunks, so when neither copy reads, the reads of all of them fail, and so do the write backs,
+  which need the other entries. Fix: ECC, or a third copy if the threat model asks for it.
+- **A failed copy of a metadata sector is put right only by the next write of that sector.** By decision, for
+  simplicity: until a chunk of the sector is written back, it stays with one copy, and a warning is logged at
+  every access, rate-limited. A trailing sector that failed to write is counted, not retried. Fix: rewrite the
+  failed copy from the other once it is found, in the worker.
 
 ## Device Mapper integration
 
@@ -86,10 +92,20 @@ Carried over from the previous list.
   the metadata area is waited for in `dm_map`, so a submitter with many requests in flight stalls for one lower
   read each time a request comes to a new region. Fix: a list of the parts waiting for an area, started by the
   end of its read.
-- **A metadata area whose read fails is read again by every request.** By decision, so that a sector that reads
-  again is seen: an area with failed sectors is not kept. On a failing device each request then costs a read of
-  64 KiB and one read per sector of the area. Fix, if it matters: keep the area and read again only its failed
+- **A metadata area with a sector failed in both copies is read again by every request that finds it unused.**
+  By decision, so that a sector that reads again is seen. On a failing device such a request then costs two
+  reads of 64 KiB and one read per sector of the failed copy. Fix, if it matters: read again only the failed
   sectors.
+- **Two flushes of the lower device per flush from above.** By decision, for simplicity: the second makes the
+  trailing copies durable before a chunk can be written back again. The flush from above completes after the
+  first. Fix: leave the trailing copies to the next flush, with a state for chunks whose trailing copy is
+  written but not yet durable; and make the moment the trailing copy is written configurable.
+- **The trailing copies are written one range at a time, synchronously, in the worker.** Each range of an area
+  is a request of its own. Fix: send them all, then wait, as runs will do for the data.
+- **When half the metadata areas are busy, the worker flushes by itself.** A write back pins its area until the
+  trailing copy is written, so random writes over many regions without flushes from above cost a flush of the
+  lower device every 16 regions. Counted in `dmsetup status`. Fix, if it matters: more areas, or a pin that
+  does not hold the whole area.
 - **A write to a chunk under write back waits.** By decision, for simplicity: a hot chunk stalls its writers
   for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does. A cheaper partial
   fix: a mask of the sectors under write back, so that only writes to those sectors wait.
@@ -129,8 +145,10 @@ Carried over from the previous list.
    clean. What is left: mark the commit before the cache.
 2. **Cache.** Designed in `ARCHITECTURE.md`. Written so far: the cache with a write back of one chunk
    at a time, kept apart from reads by the tree of reads in flight instead of chunk locks, metadata in an
-   area per region, and metadata in RAM. Left, in this order: two CRCs, neighbouring chunks written back
-   as one bio, a place to plug in the reserved area, then the cause of the unstable test of memory.
+   area per region, metadata in RAM, and both copies of the metadata written, the trailing one after a flush.
+   Left, in this order: the two copies as the two CRCs (the order of the writes and the settling read),
+   neighbouring chunks written back as one bio, a place to plug in the reserved area, then the cause of the
+   unstable test of memory.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
    write backs.

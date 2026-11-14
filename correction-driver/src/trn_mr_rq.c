@@ -4,7 +4,7 @@
 
 /// @brief Initializes struct trn_mr_rq
 /// @details
-/// Copies the entry of the chunk from the metadata cache, which reads the
+/// Copies both entries of the chunk from the metadata cache, which reads the
 /// metadata area of the region first if it is not in RAM.
 ///
 /// Expected execution context - dm_map, may sleep: waits for the metadata
@@ -12,7 +12,7 @@
 /// @param meta   Structure to initialize, inside part
 /// @param part   Parent struct trn_p_rq for chunk transformation
 /// @param dm_ctx Driver context
-/// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk does not read
+/// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk does not read in either copy
 blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
                             struct trn_p_rq *part,
                             struct dm_context *dm_ctx)
@@ -26,7 +26,7 @@ blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->first_sector, meta->nr_sectors);
 
-    return metadata_copy_entry(dm_ctx->metadata, part->sector, &meta->md);
+    return metadata_copy_entries(dm_ctx->metadata, part->sector, meta->md);
 }
 
 /// @brief Verifies CRC of read data against chunk metadata
@@ -35,8 +35,8 @@ blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
 /// of the bio reading the data, completed via trn_p_rq_end_io.
 ///
 /// Computes CRC64 for each data sector of bio,
-/// comparing the result with the copy of the entry of the chunk.
-/// On CRC mismatch, sets the status of the part
+/// comparing the result with both copies of the entry of the chunk: a sector
+/// passes if it matches either. On CRC mismatch, sets the status of the part
 /// and outputs error to the log.
 ///
 /// Expected execution context - process.
@@ -48,10 +48,10 @@ void check_crc(struct trn_mr_rq *meta)
     DM_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
              part, meta->first_sector, meta->nr_sectors);
 
-    const struct chunk_metadata *md = &meta->md;
+    const struct chunk_metadata *lead = &meta->md[METADATA_LEAD];
+    const struct chunk_metadata *trail = &meta->md[METADATA_TRAIL];
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
-    u64 expected_crc = 0;
     unsigned int in_sector_pos = 0;
     bool crc_error = false;
     struct bvec_iter iter = meta->saved_iter;
@@ -73,19 +73,22 @@ void check_crc(struct trn_mr_rq *meta)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
-                DM_DEBUG("sector=%llu, sector_idx=%u, expected_crc=%llu, computed_crc=%llu\n",
+                DM_DEBUG("sector=%llu, sector_idx=%u, lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
                          (unsigned long long)(meta->part->index + sector_idx),
                          sector_idx,
-                         (unsigned long long)le64_to_cpu(md->crc[sector_idx]),
+                         (unsigned long long)le64_to_cpu(lead->crc[sector_idx]),
+                         (unsigned long long)le64_to_cpu(trail->crc[sector_idx]),
                          (unsigned long long)current_crc);
 
-                if (md->crc[sector_idx++] != cpu_to_le64(current_crc))
+                if (lead->crc[sector_idx] != cpu_to_le64(current_crc) &&
+                    trail->crc[sector_idx] != cpu_to_le64(current_crc))
                 {
                     crc_error = true;
-                    expected_crc = le64_to_cpu(md->crc[sector_idx - 1]);
+                    sector_idx++;
                     kunmap_local(addr);
                     goto out;
                 }
+                sector_idx++;
                 current_crc = 0;
                 in_sector_pos = 0;
             }
@@ -98,10 +101,11 @@ void check_crc(struct trn_mr_rq *meta)
 out:
     if (crc_error)
     {
-        DM_ERR("CRC mismatch at sector %llu (+%u on chunk): expected_crc=%llu, computed_crc=%llu\n",
+        DM_ERR("CRC mismatch at sector %llu (+%u on chunk): lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
                (unsigned long long)(meta->part->index + sector_idx - 1),
                sector_idx - 1,
-               (unsigned long long)expected_crc,
+               (unsigned long long)le64_to_cpu(lead->crc[sector_idx - 1]),
+               (unsigned long long)le64_to_cpu(trail->crc[sector_idx - 1]),
                (unsigned long long)current_crc);
 
         part->status = BLK_STS_IOERR;

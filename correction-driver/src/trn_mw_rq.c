@@ -57,15 +57,17 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 /// @brief Initializes struct trn_mw_rq
 /// @details
 /// Calculates the CRCs of the data in part->bio and sets up part->meta_bio to
-/// write the metadata sector of the chunk from the area. This holds for a
-/// write of a whole chunk as well, as its metadata sector is shared.
+/// write the leading metadata sector of the chunk from the area. This holds for
+/// a write of a whole chunk as well, as its metadata sector is shared. If the
+/// sector failed to read in the leading copy, the area holds it from the
+/// trailing one, so the write puts it right.
 ///
 /// Expected execution context - the worker of the cache.
 /// @param meta Structure to initialize, inside part
 /// @param part Parent struct trn_p_rq
 /// @param area The metadata area of the region of the chunk, held by the caller
-/// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk did not read,
-///         so its other entries are not known and it cannot be written
+/// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk did not read in
+///         either copy, so its other entries are not known and it cannot be written
 blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
                             struct trn_p_rq *part,
                             struct metadata_area *area)
@@ -80,7 +82,7 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
     meta->part = part;
     meta->area = area;
 
-    page = metadata_sector_page(area, part->sector, &offset);
+    page = metadata_sector_page(area, METADATA_LEAD, part->sector, &offset);
     metadata_bio_init(part, page, offset, metadata_write_opf(part->bio));
 
     bio_crc_calc(meta, part->bio);
@@ -91,10 +93,17 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
              meta->nr_sectors);
     DM_DEBUG_BIO(&part->meta_bio);
 
-    return metadata_sector_bad(area, part->sector) ? BLK_STS_IOERR : BLK_STS_OK;
+    if (metadata_sector_bad(area, part->sector))
+        return BLK_STS_IOERR;
+
+    if (metadata_sector_single(area, part->sector))
+        DM_WARN_LIMIT("chunk %llu is written with one copy of its metadata\n",
+                      (unsigned long long)(part->sector / DATA_SIZE_SECTORS));
+
+    return BLK_STS_OK;
 }
 
-/// @brief Puts the new CRCs into the entry of the chunk in the metadata area
+/// @brief Puts the new CRCs into the leading entry of the chunk in the metadata area
 /// @details
 /// Changes only the CRCs of the sectors of this write; the entries of the
 /// neighbouring chunks and the CRCs of the other sectors of this chunk stay as
@@ -108,7 +117,7 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
 void update_crc_local(struct trn_mw_rq *meta)
 {
     struct trn_p_rq *part = meta->part;
-    struct chunk_metadata *md = metadata_entry(meta->area, part->sector);
+    struct chunk_metadata *md = metadata_entry(meta->area, METADATA_LEAD, part->sector);
     unsigned int offset;
 
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
@@ -117,5 +126,5 @@ void update_crc_local(struct trn_mw_rq *meta)
     for (unsigned int i = meta->first_sector; i < meta->first_sector + meta->nr_sectors; i++)
         md->crc[i] = meta->crc[i];
 
-    flush_dcache_page(metadata_sector_page(meta->area, part->sector, &offset));
+    flush_dcache_page(metadata_sector_page(meta->area, METADATA_LEAD, part->sector, &offset));
 }

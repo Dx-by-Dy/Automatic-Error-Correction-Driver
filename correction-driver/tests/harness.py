@@ -17,7 +17,8 @@ CRC_SIZE = 8
 # The metadata of a chunk: a CRC per data sector, CHUNKS_PER_METADATA_SECTOR chunks to a sector.
 METADATA_ENTRY_SIZE = DATA_SECTORS * CRC_SIZE
 CHUNKS_PER_METADATA_SECTOR = SECTOR_SIZE // METADATA_ENTRY_SIZE
-# A region: [copy of the metadata of the region before | its metadata | its data].
+# A region: [trailing copy of the metadata of the region before | leading copy of its own | its data].
+# The trailing copy of the last region is in region 0.
 REGION_CHUNKS = 1024
 REGION_METADATA_SECTORS = REGION_CHUNKS // CHUNKS_PER_METADATA_SECTOR
 REGION_DATA_SECTORS = REGION_CHUNKS * DATA_SECTORS
@@ -32,9 +33,23 @@ def physical_sector(logical):
 
 
 def metadata_sector(logical):
-    """Sector on the lower device that holds the CRCs for a logical data sector, among other chunks."""
+    """Sector on the lower device that holds the leading copy of the CRCs for a logical data sector,
+    among other chunks."""
     region, in_region = divmod(logical, REGION_DATA_SECTORS)
     return region * REGION_SECTORS + REGION_METADATA_SECTORS + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+
+
+def trail_sector(logical, lower_sectors):
+    """Sector on the lower device that holds the trailing copy of the CRCs for a logical data sector."""
+    region, in_region = divmod(logical, REGION_DATA_SECTORS)
+    regions = -(-capacity(lower_sectors) // REGION_DATA_SECTORS)
+    holder = 0 if region + 1 == regions else region + 1
+    return holder * REGION_SECTORS + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+
+
+def metadata_sectors(logical, lower_sectors):
+    """Both copies of the metadata sector of a logical data sector: the leading one, then the trailing one."""
+    return metadata_sector(logical), trail_sector(logical, lower_sectors)
 
 
 def metadata_offset(logical):
@@ -152,6 +167,16 @@ class BlockDevice:
     def flush(self):
         """Makes the writes so far durable; only then are they sure to be on the device below."""
         os.fsync(self.fd)
+
+    def flush_settled(self):
+        """A flush after which the driver leaves the device below alone.
+
+        The driver completes a flush once the data is durable, and writes the trailing copy of the
+        metadata after that. Its worker takes the second flush only once that is done, so a test
+        that looks at the device below or damages it waits for it this way.
+        """
+        self.flush()
+        self.flush()
 
     def patch(self, sector, offset, data):
         """Replaces bytes inside one sector, leaving the rest of the device untouched."""

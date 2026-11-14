@@ -28,8 +28,9 @@ struct trn_mr_rq
     /// Used to compute corresponding metadata for the request.
     u8 nr_sectors;
 
-    /// @brief Copy of the entry of the chunk, which the read checks the data against
-    struct chunk_metadata md;
+    /// @brief Copies of the entry of the chunk, by enum metadata_copy; a sector passes if it
+    /// matches either
+    struct chunk_metadata md[METADATA_COPIES];
 
     /// @brief Saved iter for bio from struct trn_p_rq
     /// @details Used to extract data from bio after its return

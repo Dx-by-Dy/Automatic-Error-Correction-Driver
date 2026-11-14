@@ -28,22 +28,27 @@ The threat model, the guarantees to the layer above, the on-disk format and the 
 
 The virtual device is divided into chunks of 4 KiB, 8 sectors, and the chunks into regions of 1024 chunks,
 4 MiB of data, as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per
-sector, 64 bytes; a metadata sector holds the entries of 8 neighbouring chunks.
+sector, 64 bytes; a metadata sector holds the entries of 8 neighbouring chunks. The metadata of a region is
+kept in two copies: the leading one next to its data, the trailing one in the next region.
 
 ### Layout
 
 ```text
 region 0                                  region 1
 +-----------+-----------+-------------+   +-----------+-----------+-------------+
-| copy of   | metadata  | data        |   | copy of   | metadata  | data        |
+| trailing  | leading   | data        |   | trailing  | leading   | data        |
 | region N  | region 0  | 1024 chunks |   | region 0  | region 1  | 1024 chunks | ...
 | 128 sect. | 128 sect. | 8192 sect.  |   | 128 sect. | 128 sect. | 8192 sect.  |
 +-----------+-----------+-------------+   +-----------+-----------+-------------+
 ```
 
-The metadata of a region and its data are one contiguous range, and the data stays aligned to 4 KiB. The
-copy of the metadata is not written yet; its place is kept. The last region may be shorter: it keeps its whole
-metadata area and as many whole chunks as fit.
+The leading copy of a region and its data are one contiguous range, and the data stays aligned to 4 KiB. The
+trailing copy of the last region is at the start of region 0. The last region may be shorter: it keeps both of
+its metadata areas and as many whole chunks as fit.
+
+The leading copy is written with each write back of a chunk, the trailing one after the lower device has
+flushed that write back, so once everything is flushed both copies hold the same. A read takes the checksum of
+a sector from either copy, so a metadata sector lost in one copy costs nothing; it is lost only when both are.
 
 ### Cache
 
@@ -64,36 +69,47 @@ new writes fail.
 1. Splitting the request into chunks;
 2. Copying each piece into the entry of its chunk in the cache, and completing it;
 3. Writing back the entry later, once no read of the chunk is in flight: one lower write per run of its dirty
-   sectors, each of which calculates the checksums, puts them into the metadata of the region in RAM, and writes
-   the data and the metadata sector of the chunk from there. Nothing is read first.
+   sectors, each of which calculates the checksums, puts them into the leading copy of the metadata of the
+   region in RAM, and writes the data and the leading metadata sector of the chunk from there. Nothing is read
+   first.
+4. After the next flush of the lower device, writing the trailing copy of the metadata sectors of the chunks
+   written back, and flushing again.
 
 ### Read Path
 
 1. Splitting the request into chunks;
 2. Copying the sectors held in the cache, and completing them;
-3. For the others: registering the read in the cache, copying the checksums of the chunk from the metadata of
-   its region in RAM, reading the data, unregistering it, calculating and verifying the checksums, completing
-   the request.
+3. For the others: registering the read in the cache, copying both entries of the chunk from the metadata of
+   its region in RAM, reading the data, unregistering it, calculating the checksums and accepting a sector that
+   matches either entry, completing the request.
 
 ### Metadata in RAM
 
-The driver keeps the metadata areas of the regions it used in RAM: 64 areas of 64 KiB, 4 MiB per device, which
-cover 256 MiB of data. The first read or write back that needs a region reads its whole area, in one request,
-on a workqueue of its own; whoever needs it meanwhile waits, `dm_map` included. Then reads and write backs of
-the region take the checksums from RAM, and a write back changes them there in place before it writes the
-sector. So the area always holds what the lower device holds, or is about to, and is never written as a whole.
+The driver keeps the metadata of the regions it used in RAM: 32 areas, each with both copies of 64 KiB, 4 MiB
+per device, which cover 128 MiB of data. The first read or write back that needs a region reads both copies,
+one request each, on a workqueue of its own; whoever needs it meanwhile waits, `dm_map` included. Then reads
+and write backs of the region take the checksums from RAM, and a write back changes the leading copy there in
+place before it writes the sector. The trailing copy in RAM changes only when it is written.
 
-When another region needs a place, the area used longest ago that no write back holds is dropped. A suspend
-drops all of them, as the lower device may change before the device is resumed; damage done to metadata on
-the lower device is not seen until then. If the read of an area fails, its sectors are read one at a time, and
-only the chunks whose entries are in a failed sector fail; such an area is not kept, so the next request reads
-it again.
+An area with chunks written back since the last flush is pinned until their trailing copy is written. When
+another region needs a place, the area used longest ago that nobody holds is dropped. When half the areas are
+held or pinned, the worker of the cache flushes the lower device and writes the trailing copies by itself,
+before it writes back the next chunk. A suspend writes them and then drops every area, as the lower device may
+change before the device is resumed; damage done to metadata on the lower device is not seen until then.
+
+If the read of a copy fails, its sectors are read one at a time. A sector that failed in one copy is taken from
+the other in RAM, and a rate-limited warning names each chunk read or written with one copy; the next write of
+that sector puts it right. Only the chunks whose entries are in a sector failed in both copies fail, and an area
+with such sectors is read again by the next request that finds it unused. A trailing sector that fails to write
+is counted, and its chunks go on with the leading copy.
 
 ### Flushes
 
 The device reports a write cache with FUA. An empty flush and a FUA write go to the worker of the cache, which
-writes back everything dirty, waits for it, and flushes the lower device. The flush fails while any entry has
-failed to write back, as it would promise data that is not on the device. A suspend writes back everything
+writes back everything dirty, waits for it, and flushes the lower device. The flush completes then, and fails
+while any entry has failed to write back, as it would promise data that is not on the device. After that the
+worker writes the trailing copies of the metadata and flushes the lower device again, so that both copies are
+durable before the chunks are written back again. A suspend writes back everything
 too, so a table reload or a removal loses nothing, except chunks that still fail to write: they are named
 in the kernel log. Any other operation, such as discard, is refused.
 
@@ -119,7 +135,7 @@ read from the lower device takes it twice.
 
 ### Memory
 
-Nothing on the I/O path allocates memory. The cache, with its pages and 256 write back jobs, and the metadata in RAM, with its 64 areas, are allocated when the target is created. A part lives in the per-bio data of its bio, or in a write back job, with its metadata structure and its metadata bio embedded in it: a read keeps a copy of the entry of its chunk, a write writes its metadata sector from the area in RAM. `dm_map` and the worker of the cache wait for an area to be read, or to be let go when all are in use; the workers of `transform_wq` never wait, as they run the completions that let areas go.
+Nothing on the I/O path allocates memory. The cache, with its pages and 256 write back jobs, and the metadata in RAM, with its 32 areas and a scratch area where the trailing sectors are built, are allocated when the target is created. A part lives in the per-bio data of its bio, or in a write back job, with its metadata structure and its metadata bio embedded in it: a read keeps a copy of both entries of its chunk, a write writes its leading metadata sector from the area in RAM. `dm_map` and the worker of the cache wait for an area to be read, or to be let go when all are in use; the workers of `transform_wq` never wait, as they run the completions that let areas go.
 
 At most 4096 parts, reads and write back jobs, are in flight per device. A bio-based device has no request queue with tags, so `dm_map` and the worker wait for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
 
@@ -177,7 +193,7 @@ Show the counters:
 dmsetup status corrdm
 ```
 
-After the usual `<start> <length> corrdm`, it prints eight counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, and how many times anything waited for a metadata area as all were in use.
+After the usual `<start> <length> corrdm`, it prints ten counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, and how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy.
 
 ## Usage
 

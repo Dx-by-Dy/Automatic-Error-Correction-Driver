@@ -85,11 +85,18 @@ flush until the chunk is written.
 - A chunk is 8 data sectors, 4 KiB. Its metadata is an entry of 64 bytes: 8 `__le64` values, `crc64_be` of
   each data sector with a zero seed, in order. A metadata sector holds the entries of 8 neighbouring chunks.
 - The lower device is a sequence of regions, as in `dm-integrity`. A region holds 1024 chunks, 4 MiB of data,
-  and is laid out as `[copy of the metadata of the region before | metadata of this region | data]`: 128
-  sectors, 128 sectors, 8192 sectors, 8448 in all. The copy of the last region goes into region 0. The
-  metadata and the data of a region are one contiguous range, and the data stays aligned to 4 KiB.
-- The copy is not written yet: its sectors stay as they were. A failed metadata sector fails the reads of
-  its 8 chunks, and the writes to them, as a write has to read the other entries of the sector first.
+  and is laid out as `[trailing copy of the metadata of the region before | leading copy of this region |
+  data]`: 128 sectors, 128 sectors, 8192 sectors, 8448 in all. The trailing copy of the last region goes into
+  region 0. The leading copy and the data of a region are one contiguous range, and the data stays aligned to
+  4 KiB.
+- The leading copy is written with each write back of a chunk, the trailing one after the lower device has
+  flushed that write back, and the device is flushed again. Once everything is flushed both copies are equal.
+  A read accepts a sector that matches either. The data and the leading copy are still written in parallel,
+  so point 3 of the contract does not hold yet.
+- A metadata sector that failed to read in one copy is taken from the other; a rate-limited warning names
+  every chunk read or written with one copy. A sector failed in both copies fails the reads of its 8 chunks,
+  and the writes to them, as a write needs the other entries of the sector. A trailing sector that fails to
+  write is counted in `dmsetup status`; it does not fail a flush, as the data and the leading copy are there.
 - The last region may be shorter: it keeps its whole metadata area and as many whole chunks as fit. The
   capacity is 8192 sectors per whole region, plus the chunks of the last one.
 - There is no "never written" state. A device has to be zeroed before use; a chunk of zeros with zero metadata
@@ -109,7 +116,17 @@ metadata lives in areas of its own, one per region, as in `dm-integrity`:
 - **Locality.** A region of 4 MiB keeps the metadata near its data on an HDD; one area for the whole device
   would put a seek between them.
 - **The copy** in the next region guards against a failed metadata sector, which now covers 8 chunks. Writing it
-  costs a second request for every change of metadata; the trade-off is to be settled when it is written.
+  costs a second request for every change of metadata; settled on 2026-11-14, see below.
+
+**Decided** on 2026-11-14, an idea of the user, replacing two CRCs in one entry: **the two copies are the two
+slots.** The entry stays 64 bytes and the layout does not change. The leading copy gets the new CRC and the
+trailing copy keeps the CRC of the data that is durable, until a flush makes the new data durable; then the
+trailing copy is written too. So the copy guards against a lost metadata sector in the steady state, and the
+two slots cover a write cut short by a crash in between. What is lost is the case of a crash in that window
+together with a lost sector of the other copy, two faults at once. A completed write is not durable, so a
+chunk written back again before a flush needs a flush first: its data may be any of three versions, and there
+are two slots. The order of the leading copy before the data, that flush and the read that settles a chunk
+whose copies differ after a crash come in the next step.
 - **The cost:** a write of the metadata of one chunk needs the other entries of its sector. They come from the
   metadata area of the region in RAM, read whole the first time the region is used, see [Cache](#cache); the
   writes of the chunks of one sector go one at a time.
@@ -120,7 +137,7 @@ metadata lives in areas of its own, one per region, as in `dm-integrity`:
   means less overhead and fewer metadata requests, but more read amplification for small reads, and it sets
   the unit of the cache and of ECC. To be measured after the cache, against the baseline. It also has to fit a
   lower device with 4 KiB logical blocks: then the metadata is written in blocks of 4 KiB, 64 chunks to a
-  block. Two CRCs take 128 bytes per chunk instead of 64.
+  block.
 - **CRC unit.** Per 512-byte sector, as now, tells which sector is bad, which helps correction. Per 4 KiB takes
   less space. With two CRCs it cannot be larger than what the drive writes atomically.
 - **ECC.** The code, the unit it corrects (bits, a sector, a run), how much space it takes, where the redundancy
@@ -179,7 +196,8 @@ complexity and bugs.
 - **Reads:** only dirty data is served from the cache, clean data is not kept.
 - **A write cut short by a crash: two CRCs are tried first**, so the cache has no journal of its own. The
   filesystem journal decides which writes survive; point 3 of the contract stays with the driver. What this
-  requires is in [RESEARCH.md](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs).
+  requires is in [RESEARCH.md](RESEARCH.md#a-write-cut-short-by-a-crash-two-crcs). Since 2026-11-14 the two
+  CRCs are the two copies of the metadata, see [On-disk format](#on-disk-format).
 - **The layout:** metadata in an area per region, see [On-disk format](#on-disk-format), decided on 2026-11-11.
   Its proportions are revisited only after measuring the cache and two CRCs on it.
 - **A failed write back:** the error is per chunk, not for the device. The data stays in RAM, and the cache has one
@@ -208,6 +226,12 @@ complexity and bugs.
   in place just before it writes the sector, so an area never holds what the lower device does not. Dropping
   dirty metadata comes with metadata writes deferred and batched, at or after runs, as it has to keep in step
   with the data cache. What to do when a metadata write fails is left to the copy of the metadata and two CRCs.
+- **Both copies in RAM**, decided on 2026-11-14: an area holds the leading and the trailing copy, 4 MiB still,
+  so 32 areas. An area with chunks written back since the last flush is pinned until their trailing copy is
+  written. A flush from above completes after the first flush of the lower device, as its data is durable then;
+  the trailing copies and the second flush follow. When half the areas are held or pinned, the worker flushes
+  and writes the trailing copies by itself, or it could wait for an area for ever. A deferred second flush and
+  when to write the trailing copy are left for the optimization stage, configurable.
 - **Defaults are constants for now:** 64 MiB of cache per device, write back from 50% used down to 45%, an age of
   1 s, 4 MiB of metadata in RAM. They are to be tuned later.
 
@@ -264,8 +288,10 @@ it counts.
   (the format of `replay-log` from xfstests): the log holds every lower request with its flushes and FUA, and
   replaying a prefix of it to a clean device gives the state after a crash at that point. A crash right after
   an `fsync` must keep everything the filesystem made durable, and so must a crash at any flush or FUA write
-  while other writes of the filesystem are in flight. A crash between the data and the metadata of one write is
-  strict `xfail` until the two CRCs of [Cache](#cache) are written.
+  while other writes of the filesystem are in flight. A crash between the data and the metadata of one write
+  reads the old data with the trailing copy; that the leading copy goes before the data is not enforced yet,
+  see [On-disk format](#on-disk-format), and `dm-log-writes`, which logs in the order of completion, cannot
+  show the other order. The next step checks the order in the log itself: a FUA leading write before the data.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
   chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes that are dropped
   silently wait for the threat model, as lost writes are an open threat.
@@ -287,4 +313,5 @@ it counts.
 | 2026-11-11 | The lock of a chunk is replaced by ranges in flight in the tree of the cache, before runs | A run spans many chunks; one state machine in the driver instead of two |
 | 2026-11-11 | Metadata moves into an area per region of 4 MiB, packed 8 chunks to a sector, with room for a copy in the next region; it replaces metadata next to each chunk | SSDs and HDDs both; two CRCs keep a run two sequential requests; data aligned to 4 KiB; 1.6% instead of 12.5% |
 | 2026-11-14 | Metadata in RAM: the area of a region as the unit, a pool of its own, clean areas dropped by LRU and on a suspend, entries changed in place by the write back | No read before a metadata write, one lower read per chunk read; two pools, as one shared with data brings deadlocks and policies whose gain is not measured |
+| 2026-11-14 | The two copies of the metadata are the two CRC slots: the leading copy is written with the write back, the trailing one after the flush that makes the data durable; both in RAM; a failed trailing write is counted and warned about, not failed | No change of format, the copy guards a lost sector in the steady state; only a crash together with a lost sector of the other copy is not covered |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |

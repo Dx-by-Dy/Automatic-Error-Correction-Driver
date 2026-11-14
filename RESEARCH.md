@@ -83,6 +83,17 @@ What it requires, all still open:
    atomic per 512 bytes, as a torn block matches neither CRC.
 6. **ECC.** It needs the old and the new redundancy, or a scheme of its own. Due before correction.
 
+Revised on 2026-11-14, an idea of the user: the two CRCs are not a pair in one entry but the two copies of the
+metadata, the leading one in the region and the trailing one in the next. The leading copy gets the new CRC
+before the data, the trailing copy keeps the old one until a flush makes the new data durable, and is written
+then. The entry stays 64 bytes. In the steady state both copies are equal, so the copy still guards against a
+lost metadata sector, point 3 needs no record of which CRC is current, and point 4 is closed once the trailing
+copy is written. A crash in the window together with a lost sector of the other copy is not covered.
+
+A trap found on the way, which holds for a pair in one entry too: a completed write is not durable until a
+flush. A chunk written back twice between two flushes may hold any of three versions after a crash, with two
+slots, so the second write back needs a flush first.
+
 ## A failed write back: a reserved area
 
 Discussed on 2026-11-11, an idea of the user, not decided. A small area is set aside in advance. A write back that

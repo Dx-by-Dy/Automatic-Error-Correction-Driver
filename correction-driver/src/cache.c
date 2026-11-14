@@ -494,8 +494,9 @@ static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
 /// @brief Completion of a write back job
 /// @details
 /// complete_work of the part calls it through bio_endio, as the last thing it
-/// does. Lets the metadata area go first, so that it can be dropped once the
-/// write backs are over. Starts the next job of the metadata sector, if one is
+/// does. A job that succeeded records its chunk for the trailing copy of the
+/// metadata, which pins the area. Lets the metadata area go first, so that it
+/// can be dropped once the write backs are over and it is not pinned. Starts the next job of the metadata sector, if one is
 /// queued, which takes its place in the tree of jobs in flight. The last job of
 /// an entry frees it, or marks it failed.
 ///
@@ -510,12 +511,15 @@ static void cache_job_end_io(struct bio *bio)
     struct cache_job *next;
 
     bio_uninit(bio);
+    if (!status)
+        metadata_written(cache->dm_ctx->metadata, job->area, chunk * DATA_SIZE_SECTORS);
     metadata_put(cache->dm_ctx->metadata, job->area);
 
     spin_lock(&cache->lock);
     if (status && !entry->status)
         entry->status = status;
     list_add(&job->list, &cache->jobs);
+    cache->nr_jobs--;
 
     next = list_first_entry_or_null(&job->queued, struct cache_job, list);
     if (next)
@@ -548,6 +552,7 @@ static struct cache_job *cache_get_job(struct cache *cache)
         cache_wait(cache);
     job = list_first_entry(&cache->jobs, struct cache_job, list);
     list_del_init(&job->list);
+    cache->nr_jobs++;
     spin_unlock(&cache->lock);
 
     return job;
@@ -644,15 +649,62 @@ static bool cache_under_pressure(struct cache *cache)
     return cache->nr_free + cache->nr_writing < CACHE_STOP_FREE;
 }
 
+/// @brief Flushes the device below, completes the flushes from above, then writes the trailing copies
+/// @details
+/// No write back job may be in flight, and none may start until it returns.
+/// The flushes from above complete once the device below has flushed, as their
+/// data is durable then: with BLK_STS_IOERR if failed is set, as a flush
+/// promises that nothing is left only in RAM. Then the trailing copies of the
+/// metadata of the chunks written back before get the CRCs of that durable
+/// data, and the device below is flushed once more, so that both copies are
+/// durable before a chunk is written back again. If the first flush fails, the
+/// trailing copies are not written: the data may not be on the device.
+///
+/// Expected execution context - the worker, or postsuspend once the worker is
+/// cancelled; may sleep.
+/// @param cache   The cache of the device
+/// @param flushes Flush and FUA bios from above to complete, or NULL
+/// @param failed  Whether chunks are left that failed to write back
+/// @return 0, or the error of a flush of the device below
+static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed)
+{
+    struct metadata_cache *metadata = cache->dm_ctx->metadata;
+    struct block_device *bdev = cache->dm_ctx->dev->bdev;
+    blk_status_t status;
+    struct bio *bio;
+    int r;
+
+    r = blkdev_issue_flush(bdev);
+    status = failed ? BLK_STS_IOERR : errno_to_blk_status(r);
+    while (flushes && (bio = bio_list_pop(flushes)))
+    {
+        bio->bi_status = status;
+        bio_endio(bio);
+    }
+
+    if (r)
+    {
+        DM_ERR_LIMIT("lower flush failed, err=%d, trailing metadata not written\n", r);
+        metadata_unpin_all(metadata);
+        return r;
+    }
+
+    metadata_write_trails(metadata);
+
+    r = blkdev_issue_flush(bdev);
+    if (r)
+        DM_ERR_LIMIT("lower flush after the trailing metadata failed, err=%d\n", r);
+
+    return r;
+}
+
 /// @brief Waits for all write backs, then completes the flushes and FUA writes
 /// @details
 /// A flush succeeds only if no entry is left that failed to write back, and the
 /// device below flushed: it promises that the data is on the device.
 static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes)
 {
-    blk_status_t status;
     unsigned long failed;
-    struct bio *bio;
 
     wait_event(cache->wait, !READ_ONCE(cache->nr_writing));
 
@@ -660,16 +712,23 @@ static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes
     failed = cache->nr_failed;
     spin_unlock(&cache->lock);
 
-    if (failed)
-        status = BLK_STS_IOERR;
-    else
-        status = errno_to_blk_status(blkdev_issue_flush(cache->dm_ctx->dev->bdev));
+    cache_sync(cache, flushes, failed);
+}
 
-    while ((bio = bio_list_pop(flushes)))
-    {
-        bio->bi_status = status;
-        bio_endio(bio);
-    }
+/// @brief Takes the pins off the metadata areas when too many are busy, before the next write back
+/// @details
+/// A write back holds the area of its chunk, and pins it when it completes,
+/// until the trailing copy is written. So once half the areas are busy, the
+/// worker waits for the jobs in flight and runs cache_sync, which unpins them
+/// all; otherwise the areas could run out with the worker waiting for one.
+static void cache_relieve_metadata(struct cache *cache)
+{
+    if (!metadata_crowded(cache->dm_ctx->metadata))
+        return;
+
+    wait_event(cache->wait, !READ_ONCE(cache->nr_jobs));
+    atomic64_inc(&cache->crowded_flushes);
+    cache_sync(cache, NULL, false);
 }
 
 /// @brief The worker
@@ -677,8 +736,10 @@ static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes
 /// Writes back the dirty entries, the oldest first: all of them for a flush,
 /// a FUA write or a suspend, and otherwise those older than CACHE_AGE_MS and
 /// as many as keep CACHE_STOP_FREE entries free or on their way to it. A flush
-/// tries the failed entries again. Then it schedules itself for the next
-/// entry to come of age.
+/// tries the failed entries again, and writes the trailing copies of the
+/// metadata after the device below has flushed, see cache_sync; so does the
+/// worker when too many metadata areas are pinned. Then it schedules itself
+/// for the next entry to come of age.
 ///
 /// It runs on an ordered workqueue of its own, never in transform_wq, so it may
 /// wait for jobs, for places among the parts in flight and for reads in flight:
@@ -716,6 +777,7 @@ static void cache_write_back(struct work_struct *work)
     list_for_each_entry_safe(entry, next, &picked, list)
     {
         list_del_init(&entry->list);
+        cache_relieve_metadata(cache);
         cache_write_back_entry(cache, entry);
     }
 
@@ -740,12 +802,13 @@ static void cache_write_back(struct work_struct *work)
 /// Called from postsuspend, when device mapper has no bio of the device in
 /// flight. Tries the failed entries once more; those that fail again keep their
 /// data in RAM, which is lost if the target is destroyed, as a suspend cannot fail.
+/// Then flushes the device below and writes the trailing copies of the
+/// metadata, see cache_sync, so that no metadata area is pinned.
 ///
 /// Expected execution context - process, may sleep.
 void cache_suspend(struct cache *cache)
 {
     unsigned long failed;
-    int r;
 
     spin_lock(&cache->lock);
     cache->write_all = true;
@@ -757,9 +820,7 @@ void cache_suspend(struct cache *cache)
     wait_event(cache->wait, !READ_ONCE(cache->nr_dirty) && !READ_ONCE(cache->nr_writing));
     cancel_delayed_work_sync(&cache->write_back);
 
-    r = blkdev_issue_flush(cache->dm_ctx->dev->bdev);
-    if (r)
-        DM_ERR("flush of the lower device failed on suspend, err=%d\n", r);
+    cache_sync(cache, NULL, false);
 
     spin_lock(&cache->lock);
     cache->write_all = false;
@@ -836,6 +897,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     atomic64_set(&cache->free_waits, 0);
     atomic64_set(&cache->busy_waits, 0);
     atomic64_set(&cache->read_waits, 0);
+    atomic64_set(&cache->crowded_flushes, 0);
 
     cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
     cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);

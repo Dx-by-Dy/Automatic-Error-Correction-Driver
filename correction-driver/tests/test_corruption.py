@@ -1,7 +1,8 @@
 """Damage on the lower device is detected, and only where the damage is.
 
 The driver keeps the metadata of the regions it used in RAM, so a test that damages metadata makes it
-read the metadata again, as it would after a suspend.
+read the metadata again, as it would after a suspend. The metadata has two copies, and a read takes a
+CRC from either, so damage to metadata is detected only when it is in both.
 """
 
 import errno
@@ -15,6 +16,7 @@ from harness import (
     SECTOR_SIZE,
     metadata_offset,
     metadata_sector,
+    metadata_sectors,
     pattern,
     physical_sector,
 )
@@ -35,8 +37,13 @@ def written(stack):
     """Three written chunks, returning their expected contents, starting at `FIRST - 8`."""
     data = pattern("written", 3 * DATA_SECTORS)
     stack.upper.write(FIRST - DATA_SECTORS, data)
-    stack.upper.flush()
+    stack.upper.flush_settled()
     return data
+
+
+def copies(stack, logical):
+    """The lower sectors of both copies of the metadata sector of a logical sector."""
+    return metadata_sectors(logical, stack.lower_sectors)
 
 
 def sector_of(data, logical):
@@ -65,7 +72,8 @@ def test_any_bit_of_a_sector_is_covered(stack, written, position):
 
 @pytest.mark.parametrize("in_chunk", range(DATA_SECTORS))
 def test_crc_corruption_fails_only_that_sector(stack, written, in_chunk):
-    stack.lower.flip_bit(metadata_sector(FIRST), byte=metadata_offset(FIRST) + in_chunk * CRC_SIZE, bit=0)
+    for sector in copies(stack, FIRST):
+        stack.lower.flip_bit(sector, byte=metadata_offset(FIRST) + in_chunk * CRC_SIZE, bit=0)
     stack.drop_metadata()
 
     assert_read_fails(stack.upper, FIRST + in_chunk)
@@ -75,24 +83,42 @@ def test_crc_corruption_fails_only_that_sector(stack, written, in_chunk):
             assert stack.upper.read(logical) == sector_of(written, logical), f"sector {logical}"
 
 
+@pytest.mark.parametrize("copy", [0, 1], ids=["leading", "trailing"])
+@pytest.mark.parametrize("in_chunk", [0, DATA_SECTORS - 1], ids=["first sector", "last sector"])
+def test_crc_corruption_in_one_copy_is_covered_by_the_other(stack, written, copy, in_chunk):
+    stack.lower.flip_bit(copies(stack, FIRST)[copy], byte=metadata_offset(FIRST) + in_chunk * CRC_SIZE, bit=0)
+    stack.drop_metadata()
+    assert stack.upper.read(FIRST - DATA_SECTORS, 3 * DATA_SECTORS) == written
+
+
 def test_zeroed_metadata_is_detected(stack, written):
     """The scenario of the original tests.py, without damaging the entries of the neighbouring chunks."""
-    stack.lower.patch(metadata_sector(FIRST), metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
+    for sector in copies(stack, FIRST):
+        stack.lower.patch(sector, metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
     stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
     assert stack.upper.read(FIRST + DATA_SECTORS) == sector_of(written, FIRST + DATA_SECTORS)
 
 
 def test_a_zeroed_metadata_sector_fails_every_chunk_it_covers(stack, written):
-    stack.lower.write(metadata_sector(FIRST), bytes(SECTOR_SIZE))
+    for sector in copies(stack, FIRST):
+        stack.lower.write(sector, bytes(SECTOR_SIZE))
     stack.drop_metadata()
     for chunk_start in (FIRST - DATA_SECTORS, FIRST, FIRST + DATA_SECTORS):
         assert_read_fails(stack.upper, chunk_start, DATA_SECTORS)
 
 
+@pytest.mark.parametrize("copy", [0, 1], ids=["leading", "trailing"])
+def test_a_zeroed_metadata_sector_in_one_copy_fails_nothing(stack, written, copy):
+    stack.lower.write(copies(stack, FIRST)[copy], bytes(SECTOR_SIZE))
+    stack.drop_metadata()
+    assert stack.upper.read(FIRST - DATA_SECTORS, 3 * DATA_SECTORS) == written
+
+
 def test_the_entry_of_a_neighbour_does_not_cover_this_chunk(stack, written):
     neighbour = FIRST + DATA_SECTORS
-    stack.lower.flip_bit(metadata_sector(neighbour), byte=metadata_offset(neighbour), bit=0)
+    for sector in copies(stack, neighbour):
+        stack.lower.flip_bit(sector, byte=metadata_offset(neighbour), bit=0)
     stack.drop_metadata()
     assert stack.upper.read(FIRST, DATA_SECTORS) == written[DATA_SECTORS * SECTOR_SIZE :][: DATA_SECTORS * SECTOR_SIZE]
     assert_read_fails(stack.upper, neighbour)
@@ -132,7 +158,8 @@ def test_corruption_is_detected_after_recreating_the_device(stack, written):
 @pytest.mark.xfail(strict=True, reason="TODO.md: A zeroed chunk passes the check")
 def test_zeroed_chunk_is_detected(stack, written):
     stack.lower.write(physical_sector(FIRST), bytes(DATA_SECTORS * SECTOR_SIZE))
-    stack.lower.patch(metadata_sector(FIRST), metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
+    for sector in copies(stack, FIRST):
+        stack.lower.patch(sector, metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
     stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
 
@@ -143,6 +170,7 @@ def test_chunk_copied_elsewhere_is_detected(stack, written):
     stack.lower.write(physical_sector(target), stack.lower.read(physical_sector(FIRST), DATA_SECTORS))
     offset = metadata_offset(FIRST)
     entry = stack.lower.read(metadata_sector(FIRST))[offset : offset + METADATA_ENTRY_SIZE]
-    stack.lower.patch(metadata_sector(target), metadata_offset(target), entry)
+    for sector in copies(stack, target):
+        stack.lower.patch(sector, metadata_offset(target), entry)
     stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST + DATA_SECTORS, DATA_SECTORS)

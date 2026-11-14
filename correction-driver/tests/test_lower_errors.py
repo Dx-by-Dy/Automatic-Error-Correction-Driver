@@ -6,31 +6,49 @@ added and enabled; a write to it clears it, unless it was added with a count of 
 first, and until then reads of it fail too. One test loads dm-flakey in its place instead.
 
 The driver keeps the metadata of the regions it used in RAM, so a test about a metadata sector that
-fails to read makes the driver forget it first, as a suspend does.
+fails to read makes the driver forget it first, as a suspend does. The metadata has two copies.
 """
 
 import errno
+import time
 
 import pytest
 
-from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, drop_metadata, make_lower
+from conftest import (
+    FAULTY_NAME,
+    LOWER_NAME,
+    UPPER_NAME,
+    device_status,
+    dmsetup_remove,
+    drop_metadata,
+    kernel_messages,
+    make_lower,
+)
 from harness import (
     CHUNKS_PER_METADATA_SECTOR,
     DATA_SECTORS,
+    REGION_DATA_SECTORS,
+    REGION_SECTORS,
     BlockDevice,
     capacity,
     metadata_sector,
+    metadata_sectors,
     pattern,
     physical_sector,
     run,
 )
 
-LOWER_MIB = 4
+# Two whole regions and a short third one, so that the trailing copy of region 0 is in region 1:
+# dm-dust takes an empty flush, whose sector is 0, for a write to block 0, which clears a bad block 0
+# or fails the flush.
+LOWER_MIB = 9
 CACHE_MIB = 64
 # Two metadata sectors of chunks: BAD_CHUNK and its neighbours share the first.
 CHUNKS = 2 * CHUNKS_PER_METADATA_SECTOR
 AREA = CHUNKS * DATA_SECTORS
 BAD_CHUNK = 1
+# METADATA_AREAS in src/metadata.h.
+METADATA_AREAS = 32
 
 
 class FaultyStack:
@@ -72,9 +90,9 @@ class FaultyStack:
 
 
 def flushed_write(device, start, data):
-    """A write that has reached the lower device, or an error if it could not."""
+    """A write that has reached the lower device, both copies of its metadata too, or an error."""
     device.write(start, data)
-    device.flush()
+    device.flush_settled()
 
 
 @pytest.fixture
@@ -103,6 +121,26 @@ def chunk_sectors(chunk):
     return list(range(chunk * DATA_SECTORS, (chunk + 1) * DATA_SECTORS))
 
 
+def copies(chunk):
+    """The lower sectors of both copies of the metadata sector of a chunk."""
+    return metadata_sectors(chunk * DATA_SECTORS, LOWER_MIB * 2048)
+
+
+def warned(action, text, attempts=8):
+    """Whether the driver logs a warning with this text when the action runs.
+
+    The warnings are rate limited, 10 in 5 s, and earlier tests may have used them up, so the
+    action runs again for up to that long.
+    """
+    for _ in range(attempts):
+        with kernel_messages() as messages:
+            action()
+        if any(text in message for message in messages):
+            return True
+        time.sleep(1)
+    return False
+
+
 def metadata_sector_chunks(chunk):
     """The chunks whose metadata shares one sector with the metadata of this chunk."""
     first = chunk - chunk % CHUNKS_PER_METADATA_SECTOR
@@ -120,15 +158,95 @@ def test_failed_data_sector_fails_only_its_reads(faulty, index):
 
 
 def test_failed_metadata_sector_fails_only_the_chunks_it_covers(faulty):
-    faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
+    for sector in copies(BAD_CHUNK):
+        faulty.fail(sector)
     drop_metadata()
     covered = [sector for chunk in metadata_sector_chunks(BAD_CHUNK) for sector in chunk_sectors(chunk)]
     assert unreadable_sectors(faulty.upper) == covered
 
 
+@pytest.mark.parametrize("copy", [0, 1], ids=["leading", "trailing"])
+def test_metadata_sector_failed_in_one_copy_fails_nothing_and_warns(faulty, copy):
+    """The other copy serves the reads, with a warning; a write of a chunk there rewrites both copies."""
+    faulty.fail(copies(BAD_CHUNK)[copy])
+    drop_metadata()
+    assert unreadable_sectors(faulty.upper) == []
+    first = BAD_CHUNK * DATA_SECTORS
+    assert warned(lambda: faulty.upper.read(first, DATA_SECTORS), "is read with one copy of its metadata")
+
+    new = pattern("after", DATA_SECTORS)
+    assert warned(lambda: flushed_write(faulty.upper, first, new), "is written with one copy of its metadata")
+    lower = BlockDevice(faulty.lower)
+    try:
+        lead, trail = (lower.read(sector) for sector in copies(BAD_CHUNK))
+    finally:
+        lower.close()
+    assert lead == trail, "the failed copy was written with what RAM had before, not with the other copy"
+    drop_metadata()
+    with kernel_messages() as messages:
+        assert faulty.upper.read(first, DATA_SECTORS) == new
+    assert not [message for message in messages if "one copy of its metadata" in message]
+
+
+def test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy():
+    """The other entries of a leading sector that failed to read come from the trailing copy.
+
+    Every area holds another region before the region of the chunk is read again, so what RAM had for
+    the sector is of no use. A write of one chunk there writes the whole leading sector, which has to
+    come out equal to the trailing one.
+    """
+    regions = METADATA_AREAS + 2
+    faulty = FaultyStack((regions * REGION_SECTORS * 512 >> 20) + 1)
+    try:
+        flushed_write(faulty.upper, 0, pattern("before", AREA))
+        lead, trail = metadata_sectors(BAD_CHUNK * DATA_SECTORS, faulty.lower_sectors)
+        faulty.fail(lead)
+        drop_metadata()
+        for region in range(1, regions):
+            faulty.upper.read(region * REGION_DATA_SECTORS, DATA_SECTORS)
+        first = BAD_CHUNK * DATA_SECTORS
+        new = pattern("after", DATA_SECTORS)
+        flushed_write(faulty.upper, first, new)
+        lower = BlockDevice(faulty.lower)
+        try:
+            assert lower.read(lead) == lower.read(trail)
+        finally:
+            lower.close()
+        expected = bytearray(pattern("before", AREA))
+        expected[first * 512 : (first + DATA_SECTORS) * 512] = new
+        drop_metadata()
+        assert faulty.upper.read(0, AREA) == expected
+    finally:
+        faulty.remove()
+
+
+def test_failed_trailing_write_is_counted_and_warned(faulty):
+    """A write whose trailing copy of the metadata fails still succeeds: the data and one copy are there.
+
+    dm-dust fails reads of the sector as well until it is written, so the chunk keeps one copy after
+    the metadata is read again; once the sector takes writes, the next write of the chunk restores it.
+    """
+    faulty.fail(copies(BAD_CHUNK)[1], writes=1)
+    first = BAD_CHUNK * DATA_SECTORS
+    new = pattern("after", DATA_SECTORS)
+    flushed_write(faulty.upper, first, new)
+    assert device_status()["trail_errors"] == 1
+    assert warned(lambda: faulty.upper.read(first, DATA_SECTORS), "is read with one copy of its metadata")
+    assert faulty.upper.read(0, AREA)[first * 512 :][: DATA_SECTORS * 512] == new
+
+    again = pattern("again", DATA_SECTORS)
+    flushed_write(faulty.upper, first, again)
+    assert device_status()["trail_errors"] == 1
+    drop_metadata()
+    with kernel_messages() as messages:
+        assert faulty.upper.read(first, DATA_SECTORS) == again
+    assert not [message for message in messages if "one copy of its metadata" in message]
+
+
 def test_device_works_again_once_the_sector_reads(faulty):
     faulty.fail(physical_sector(BAD_CHUNK * DATA_SECTORS))
-    faulty.fail(metadata_sector((BAD_CHUNK + 1) * DATA_SECTORS))
+    for sector in copies(BAD_CHUNK + 1):
+        faulty.fail(sector)
     drop_metadata()
     assert set(unreadable_sectors(faulty.upper)) > set(chunk_sectors(BAD_CHUNK)), "the metadata sector read"
     faulty.heal()
@@ -141,13 +259,14 @@ def test_device_works_again_once_the_sector_reads(faulty):
     ids=["whole chunk", "one sector", "whole neighbouring chunk"],
 )
 def test_write_fails_when_its_metadata_sector_does_not_read(faulty, chunk, start, sectors):
-    """Its CRCs cannot be merged with the other entries of the sector, so the write fails.
+    """Its CRCs cannot be merged with the other entries of the sector in either copy, so the write fails.
 
     A whole chunk too, as its metadata sector holds the entries of its neighbours. What the chunk
     holds afterwards is open, see "Data and CRC are not written atomically" in TODO.md; here only
     the error and the other chunks are checked.
     """
-    faulty.fail(metadata_sector(BAD_CHUNK * DATA_SECTORS))
+    for sector in copies(BAD_CHUNK):
+        faulty.fail(sector)
     drop_metadata()
     first = chunk * DATA_SECTORS + start
     assert fails_with_eio(lambda: flushed_write(faulty.upper, first, pattern("after", sectors)))

@@ -135,10 +135,15 @@ def chunk_entries(entries, first, last, chunk):
     return data, metadata
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: Data and CRC are not written atomically")
 @pytest.mark.parametrize("sectors", [DATA_SECTORS, 1], ids=["whole chunk", "one sector"])
 def test_a_write_cut_between_data_and_metadata_reads_old_or_new(logged, sectors):
-    """A crash after one of the two writes of a chunk reached the disk, but not the other."""
+    """A crash after one of the two writes of a chunk reached the disk, but not the other.
+
+    The trailing copy of the metadata still has the CRC of the old data, so a cut after the leading
+    copy reads the old data. dm-log-writes logs the writes in the order they complete, and the leading
+    copy completes first, so the cut after the data alone does not occur here; the driver does not
+    enforce that order yet, see "Data and CRC are not written atomically" in TODO.md.
+    """
     chunk = 3
     start = chunk * DATA_SECTORS
     old = pattern("old", DATA_SECTORS)
@@ -237,8 +242,9 @@ def test_ext4_survives_a_crash_at_any_flush(logged):
     Before the cache it failed at once: ext4 writes its superblock, part of a chunk, with FUA, and the
     data reached the disk before the metadata write was even sent. The cache turns a FUA write into a
     write back and a flush, and sends a flush down only once every write back before it is done, so at
-    these points nothing of the driver is in flight. A crash between the data and the metadata of one
-    write is still possible, between flushes: test_a_write_cut_between_data_and_metadata_reads_old_or_new.
+    these points nothing of the driver is in flight. The trailing copies of the metadata are written after
+    such a flush, followed by another. A crash between the data and the metadata of one write is still
+    possible, between flushes: test_a_write_cut_between_data_and_metadata_reads_old_or_new.
     """
     entries, written, marks = ext4_workload(logged)
     start = mark_index(entries, "mkfs")

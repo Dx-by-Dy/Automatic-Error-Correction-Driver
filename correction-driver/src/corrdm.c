@@ -147,7 +147,9 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_dm_get_device;
     }
 
-    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev);
+    ti->len = device_new_capacity(get_capacity(dm_ctx->dev->bdev->bd_disk));
+
+    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, DIV_ROUND_UP_SECTOR_T(ti->len, REGION_DATA_SECTORS));
     if (IS_ERR(dm_ctx->metadata))
     {
         ti->error = "metadata cache alloc failed";
@@ -166,7 +168,6 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     }
 
     ti->private = dm_ctx;
-    ti->len = device_new_capacity(get_capacity(dm_ctx->dev->bdev->bd_disk));
 
     DM_INFO("mapped on dev=%s, disk capacity=%llu sec, available capacity=%llu sec\n",
             argv[0],
@@ -238,7 +239,8 @@ static void dm_target_resume(struct dm_target *ti)
 /// reads that waited for the write back of their chunk, entries holding data
 /// not yet on the lower device, entries whose write back failed, metadata
 /// areas read from the lower device, waits for a metadata area when all were
-/// in use.
+/// in use, sectors of the trailing copy of the metadata that failed to write,
+/// flushes the worker made because too many metadata areas were busy.
 /// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
@@ -256,14 +258,16 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->read_waits),
                dirty, failed,
                (unsigned long long)atomic64_read(&dm_ctx->metadata->loads),
-               (unsigned long long)atomic64_read(&dm_ctx->metadata->waits));
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->waits),
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->trail_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->crowded_flushes));
         break;
     case STATUSTYPE_TABLE:
     case STATUSTYPE_IMA:
