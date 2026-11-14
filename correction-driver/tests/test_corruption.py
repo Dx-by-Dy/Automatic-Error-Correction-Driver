@@ -140,6 +140,62 @@ def test_rewriting_a_corrupted_sector_clears_the_error(stack, written):
     assert stack.upper.read(FIRST) == update
 
 
+def settle_counts(stack):
+    status = stack.status()
+    return status["settle_reads"], status["settle_mismatches"]
+
+
+@pytest.mark.parametrize("copy", [0, 1], ids=["leading", "trailing"])
+def test_a_sector_whose_copies_differ_is_read_before_it_is_written(stack, written, copy):
+    """As after a crash between the copies: the data matches one of them, and a write of it reads it first.
+
+    With the other copy damaged, the data matches the trailing copy or the leading one; the read
+    finds which, and after the write and its flush both copies hold the new CRC.
+    """
+    stack.lower.flip_bit(copies(stack, FIRST)[copy], byte=metadata_offset(FIRST), bit=0)
+    stack.drop_metadata()
+    before = settle_counts(stack)
+    update = pattern("update", 1)
+    stack.upper.write(FIRST, update)
+    stack.upper.flush_settled()
+    assert settle_counts(stack) == (before[0] + 1, before[1])
+    lead, trail = (stack.lower.read(sector) for sector in copies(stack, FIRST))
+    assert lead == trail
+    assert stack.upper.read(FIRST) == update
+
+
+def test_only_the_sectors_written_are_read_first(stack, written):
+    """Copies that differ in another sector of the chunk are left alone by a write of this one.
+
+    Neither read first, nor put into the trailing copy after the flush: the sector would then have the
+    damaged CRC in both copies.
+    """
+    stack.lower.flip_bit(copies(stack, FIRST)[0], byte=metadata_offset(FIRST) + 5 * CRC_SIZE, bit=0)
+    stack.drop_metadata()
+    before = settle_counts(stack)
+    update = pattern("update", 1)
+    stack.upper.write(FIRST, update)
+    stack.upper.flush_settled()
+    assert settle_counts(stack) == before
+    stack.drop_metadata()
+    expected = bytearray(written[DATA_SECTORS * SECTOR_SIZE :][: DATA_SECTORS * SECTOR_SIZE])
+    expected[:SECTOR_SIZE] = update
+    assert stack.upper.read(FIRST, DATA_SECTORS) == expected
+
+
+def test_a_sector_matching_neither_copy_is_counted_before_it_is_written(stack, written):
+    """Damaged data with copies that differ: the read before the write counts it, and the write goes on."""
+    stack.lower.flip_bit(copies(stack, FIRST)[0], byte=metadata_offset(FIRST), bit=0)
+    stack.lower.flip_bit(physical_sector(FIRST), byte=100, bit=3)
+    stack.drop_metadata()
+    before = settle_counts(stack)
+    update = pattern("update", 1)
+    stack.upper.write(FIRST, update)
+    stack.upper.flush_settled()
+    assert settle_counts(stack) == (before[0] + 1, before[1] + 1)
+    assert stack.upper.read(FIRST) == update
+
+
 def test_write_to_a_neighbour_does_not_hide_corruption(stack, written):
     stack.lower.flip_bit(physical_sector(FIRST))
     update = pattern("neighbour", 1)

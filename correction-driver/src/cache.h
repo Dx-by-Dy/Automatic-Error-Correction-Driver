@@ -186,6 +186,10 @@ struct cache
     /// @brief How many times the worker flushed and wrote the trailing copies of the metadata
     /// because too many metadata areas were busy, see metadata_crowded
     atomic64_t crowded_flushes;
+
+    /// @brief How many times the worker flushed before a write back, as the chunk had been written
+    /// back since the last flush, see cache_prepare_metadata
+    atomic64_t barriers;
 };
 
 struct cache *cache_create(struct dm_context *dm_ctx);

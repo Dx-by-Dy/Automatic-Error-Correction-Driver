@@ -75,10 +75,17 @@ struct metadata_cache;
 /// @details
 /// Its contents follow the device below: both copies are read from it, and
 /// after that only a write back changes the leading entries of its chunks, in
-/// place, and writes the changed sector; metadata_write_trails copies those
-/// entries into the trailing copy and writes it, once the lower device has
-/// flushed. An area with chunks so written is pinned until then; any other one
+/// place, and writes the changed sector with FUA before the data. The trailing
+/// copy keeps the CRCs of the data that is durable, so after a crash each
+/// sector matches one of the two. metadata_write_trails copies the new entries
+/// into the trailing copy and writes it once the lower device has flushed the
+/// data. An area with chunks so written is pinned until then; any other one
 /// nobody holds is dropped at any time without being written.
+///
+/// A chunk is not written back again before that flush, as its data could then
+/// be any of three versions. A chunk whose copies differ for another reason, a
+/// crash or a failed write back, is read by metadata_settle before it is
+/// written back, so that the trailing copy holds the CRC of what is there.
 ///
 /// A sector that failed to read in one copy is filled from the other in RAM,
 /// so the area holds what one copy of the device below does. Protected by the
@@ -109,16 +116,24 @@ struct metadata_area
     /// holds it reads it again.
     bool failed;
 
-    /// @brief Some chunks were written back since the trailing copy was last written; the area
-    /// holds itself until metadata_write_trails
+    /// @brief Some chunks were written back since the last flush of the lower device; the area
+    /// holds itself until metadata_write_trails or metadata_unpin_all
     bool pinned;
 
     /// @brief Sectors of each copy that failed to read, and of the trailing copy that failed to write;
     /// reads take such a sector from the other copy
     DECLARE_BITMAP(bad[METADATA_COPIES], REGION_METADATA_SECTORS);
 
-    /// @brief Chunks written back since the trailing copy was last written
+    /// @brief Chunks with a write back since the last flush of the lower device, failed or not.
+    /// Their data may not be durable, so they are not written back again before a flush.
     DECLARE_BITMAP(written, REGION_CHUNKS);
+
+    /// @brief Of the written chunks, those with a write back that failed: their data is not known,
+    /// and their trailing copy stays
+    DECLARE_BITMAP(write_failed, REGION_CHUNKS);
+
+    /// @brief Sectors of each written chunk whose write back succeeded, which the trailing copy takes
+    u8 sectors[REGION_CHUNKS];
 
     /// @brief The metadata, METADATA_AREA_BYTES of each copy
     struct page *pages[METADATA_COPIES][METADATA_AREA_PAGES];
@@ -166,8 +181,11 @@ struct metadata_cache
     /// @brief METADATA_AREAS areas
     struct metadata_area *areas;
 
-    /// @brief One copy of an area, where metadata_write_trails builds what it writes
+    /// @brief One copy of an area, where metadata_write_trails and metadata_settle build what they write
     struct page *scratch[METADATA_AREA_PAGES];
+
+    /// @brief The data of a chunk, read by metadata_settle
+    struct page *chunk_page;
 
     /// @brief Workqueue of the loads, which wait for their reads
     struct workqueue_struct *wq;
@@ -186,6 +204,12 @@ struct metadata_cache
 
     /// @brief How many sectors of the trailing copies failed to write
     atomic64_t trail_errors;
+
+    /// @brief How many chunks were read before a write back, as their copies differed
+    atomic64_t settle_reads;
+
+    /// @brief How many sectors so read matched neither copy, or did not read
+    atomic64_t settle_mismatches;
 };
 
 struct metadata_cache *metadata_cache_create(struct block_device *bdev, sector_t regions);
@@ -194,7 +218,10 @@ struct metadata_area *metadata_get(struct metadata_cache *cache, sector_t sector
 void metadata_put(struct metadata_cache *cache, struct metadata_area *area);
 blk_status_t metadata_copy_entries(struct metadata_cache *cache, sector_t sector,
                                    struct chunk_metadata md[METADATA_COPIES]);
-void metadata_written(struct metadata_cache *cache, struct metadata_area *area, sector_t sector);
+void metadata_written(struct metadata_cache *cache, struct metadata_area *area, sector_t sector,
+                      u8 mask, bool ok);
+bool metadata_written_since_flush(struct metadata_cache *cache, struct metadata_area *area, sector_t sector);
+void metadata_settle(struct metadata_cache *cache, struct metadata_area *area, sector_t sector, u8 mask);
 bool metadata_crowded(struct metadata_cache *cache);
 void metadata_write_trails(struct metadata_cache *cache);
 void metadata_unpin_all(struct metadata_cache *cache);

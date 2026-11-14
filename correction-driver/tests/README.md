@@ -123,7 +123,7 @@ metadata, happen every time.
 | `test_the_write_backs_of_chunks_sharing_a_metadata_sector_wait_for_its_metadata` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
 | `test_a_read_of_a_clean_sector_waits_for_the_write_back` | 1 | Metadata delayed: a read of sector 5 while sector 1 is written back waits for it, counted in `read_waits`, and reads the old data |
 
-### `test_corruption.py`: damage is detected, and only where it is (35 tests)
+### `test_corruption.py`: damage is detected, and only where it is (39 tests)
 
 Three chunks are written, whose entries share one metadata sector, and the damage is done to the middle one.
 A read accepts a CRC from either copy of the metadata, so damage to metadata is done to both, but where a test
@@ -139,6 +139,9 @@ says one copy.
 | `test_a_zeroed_metadata_sector_fails_every_chunk_it_covers` | 1 | The whole sector zeroed: all three chunks fail |
 | `test_a_zeroed_metadata_sector_in_one_copy_fails_nothing` | 2 | The whole sector zeroed in the leading or the trailing copy: all three chunks read |
 | `test_the_entry_of_a_neighbour_does_not_cover_this_chunk` | 1 | A flipped bit in the entry of the next chunk fails that chunk only |
+| `test_a_sector_whose_copies_differ_is_read_before_it_is_written` | 2 | The CRC of a sector damaged in the leading or the trailing copy, as a crash between the copies leaves them: a write of that sector reads the chunk first, finds no mismatch, and after the flush both copies are equal and the sector reads |
+| `test_only_the_sectors_written_are_read_first` | 1 | Copies that differ in another sector: a write of one sector reads nothing first, and the other sector still reads after the metadata is read again, so its trailing copy was not overwritten |
+| `test_a_sector_matching_neither_copy_is_counted_before_it_is_written` | 1 | Copies that differ and damaged data: the read before the write counts a mismatch, and the write goes on |
 | `test_restoring_the_data_clears_the_error` | 1 | No error state is kept in the driver |
 | `test_rewriting_a_corrupted_sector_clears_the_error` | 1 | A write of that sector gives it a new, correct CRC |
 | `test_write_to_a_neighbour_does_not_hide_corruption` | 1 | A partial write keeps the old CRC of the damaged sector |
@@ -159,19 +162,25 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
 | `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: the journal commit is seen, as a FUA write on the lower device alone and as a flush through the driver, whose cache turns FUA into a write back and a flush; and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
-### `test_crash.py`: the device after a crash (6 tests)
+### `test_crash.py`: the device after a crash (11 tests)
 
 `dm-log-writes` logs every write that reaches the disk below the driver, with its flushes and FUA, in
 the order the data reaches the disk itself. `logwrites.py` reads the log and replays a prefix of it to the
 zeroed lower device, then the driver is put on it again: that is the device after a crash at that point.
-The format is that of `replay-log` from xfstests, which is not needed.
+The format is that of `replay-log` from xfstests, which is not needed. The log is in the order writes
+complete, so a disk that persists two writes in another order between flushes cannot be replayed: the order of
+the driver's own writes is checked in the log itself. A second crash is replayed on top of the first: the log
+is started again from the state of a replay, and the entries of both run in a row.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_flushed_writes_survive_a_crash` | 1 | Whole chunks, partial writes and a write across a chunk, each step flushed and marked, then a write left unflushed: at each mark the device holds exactly what was written before it |
-| `test_a_write_cut_between_data_and_metadata_reads_old_or_new` | 2 | A whole chunk and one sector: the replay stops after the first of the two writes of the chunk, and the chunk must read as the old or the new data. The leading copy completes first, so the old data reads with the trailing copy; the driver does not enforce that order yet, and the log, in the order of completion, cannot show the other one |
+| `test_the_leading_copy_is_durable_before_the_data` | 2 | A whole chunk and one sector: between two flushes, the leading metadata sector of the chunk is a FUA write and comes before its data in the log |
+| `test_a_write_cut_between_data_and_metadata_reads_old_or_new` | 2 | A whole chunk and one sector: a crash at every entry between the two flushes leaves the chunk with its old or its new data |
+| `test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions` | 1 | A chunk written back by age twice without a flush from above: one barrier, and a crash at every entry leaves one of its three versions |
+| `test_a_second_crash_after_one_between_the_copies` | 2 | A crash after the leading copy (old data left) or after the data (new data left), then a write of the chunk, logged anew: one read before the write back, no mismatch, and a second crash at every entry leaves what the first crash left or the newest data |
 | `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
-| `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush and FUA write after `mkfs`. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA. With the cache a flush reaches the disk only after every write back before it, so nothing of the driver is in flight at these points |
+| `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush after `mkfs`, and at every fourth FUA write: each write back writes its leading metadata sector with FUA, about 270 points besides 60 flushes, too many to check all in 10 minutes. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA |
 
 ### `test_lower_errors.py`: the lower device fails (17 tests)
 
@@ -378,6 +387,16 @@ Both copies of the metadata, the trailing one written after a flush:
 | The trailing copy is never written | Failed, 6 | `test_layout_of_the_first_chunks_of_two_regions`, `test_metadata_is_written_outside_the_data`, `test_the_trailing_copy_is_written_after_a_flush`, `test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned`; in a run of its own, both cases of `test_a_write_cut_between_data_and_metadata_reads_old_or_new` |
 | A failed trailing write counts as written | Failed | `test_failed_trailing_write_is_counted_and_warned` |
 | The worker never flushes by itself when the areas are busy | Hang, exit code 3 | `test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned`: the write back waits for an area for ever |
+
+The two copies as the two CRCs:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The leading copy without FUA | Failed, 2 | Both cases of `test_the_leading_copy_is_durable_before_the_data`; the replays pass, as the log is in the order of completion |
+| No barrier, with the check of the counter taken out of the test | Failed | `test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions`: the chunk does not read after a crash at entry 7 |
+| No read before a write back, with the check of the counters taken out of the crash test | Failed, 4 | `test_a_second_crash_after_one_between_the_copies[data]`, the 3 tests of a read before a write in `test_corruption.py`; the `[leading copy]` case passes, as it should: the trailing copy matches there |
+| The trailing copy written by the read before a write back without FUA | Failed | `test_a_second_crash_after_one_between_the_copies[data]` |
+| The trailing copy takes the whole entry of a chunk, not only the sectors written | Failed | `test_only_the_sectors_written_are_read_first` |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 

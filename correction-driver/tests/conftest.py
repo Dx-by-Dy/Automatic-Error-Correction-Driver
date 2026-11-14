@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -31,6 +32,8 @@ DEFAULT_LOWER_MIB = 16
 
 HUNG_TASK_SECONDS = 30
 TEST_SECONDS = 180
+# CACHE_AGE_MS in src/cache.h, with a margin.
+WRITE_BACK_SECONDS = 3
 SLOW_TEST_SECONDS = 600
 
 KERNEL_REPORT = re.compile(
@@ -65,6 +68,9 @@ STATUS_FIELDS = (
     "metadata_waits",
     "trail_errors",
     "crowded_flushes",
+    "barriers",
+    "settle_reads",
+    "settle_mismatches",
 )
 
 
@@ -79,11 +85,22 @@ def device_status(name=UPPER_NAME):
     metadata_loads: metadata areas of regions read from the lower device;
     metadata_waits: waits for a metadata area to be let go, as all were in use;
     trail_errors: sectors of the trailing copy of the metadata that failed to write;
-    crowded_flushes: flushes the driver made by itself, as too many metadata areas were busy.
+    crowded_flushes: flushes the driver made by itself, as too many metadata areas were busy;
+    barriers: flushes it made before writing back a chunk written back since the last flush;
+    settle_reads: chunks it read before a write back, as their two copies of the metadata differed;
+    settle_mismatches: sectors so read that matched neither copy, or did not read.
     """
     fields = run("dmsetup", "status", name).stdout.split()
     assert fields[2] == "corrdm", fields
     return dict(zip(STATUS_FIELDS, map(int, fields[3:]), strict=True))
+
+
+def wait_for_write_back(name=UPPER_NAME, seconds=WRITE_BACK_SECONDS):
+    """Waits until the cache has written everything back by age, without a flush."""
+    deadline = time.monotonic() + seconds
+    while device_status(name)["dirty"]:
+        assert time.monotonic() < deadline, "the cache did not write back by age"
+        time.sleep(0.1)
 
 
 def drop_metadata(name=UPPER_NAME):

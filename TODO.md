@@ -33,14 +33,13 @@ in a run, **From reading** means it was only found in the code.
 - **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
   another chunk reads back without an error, as the sector number is not part of the CRC. A
   misdirected write would pass the same way. Fix: mix the sector number into the seed.
-- **Data and CRC are not written atomically.** From reading: they are two independent bios, so
-  after a power loss a chunk may have new data and an old CRC, and reads fail on data that
-  is fine. It is the same when the metadata bio of a write back fails after its data bio
-  succeeded. Confirmed by the crash tests before the trailing copy was written; they pass now, as the leading
-  copy happens to complete first and `dm-log-writes` logs in the order of completion. Fix, under way: the two
-  copies of the metadata as the two CRCs, see "On-disk format" in `ARCHITECTURE.md`. Both copies are written; left: the
-  leading copy durable before the data, a flush before a chunk is written back again, and a read that settles a
-  chunk whose copies differ after a crash.
+- **A crash together with a lost sector of the other copy fails the chunks that were in flight.** By
+  decision: between the write back of a chunk and the flush after it, only the trailing copy has the CRC of the
+  old data and only the leading one that of the new. Fix, if the threat model asks for it: a third copy, or ECC.
+- **A failed flush of the lower device leaves the trailing copies behind.** From reading: the chunks written
+  back before it are forgotten without their trailing copy, so their copies differ, and the read before their
+  next write back may see data that is not durable. A device that fails flushes gives no durability anyway.
+  Fix, if it matters: keep them pinned and retry, with a way out when the areas run out.
 - **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
   operation other than read, write and an empty flush. Discard needs the "never written" state,
   so that a discarded chunk does not fail its check.
@@ -100,6 +99,13 @@ Carried over from the previous list.
   trailing copies durable before a chunk can be written back again. The flush from above completes after the
   first. Fix: leave the trailing copies to the next flush, with a state for chunks whose trailing copy is
   written but not yet durable; and make the moment the trailing copy is written configurable.
+- **A write back is two requests in a row.** By decision: the leading metadata sector is a FUA write, and the
+  data waits for it, so every chunk costs the latency of two writes and a FUA. Fix: runs, with one FUA write of
+  a range of the metadata area before the data of the run; or the leading copies of a batch, then a flush, then
+  its data.
+- **The read before a write back is synchronous in the worker.** It happens only for chunks whose copies
+  differ, after a crash or a failed write back. Fix, if it matters: settle them in the background after
+  activation.
 - **The trailing copies are written one range at a time, synchronously, in the worker.** Each range of an area
   is a request of its own. Fix: send them all, then wait, as runs will do for the data.
 - **When half the metadata areas are busy, the worker flushes by itself.** A write back pins its area until the
@@ -146,10 +152,10 @@ Carried over from the previous list.
 2. **Cache.** Designed in `ARCHITECTURE.md`. Written so far: the cache with a write back of one chunk
    at a time, kept apart from reads by the tree of reads in flight instead of chunk locks, metadata in an
    area per region, metadata in RAM, and both copies of the metadata written, the trailing one after a flush.
-   Left, in this order: the two copies as the two CRCs (the order of the writes and the settling read),
-   neighbouring chunks written back as one bio, a place to plug in the reserved area, then the cause of the
-   unstable test of memory.
-3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and
+   The two copies are the two CRCs: the leading one before the data, a flush before a chunk is written back
+   again, and a read of a chunk whose copies differ. Left, in this order: neighbouring chunks written back as
+   one bio, a place to plug in the reserved area, then the cause of the unstable test of memory.
+3. **Integrity and format.** Superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
    write backs.
 4. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,

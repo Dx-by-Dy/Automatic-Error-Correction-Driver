@@ -68,12 +68,17 @@ new writes fail.
 
 1. Splitting the request into chunks;
 2. Copying each piece into the entry of its chunk in the cache, and completing it;
-3. Writing back the entry later, once no read of the chunk is in flight: one lower write per run of its dirty
-   sectors, each of which calculates the checksums, puts them into the leading copy of the metadata of the
-   region in RAM, and writes the data and the leading metadata sector of the chunk from there. Nothing is read
-   first.
-4. After the next flush of the lower device, writing the trailing copy of the metadata sectors of the chunks
-   written back, and flushing again.
+3. Writing back the entry later, once no read of the chunk is in flight. If the chunk was written back since
+   the last flush of the lower device, the worker flushes first: its data could otherwise be any of three
+   versions. If the two copies of its metadata differ in the sectors to be written, after a crash or a failed
+   write back, the chunk is read, and a sector that matches the leading copy gets that checksum in the trailing
+   copy, written with FUA.
+4. One lower write per run of its dirty sectors, each of which calculates the checksums, puts them into the
+   leading copy of the metadata of the region in RAM, writes the leading metadata sector of the chunk from
+   there with FUA, and only then the data.
+5. After the next flush of the lower device, writing the trailing copy of the metadata sectors of the chunks
+   written back, and flushing again. Until then the trailing copy has the checksums of the old data and the
+   leading one those of the new, so after a crash each sector reads its old or its new data.
 
 ### Read Path
 
@@ -193,7 +198,7 @@ Show the counters:
 dmsetup status corrdm
 ```
 
-After the usual `<start> <length> corrdm`, it prints ten counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, and how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy.
+After the usual `<start> <length> corrdm`, it prints thirteen counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy, how many times it flushed before writing back a chunk written back since the last flush, how many chunks it read before a write back as their two copies of the metadata differed, and how many sectors so read matched neither copy or did not read.
 
 ## Usage
 

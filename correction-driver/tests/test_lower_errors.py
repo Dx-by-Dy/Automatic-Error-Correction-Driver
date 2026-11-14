@@ -261,9 +261,9 @@ def test_device_works_again_once_the_sector_reads(faulty):
 def test_write_fails_when_its_metadata_sector_does_not_read(faulty, chunk, start, sectors):
     """Its CRCs cannot be merged with the other entries of the sector in either copy, so the write fails.
 
-    A whole chunk too, as its metadata sector holds the entries of its neighbours. What the chunk
-    holds afterwards is open, see "Data and CRC are not written atomically" in TODO.md; here only
-    the error and the other chunks are checked.
+    A whole chunk too, as its metadata sector holds the entries of its neighbours. The write back fails
+    before any I/O, so the chunk keeps its old data, which cannot be read back to check it, as its
+    metadata does not read: only the error and the other chunks are checked.
     """
     for sector in copies(BAD_CHUNK):
         faulty.fail(sector)

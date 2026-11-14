@@ -52,8 +52,9 @@ union trn_m_rq
 ///   3. complete_work         — checks the CRCs of a read, completes the bio
 ///
 /// A read submits only its data bio: its metadata is copied from RAM when it is
-/// set up. A write submits its data bio and the bio of its metadata sector.
-/// When the metadata sector did not read, the part fails without any I/O.
+/// set up. A write submits the bio of its leading metadata sector with FUA, and
+/// its data bio once that completes. When the metadata sector did not read, the
+/// part fails without any I/O.
 struct trn_p_rq
 {
     /// @brief Work item for submitting bios to the underlying device
@@ -90,9 +91,8 @@ struct trn_p_rq
     /// @brief (TRANSFORM_READ only) the read in the tree of reads of the cache, see cache_read
     struct cache_range range;
 
-    /// @brief Counter of outstanding bios: 1 for a read, 2 for a write with its metadata
-    /// @details When it reaches 0, complete_work is invoked.
-    atomic_t pending;
+    /// @brief (TRANSFORM_WRITE only) meta_bio completed, so submit_work sends the data
+    bool meta_written;
 
     /// @brief Transformation type: read or write
     enum trn_p_type type;
@@ -114,5 +114,6 @@ void trn_p_rq_init(struct trn_p_rq *part,
                    enum trn_p_type type,
                    struct metadata_area *area);
 void trn_p_rq_end_io(struct bio *bio);
+void trn_p_rq_meta_end_io(struct bio *bio);
 
 #endif

@@ -494,9 +494,10 @@ static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
 /// @brief Completion of a write back job
 /// @details
 /// complete_work of the part calls it through bio_endio, as the last thing it
-/// does. A job that succeeded records its chunk for the trailing copy of the
-/// metadata, which pins the area. Lets the metadata area go first, so that it
-/// can be dropped once the write backs are over and it is not pinned. Starts the next job of the metadata sector, if one is
+/// does. It records the outcome for the metadata, which pins the area until
+/// the next flush; the sectors of a job that succeeded go into the trailing
+/// copy then. Lets the metadata area go first, so that it can be dropped once
+/// the write backs are over and it is not pinned. Starts the next job of the metadata sector, if one is
 /// queued, which takes its place in the tree of jobs in flight. The last job of
 /// an entry frees it, or marks it failed.
 ///
@@ -511,8 +512,8 @@ static void cache_job_end_io(struct bio *bio)
     struct cache_job *next;
 
     bio_uninit(bio);
-    if (!status)
-        metadata_written(cache->dm_ctx->metadata, job->area, chunk * DATA_SIZE_SECTORS);
+    metadata_written(cache->dm_ctx->metadata, job->area, chunk * DATA_SIZE_SECTORS,
+                     sector_mask(job->part.meta.write.first_sector, job->part.meta.write.nr_sectors), !status);
     metadata_put(cache->dm_ctx->metadata, job->area);
 
     spin_lock(&cache->lock);
@@ -607,13 +608,42 @@ static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
         queue_work(dm_ctx->transform_wq, &job->part.submit_work);
 }
 
+static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed);
+
+/// @brief Makes the metadata of a chunk ready for a write back that writes the leading copy first
+/// @details
+/// A chunk written back since the last flush of the device below may hold its
+/// old or its new data, and the trailing copy has the CRC of the old one; one
+/// more write back would leave three versions for two copies. So the worker
+/// first waits for the jobs in flight and runs cache_sync, which makes the data
+/// durable and puts its CRC into the trailing copy; this is counted as a
+/// barrier. Then metadata_settle reads the chunk if its copies still differ in
+/// the sectors to be written.
+static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entry)
+{
+    struct metadata_cache *metadata = cache->dm_ctx->metadata;
+    sector_t sector = entry->chunk * DATA_SIZE_SECTORS;
+    struct metadata_area *area = metadata_get(metadata, sector);
+
+    if (metadata_written_since_flush(metadata, area, sector))
+    {
+        wait_event(cache->wait, !READ_ONCE(cache->nr_jobs));
+        atomic64_inc(&cache->barriers);
+        cache_sync(cache, NULL, false);
+    }
+
+    metadata_settle(metadata, area, sector, entry->mask);
+    metadata_put(metadata, area);
+}
+
 /// @brief Writes back an entry in CACHE_WRITING, one job per run of its sectors
 /// @details
 /// Writes to the entry wait until it leaves CACHE_WRITING, so its mask and its
 /// page do not change while the jobs are in flight. So do new reads of its
 /// clean sectors, so the reads of the chunk already in flight are waited for
 /// before the first job: a read that met a job could see the data of one
-/// version of a sector and the CRC of another.
+/// version of a sector and the CRC of another. Then the metadata of the chunk
+/// is made ready, see cache_prepare_metadata.
 static void cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
 {
     u8 mask = entry->mask;
@@ -634,6 +664,8 @@ static void cache_write_back_entry(struct cache *cache, struct cache_entry *entr
     while (cache_reads_on(cache, entry->chunk))
         cache_wait(cache);
     spin_unlock(&cache->lock);
+
+    cache_prepare_metadata(cache, entry);
 
     for (first = 0; first < DATA_SIZE_SECTORS; first += run)
     {
@@ -898,6 +930,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     atomic64_set(&cache->busy_waits, 0);
     atomic64_set(&cache->read_waits, 0);
     atomic64_set(&cache->crowded_flushes, 0);
+    atomic64_set(&cache->barriers, 0);
 
     cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
     cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);

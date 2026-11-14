@@ -83,7 +83,7 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
     meta->area = area;
 
     page = metadata_sector_page(area, METADATA_LEAD, part->sector, &offset);
-    metadata_bio_init(part, page, offset, metadata_write_opf(part->bio));
+    metadata_bio_init(part, page, offset, metadata_write_opf());
 
     bio_crc_calc(meta, part->bio);
 

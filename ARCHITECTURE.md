@@ -74,9 +74,10 @@ The filesystem journal relies on 1 and 2 for the order of its writes, and on 3 w
 past the last commit to find the end of the journal, and a read error there stops the mount.
 
 **Current.** Points 1 and 2 hold: an empty flush and a FUA write wait until the cache has written back
-everything dirty and the lower device has flushed. Point 3 does not hold: data and CRC are two writes ("Data
-and CRC are not written atomically" in `TODO.md`). Point 5 holds as written: a failed write back fails every
-flush until the chunk is written.
+everything dirty and the lower device has flushed. Point 3 holds through the two copies of the metadata, see
+[On-disk format](#on-disk-format), except after a crash together with a lost sector of the other copy, or
+when the lower device fails to flush. Point 5 holds as written: a failed write back fails every flush until
+the chunk is written.
 
 ## On-disk format
 
@@ -89,10 +90,14 @@ flush until the chunk is written.
   data]`: 128 sectors, 128 sectors, 8192 sectors, 8448 in all. The trailing copy of the last region goes into
   region 0. The leading copy and the data of a region are one contiguous range, and the data stays aligned to
   4 KiB.
-- The leading copy is written with each write back of a chunk, the trailing one after the lower device has
-  flushed that write back, and the device is flushed again. Once everything is flushed both copies are equal.
-  A read accepts a sector that matches either. The data and the leading copy are still written in parallel,
-  so point 3 of the contract does not hold yet.
+- The leading copy is written with each write back of a chunk, with FUA, and the data only once it
+  completes; the trailing one after the lower device has flushed that write back, and the device is flushed
+  again. Once everything is flushed both copies are equal. A read accepts a sector that matches either, so
+  after a crash at any point each sector reads its old or its new data.
+- A chunk written back since the last flush is not written back again before another flush, counted as a
+  barrier. A chunk whose copies differ in the sectors to be written, after a crash or a failed write back, is
+  read first: a sector that matches the leading copy has that CRC written into the trailing one with FUA; one
+  that matches neither is counted and left, so the damage stays visible.
 - A metadata sector that failed to read in one copy is taken from the other; a rate-limited warning names
   every chunk read or written with one copy. A sector failed in both copies fails the reads of its 8 chunks,
   and the writes to them, as a write needs the other entries of the sector. A trailing sector that fails to
@@ -125,8 +130,8 @@ trailing copy is written too. So the copy guards against a lost metadata sector 
 two slots cover a write cut short by a crash in between. What is lost is the case of a crash in that window
 together with a lost sector of the other copy, two faults at once. A completed write is not durable, so a
 chunk written back again before a flush needs a flush first: its data may be any of three versions, and there
-are two slots. The order of the leading copy before the data, that flush and the read that settles a chunk
-whose copies differ after a crash come in the next step.
+are two slots. A chunk whose copies differ after a crash is read before it is written back again, as
+writing its leading copy over a trailing one that does not match the data would leave neither matching.
 - **The cost:** a write of the metadata of one chunk needs the other entries of its sector. They come from the
   metadata area of the region in RAM, read whole the first time the region is used, see [Cache](#cache); the
   writes of the chunks of one sector go one at a time.
@@ -160,8 +165,9 @@ whose copies differ after a crash come in the next step.
 
 **Current.** Device mapper splits each bio at chunk boundaries (`max_io_len` of 8 sectors). A write is copied
 into the cache and completes. The worker writes an entry back as one part per run of its dirty sectors, once no read
-of the chunk is in flight: the part goes to the lower device as a data bio and a metadata bio, which reads the
-metadata sector first and writes it back with the new CRCs merged in. The parts of the chunks of one metadata
+of the chunk is in flight and the metadata of the chunk is ready (a barrier or a settling read, see
+[On-disk format](#on-disk-format)): the part writes the leading metadata sector from the area in RAM with the
+new CRCs merged in, with FUA, and the data bio once it completes. The parts of the chunks of one metadata
 sector go one at a time. A read takes the sectors the cache holds from it; the
 rest is a part in the per-bio data of its bio, registered in the tree of reads of the cache while in flight,
 which reads from the lower device and checks the CRC in a worker. Details are in
@@ -288,10 +294,10 @@ it counts.
   (the format of `replay-log` from xfstests): the log holds every lower request with its flushes and FUA, and
   replaying a prefix of it to a clean device gives the state after a crash at that point. A crash right after
   an `fsync` must keep everything the filesystem made durable, and so must a crash at any flush or FUA write
-  while other writes of the filesystem are in flight. A crash between the data and the metadata of one write
-  reads the old data with the trailing copy; that the leading copy goes before the data is not enforced yet,
-  see [On-disk format](#on-disk-format), and `dm-log-writes`, which logs in the order of completion, cannot
-  show the other order. The next step checks the order in the log itself: a FUA leading write before the data.
+  while other writes of the filesystem are in flight, and a crash at any entry between two flushes. As
+  `dm-log-writes` logs in the order of completion, it cannot show a disk that persists the data before the
+  leading copy; that order is checked in the log itself: the leading write is FUA and comes first. A second
+  crash is replayed on top of the state of the first, with a log started from it.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
   chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes that are dropped
   silently wait for the threat model, as lost writes are an open threat.
@@ -314,4 +320,5 @@ it counts.
 | 2026-11-11 | Metadata moves into an area per region of 4 MiB, packed 8 chunks to a sector, with room for a copy in the next region; it replaces metadata next to each chunk | SSDs and HDDs both; two CRCs keep a run two sequential requests; data aligned to 4 KiB; 1.6% instead of 12.5% |
 | 2026-11-14 | Metadata in RAM: the area of a region as the unit, a pool of its own, clean areas dropped by LRU and on a suspend, entries changed in place by the write back | No read before a metadata write, one lower read per chunk read; two pools, as one shared with data brings deadlocks and policies whose gain is not measured |
 | 2026-11-14 | The two copies of the metadata are the two CRC slots: the leading copy is written with the write back, the trailing one after the flush that makes the data durable; both in RAM; a failed trailing write is counted and warned about, not failed | No change of format, the copy guards a lost sector in the steady state; only a crash together with a lost sector of the other copy is not covered |
+| 2026-11-14 | The leading copy is a FUA write before the data; a chunk written back since the last flush waits for a flush (a barrier); a chunk whose copies differ is read before its write back, and the matching CRC goes into the trailing copy with FUA | A completed write is not durable, so two write backs between flushes leave three versions for two slots; the read settles a crash left over without a superblock or an epoch |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |

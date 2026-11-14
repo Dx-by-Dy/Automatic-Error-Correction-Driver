@@ -12,15 +12,13 @@ regions between them.
 """
 
 import os
-import time
 
+from conftest import wait_for_write_back
 from harness import DATA_SECTORS, REGION_DATA_SECTORS, REGION_SECTORS, SECTOR_SIZE, metadata_sectors, pattern
 
 # METADATA_AREAS and METADATA_CROWDED in src/metadata.h.
 METADATA_AREAS = 32
 METADATA_CROWDED = METADATA_AREAS // 2
-# CACHE_AGE_MS in src/cache.h, with a margin.
-WRITE_BACK_SECONDS = 3
 CHUNK = 5
 FIRST = REGION_DATA_SECTORS + CHUNK * DATA_SECTORS
 
@@ -41,19 +39,11 @@ def written_and_flushed(stack, start, data):
     stack.upper.flush()
 
 
-def wait_for_write_back(stack):
-    """Waits until the cache has written everything back by age, without a flush."""
-    deadline = time.monotonic() + WRITE_BACK_SECONDS
-    while stack.status()["dirty"]:
-        assert time.monotonic() < deadline, "the cache did not write back by age"
-        time.sleep(0.1)
-
-
 def test_the_trailing_copy_is_written_after_a_flush(stack):
     """Written back by age, the chunk has its leading copy; the trailing one waits for a flush."""
     lead, trail = metadata_sectors(FIRST, stack.lower_sectors)
     stack.upper.write(FIRST, pattern("data", DATA_SECTORS))
-    wait_for_write_back(stack)
+    wait_for_write_back()
     assert stack.lower.read(lead) != bytes(SECTOR_SIZE)
     assert stack.lower.read(trail) == bytes(SECTOR_SIZE), "the trailing copy came before a flush"
     stack.upper.flush_settled()
@@ -171,14 +161,14 @@ def test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned(make_stack)
 
     for region in range(1, METADATA_CROWDED - 2):
         stack.upper.write(start(region), pattern(region, DATA_SECTORS))
-    wait_for_write_back(stack)
+    wait_for_write_back()
     assert stack.status()["crowded_flushes"] == 0
     lead, trail = metadata_sectors(start(1), stack.lower_sectors)
     assert stack.lower.read(trail) == bytes(SECTOR_SIZE), "a trailing copy was written with few areas pinned"
 
     for region in range(METADATA_CROWDED - 2, regions):
         stack.upper.write(start(region), pattern(region, DATA_SECTORS))
-    wait_for_write_back(stack)
+    wait_for_write_back()
     assert stack.status()["crowded_flushes"] > 0
     assert stack.lower.read(trail) == stack.lower.read(lead)
 

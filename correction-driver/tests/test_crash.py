@@ -10,7 +10,16 @@ import os
 
 import pytest
 
-from conftest import LOG_DEVICE_NAME, LOG_NAME, LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
+from conftest import (
+    LOG_DEVICE_NAME,
+    LOG_NAME,
+    LOWER_NAME,
+    UPPER_NAME,
+    device_status,
+    dmsetup_remove,
+    make_lower,
+    wait_for_write_back,
+)
 from harness import DATA_SECTORS, BlockDevice, capacity, metadata_sector, pattern, physical_sector, run
 from logwrites import FLUSH, FUA, mark_index, read_log, replay
 
@@ -19,6 +28,8 @@ LOG_MIB = 128
 LOG_OFFSET_MIB = 256
 MOUNTPOINT = "/mnt/corrdm_crash"
 FILES = 8
+# test_ext4_survives_a_crash_at_any_flush checks every flush and every FUA_STRIDE-th FUA write.
+FUA_STRIDE = 4
 
 
 class LoggedStack:
@@ -28,11 +39,21 @@ class LoggedStack:
         self.lower_sectors = LOWER_MIB * 2048
         self.lower_path = make_lower(self.lower_sectors)
         self.log_device_path = make_lower(LOG_MIB * 2048, LOG_DEVICE_NAME, LOG_OFFSET_MIB)
+        self.start_log()
+
+    def start_log(self):
+        """Puts dm-log-writes on the lower device as it is, with a fresh log, and the driver on it."""
         run(
             "dmsetup", "create", LOG_NAME,
             stdin=f"0 {self.lower_sectors} log-writes {self.lower_path} {self.log_device_path}\n",
         )
         self.create_upper(f"/dev/mapper/{LOG_NAME}")
+
+    def log_again(self):
+        """Logs anew from the state of the last replay: its entries and the new ones replay in a row."""
+        dmsetup_remove(UPPER_NAME)
+        run("dd", "if=/dev/zero", f"of={self.log_device_path}", "bs=1M", "oflag=direct", f"count={LOG_MIB}")
+        self.start_log()
 
     @property
     def sectors(self):
@@ -135,36 +156,110 @@ def chunk_entries(entries, first, last, chunk):
     return data, metadata
 
 
-@pytest.mark.parametrize("sectors", [DATA_SECTORS, 1], ids=["whole chunk", "one sector"])
-def test_a_write_cut_between_data_and_metadata_reads_old_or_new(logged, sectors):
-    """A crash after one of the two writes of a chunk reached the disk, but not the other.
+def read_after(logged, entries, start, sectors=DATA_SECTORS):
+    """What the device holds at these sectors after a crash with only these entries on its disk."""
+    device = logged.replay(entries)
+    try:
+        return device.read(start, sectors)
+    except OSError as error:
+        pytest.fail(f"the chunk does not read after a crash at entry {entries[-1].index}: {error}")
+    finally:
+        device.close()
 
-    The trailing copy of the metadata still has the CRC of the old data, so a cut after the leading
-    copy reads the old data. dm-log-writes logs the writes in the order they complete, and the leading
-    copy completes first, so the cut after the data alone does not occur here; the driver does not
-    enforce that order yet, see "Data and CRC are not written atomically" in TODO.md.
-    """
-    chunk = 3
-    start = chunk * DATA_SECTORS
+
+def write_old_and_new(logged, start, sectors):
+    """A whole chunk, flushed, then new data over some of it, flushed; returns the log and both contents."""
     old = pattern("old", DATA_SECTORS)
     new = pattern("new", sectors)
     write_and_flush(logged.upper_path, [(start, old)])
     logged.mark("old")
     write_and_flush(logged.upper_path, [(start, new)])
     logged.mark("new")
-    entries = logged.finish()
+    return logged.finish(), old, new + old[len(new) :]
 
+
+@pytest.mark.parametrize("sectors", [DATA_SECTORS, 1], ids=["whole chunk", "one sector"])
+def test_the_leading_copy_is_durable_before_the_data(logged, sectors):
+    """The leading metadata sector of a write back is a FUA write logged before its data.
+
+    The log is in the order writes complete, so this is what makes the order hold on any disk: the
+    data is sent only once the leading copy is durable.
+    """
+    chunk = 3
+    entries, _, _ = write_old_and_new(logged, chunk * DATA_SECTORS, sectors)
     data, metadata = chunk_entries(entries, mark_index(entries, "old"), mark_index(entries, "new"), chunk)
     assert len(data) == 1 and len(metadata) == 1, (data, metadata)
-    cut = min(data[0], metadata[0])
-    device = logged.replay(entries[: cut + 1])
+    assert entries[metadata[0]].flags & FUA, "the leading copy is not a FUA write"
+    assert metadata[0] < data[0], "the data reached the disk before the leading copy"
+
+
+@pytest.mark.parametrize("sectors", [DATA_SECTORS, 1], ids=["whole chunk", "one sector"])
+def test_a_write_cut_between_data_and_metadata_reads_old_or_new(logged, sectors):
+    """A crash at any entry between two flushes leaves the chunk with its old or its new data.
+
+    The leading copy has the CRC of the new data before the data is sent, and the trailing copy keeps
+    that of the old one until the new data is flushed.
+    """
+    chunk = 3
+    start = chunk * DATA_SECTORS
+    entries, old, new = write_old_and_new(logged, start, sectors)
+    for point in range(mark_index(entries, "old"), mark_index(entries, "new") + 1):
+        assert read_after(logged, entries[: point + 1], start) in (old, new), f"after a crash at entry {point}"
+
+
+def test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions(logged):
+    """Written back by age twice without a flush from above, a chunk could hold three versions.
+
+    The driver flushes before the second write back, counted as a barrier, so a crash at any entry
+    leaves one of them readable.
+    """
+    start = 3 * DATA_SECTORS
+    versions = [pattern(name, DATA_SECTORS) for name in ("a", "b", "c")]
+    write_and_flush(logged.upper_path, [(start, versions[0])])
+    logged.mark("a")
+    assert device_status()["barriers"] == 0
+    device = BlockDevice(logged.upper_path)
     try:
-        contents = device.read(start, DATA_SECTORS)
-    except OSError as error:
-        pytest.fail(f"the chunk does not read after the crash: {error}")
+        for version in versions[1:]:
+            device.write(start, version)
+            wait_for_write_back()
+        assert device_status()["barriers"] == 1
+        device.flush()
     finally:
         device.close()
-    assert contents in (old, new + old[len(new) :])
+    logged.mark("c")
+    entries = logged.finish()
+    for point in range(mark_index(entries, "a"), mark_index(entries, "c") + 1):
+        assert read_after(logged, entries[: point + 1], start) in versions, f"after a crash at entry {point}"
+
+
+@pytest.mark.parametrize("cut", ["leading copy", "data"])
+def test_a_second_crash_after_one_between_the_copies(logged, cut):
+    """A crash leaves the copies of a chunk different; the next write back of it reads it first.
+
+    Cut after the leading copy, the old data is there and matches the trailing copy. Cut after the
+    data, the new data matches the leading copy, so the driver writes its CRC into the trailing copy
+    before the leading one changes again: otherwise a second crash would leave the new data with
+    neither copy matching it.
+    """
+    chunk = 3
+    start = chunk * DATA_SECTORS
+    entries, old, new = write_old_and_new(logged, start, DATA_SECTORS)
+    data, metadata = chunk_entries(entries, mark_index(entries, "old"), mark_index(entries, "new"), chunk)
+    first = entries[: (metadata[0] if cut == "leading copy" else data[0]) + 1]
+    survived = old if cut == "leading copy" else new
+    assert read_after(logged, first, start) == survived
+
+    logged.log_again()
+    newer = pattern("newer", DATA_SECTORS)
+    write_and_flush(logged.upper_path, [(start, newer)])
+    status = device_status()
+    assert (status["settle_reads"], status["settle_mismatches"], status["barriers"]) == (1, 0, 0), status
+    second = logged.finish()
+    for point in range(len(second)):
+        assert read_after(logged, first + second[: point + 1], start) in (survived, newer), (
+            f"after a second crash at entry {point}"
+        )
 
 
 def flush_points(entries):
@@ -243,12 +338,17 @@ def test_ext4_survives_a_crash_at_any_flush(logged):
     data reached the disk before the metadata write was even sent. The cache turns a FUA write into a
     write back and a flush, and sends a flush down only once every write back before it is done, so at
     these points nothing of the driver is in flight. The trailing copies of the metadata are written after
-    such a flush, followed by another. A crash between the data and the metadata of one write is still
-    possible, between flushes: test_a_write_cut_between_data_and_metadata_reads_old_or_new.
+    such a flush, followed by another. A crash between the data and the metadata of one write is covered
+    by the two copies: test_a_write_cut_between_data_and_metadata_reads_old_or_new.
+
+    Every write back writes its leading metadata sector with FUA, which makes about 270 more points
+    than the 60 flushes; every FUA_STRIDE-th of them is checked, so that the test takes about 6 minutes.
     """
     entries, written, marks = ext4_workload(logged)
     start = mark_index(entries, "mkfs")
     points = [point for point in flush_points(entries) if point > start]
     assert points, "no flush in the log after mkfs"
-    for point in points:
+    flushes = [point for point in points if entries[point].flags & FLUSH]
+    fua_only = [point for point in points if not entries[point].flags & FLUSH]
+    for point in sorted(flushes + fua_only[::FUA_STRIDE]):
         check_ext4_after_a_crash(logged, entries, point, written, marks)

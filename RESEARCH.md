@@ -94,6 +94,12 @@ A trap found on the way, which holds for a pair in one entry too: a completed wr
 flush. A chunk written back twice between two flushes may hold any of three versions after a crash, with two
 slots, so the second write back needs a flush first.
 
+Point 3 in the end: a chunk whose copies differ is read before its next write back, which is enough without an
+epoch, as in the steady state they are equal. The read is valid only for data that is durable, so it comes
+after the flush that a chunk written back since the last one waits for anyway. Point 1: the leading copy is a
+FUA write of one sector per write back, and the data waits for it, two requests in a row; runs will make the
+first a range of the metadata area.
+
 ## A failed write back: a reserved area
 
 Discussed on 2026-11-11, an idea of the user, not decided. A small area is set aside in advance. A write back that

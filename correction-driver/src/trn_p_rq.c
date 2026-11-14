@@ -3,7 +3,8 @@
 
 /// @brief Function completing the structure lifecycle
 /// @details
-/// Called when part->pending reaches 0, or at once by submit_work when the
+/// Called when the data bio completes, when the metadata bio of a write
+/// fails, as the data is then not sent, or at once by submit_work when the
 /// part failed before any I/O.
 ///
 /// TRANSFORM_READ: leaves the tree of reads of the cache and on a successful
@@ -45,12 +46,14 @@ static void complete_work(struct work_struct *work)
 
 /// @brief Work handler: submits bio to device
 /// @details
-/// Runs from transform_wq once for each trn_p_rq.
+/// Runs from transform_wq once for a read and twice for a write.
 ///
 /// A part whose metadata sector did not read completes at once, without I/O.
-/// Otherwise submits the data bio, and for TRANSFORM_WRITE first puts the new
-/// CRCs into the metadata area in RAM and submits meta_bio, which writes the
-/// metadata sector from there.
+/// A read submits its data bio. A write first puts the new CRCs into the
+/// leading copy in the metadata area in RAM and submits meta_bio, which writes
+/// that sector from there with FUA; trn_p_rq_meta_end_io runs this again once
+/// it is durable, and the data bio goes then. So after a crash the trailing
+/// copy still has the CRC of the old data, and the leading one of the new.
 ///
 /// Expected execution context - process.
 /// @param work Pointer to work_struct embedded in part->submit_work
@@ -66,11 +69,13 @@ static void submit_work(struct work_struct *work)
         return;
     }
 
-    if (part->type == TRANSFORM_WRITE)
+    if (part->type == TRANSFORM_WRITE && !part->meta_written)
     {
         update_crc_local(&part->meta.write);
         submit_bio(&part->meta_bio);
+        return;
     }
+
     submit_bio_noacct(part->bio);
 }
 
@@ -113,11 +118,10 @@ void trn_p_rq_init(struct trn_p_rq *part,
     case TRANSFORM_READ:
         part->status = trn_mr_rq_init(&part->meta.read, part, dm_ctx);
         part->meta.read.saved_iter = bio->bi_iter;
-        atomic_set(&part->pending, 1);
         break;
     case TRANSFORM_WRITE:
+        part->meta_written = false;
         part->status = trn_mw_rq_init(&part->meta.write, part, area);
-        atomic_set(&part->pending, 2);
         break;
     }
 
@@ -134,14 +138,9 @@ void trn_p_rq_init(struct trn_p_rq *part,
     DM_DEBUG_BIO(bio);
 }
 
-/// @brief Handler for completion of data and metadata bios
+/// @brief Handler for completion of the data bio
 /// @details
-/// Called upon completion of any data bio or metadata bio.
-///
-/// On bio error, captures status in the part.
-///
-/// Decrements part->pending counter of the chunk transformation request.
-/// When pending == 0, starts complete_work to finish the part.
+/// On bio error, captures status in the part, then starts complete_work.
 ///
 /// Expected execution context - softirq.
 /// @param bio Completed bio
@@ -158,6 +157,30 @@ void trn_p_rq_end_io(struct bio *bio)
         WRITE_ONCE(part->status, bio->bi_status);
     }
 
-    if (atomic_dec_and_test(&part->pending))
+    queue_work(part->dm_ctx->transform_wq, &part->complete_work);
+}
+
+/// @brief Handler for completion of the metadata bio of a write
+/// @details
+/// On success the leading sector is durable, so submit_work runs again to
+/// send the data. On error the data is not sent and the part completes with
+/// the error: the device keeps the old data, which the trailing copy matches.
+///
+/// Expected execution context - softirq.
+/// @param bio Completed metadata bio
+void trn_p_rq_meta_end_io(struct bio *bio)
+{
+    struct trn_p_rq *part = bio->bi_private;
+
+    if (bio->bi_status != BLK_STS_OK)
+    {
+        DM_ERR_LIMIT("metadata write failed, status=%d, sector=%llu\n", bio->bi_status,
+                     (unsigned long long)part->metadata_sector);
+        WRITE_ONCE(part->status, bio->bi_status);
         queue_work(part->dm_ctx->transform_wq, &part->complete_work);
+        return;
+    }
+
+    part->meta_written = true;
+    queue_work(part->dm_ctx->transform_wq, &part->submit_work);
 }

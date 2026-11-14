@@ -240,7 +240,10 @@ static void dm_target_resume(struct dm_target *ti)
 /// not yet on the lower device, entries whose write back failed, metadata
 /// areas read from the lower device, waits for a metadata area when all were
 /// in use, sectors of the trailing copy of the metadata that failed to write,
-/// flushes the worker made because too many metadata areas were busy.
+/// flushes the worker made because too many metadata areas were busy, flushes
+/// it made before writing back a chunk written back since the last one, chunks
+/// read before a write back as their two copies of the metadata differed, and
+/// sectors so read that matched neither copy or did not read.
 /// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
@@ -258,7 +261,7 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
@@ -267,7 +270,10 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                (unsigned long long)atomic64_read(&dm_ctx->metadata->loads),
                (unsigned long long)atomic64_read(&dm_ctx->metadata->waits),
                (unsigned long long)atomic64_read(&dm_ctx->metadata->trail_errors),
-               (unsigned long long)atomic64_read(&dm_ctx->cache->crowded_flushes));
+               (unsigned long long)atomic64_read(&dm_ctx->cache->crowded_flushes),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->barriers),
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->settle_reads),
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->settle_mismatches));
         break;
     case STATUSTYPE_TABLE:
     case STATUSTYPE_IMA:

@@ -44,15 +44,14 @@ struct trn_mw_rq
     __le64 crc[DATA_SIZE_SECTORS];
 };
 
-/// @brief Operation and flags of the bio that writes the metadata of a chunk
+/// @brief Operation and flags of the bio that writes the leading metadata sector of a chunk
 /// @details
-/// A FUA write is durable once it completes, so its metadata has to be FUA as
-/// well: the data bio is the upper bio and keeps the flag by itself.
-/// @param data The data bio of the part
-/// @return REQ_OP_WRITE, with REQ_FUA if the data bio has it
-static inline blk_opf_t metadata_write_opf(const struct bio *data)
+/// FUA, as the data is sent only once the sector is durable: after a crash
+/// the leading copy has the CRC of the new data and the trailing copy that of
+/// the old, so the chunk reads either way.
+static inline blk_opf_t metadata_write_opf(void)
 {
-    return REQ_OP_WRITE | (data->bi_opf & REQ_FUA);
+    return REQ_OP_WRITE | REQ_FUA;
 }
 
 blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,

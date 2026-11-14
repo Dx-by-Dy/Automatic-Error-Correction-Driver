@@ -7,7 +7,7 @@
 /// part->meta_bio is embedded in the part, so it cannot fail to allocate. It is
 /// bound to the metadata sector of the chunk, part->metadata_sector, which it
 /// shares with its neighbours, with a single segment of length
-/// SECTOR_SIZE at offset within page, and completes to trn_p_rq_end_io.
+/// SECTOR_SIZE at offset within page, and completes to trn_p_rq_meta_end_io.
 ///
 /// A bio set up before must be released with bio_uninit first.
 ///
@@ -27,7 +27,7 @@ void metadata_bio_init(struct trn_p_rq *part,
 
     bio_init(bio, part->dm_ctx->dev->bdev, &part->meta_bvec, 1, opf);
     bio->bi_iter.bi_sector = part->metadata_sector;
-    bio->bi_end_io = trn_p_rq_end_io;
+    bio->bi_end_io = trn_p_rq_meta_end_io;
     bio->bi_private = part;
     __bio_add_page(bio, page, SECTOR_SIZE, offset);
 }
