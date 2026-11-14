@@ -110,8 +110,9 @@ metadata lives in areas of its own, one per region, as in `dm-integrity`:
   would put a seek between them.
 - **The copy** in the next region guards against a failed metadata sector, which now covers 8 chunks. Writing it
   costs a second request for every change of metadata; the trade-off is to be settled when it is written.
-- **The cost:** a write of the metadata of one chunk has to read the other entries of its sector first, until
-  metadata is kept in RAM, and the writes of the chunks of one sector go one at a time.
+- **The cost:** a write of the metadata of one chunk needs the other entries of its sector. They come from the
+  metadata area of the region in RAM, read whole the first time the region is used, see [Cache](#cache); the
+  writes of the chunks of one sector go one at a time.
 
 **Open:**
 
@@ -200,8 +201,15 @@ complexity and bugs.
   reads in flight on its chunks, while new reads of their clean sectors wait for it. A run spans many chunks, and
   a part may not hold many chunk locks. The lower writes of the chunks of one metadata sector go one at a time,
   as each merges its CRCs into that sector.
+- **Metadata in RAM**, decided on 2026-11-14: the metadata area of a region, 64 KiB, is the unit, read whole
+  the first time a chunk of the region needs it, as the next request is likely near. A structure of our own, in a
+  pool of its own apart from the data, so that a write back never waits for its own metadata to find room among
+  dirty data. Clean areas are dropped by LRU and on a suspend; a write back holds its area and changes the entry
+  in place just before it writes the sector, so an area never holds what the lower device does not. Dropping
+  dirty metadata comes with metadata writes deferred and batched, at or after runs, as it has to keep in step
+  with the data cache. What to do when a metadata write fails is left to the copy of the metadata and two CRCs.
 - **Defaults are constants for now:** 64 MiB of cache per device, write back from 50% used down to 45%, an age of
-  1 s. They are to be tuned later.
+  1 s, 4 MiB of metadata in RAM. They are to be tuned later.
 
 
 **Proposed**, requirements:
@@ -278,4 +286,5 @@ it counts.
 | 2026-11-11 | FUA goes the way of a flush; a failed chunk is retried on a flush, a suspend or a new write; a chunk that fails on a suspend is lost with a log line | One path of code first; a suspend cannot fail, and the reserved area is not there yet |
 | 2026-11-11 | The lock of a chunk is replaced by ranges in flight in the tree of the cache, before runs | A run spans many chunks; one state machine in the driver instead of two |
 | 2026-11-11 | Metadata moves into an area per region of 4 MiB, packed 8 chunks to a sector, with room for a copy in the next region; it replaces metadata next to each chunk | SSDs and HDDs both; two CRCs keep a run two sequential requests; data aligned to 4 KiB; 1.6% instead of 12.5% |
+| 2026-11-14 | Metadata in RAM: the area of a region as the unit, a pool of its own, clean areas dropped by LRU and on a suspend, entries changed in place by the write back | No read before a metadata write, one lower read per chunk read; two pools, as one shared with data brings deadlocks and policies whose gain is not measured |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |

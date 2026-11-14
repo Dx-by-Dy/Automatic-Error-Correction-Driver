@@ -53,7 +53,16 @@ def device_exists(name):
     return run("dmsetup", "info", name, check=False).returncode == 0
 
 
-STATUS_FIELDS = ("map_waits", "free_waits", "busy_waits", "read_waits", "dirty", "failed")
+STATUS_FIELDS = (
+    "map_waits",
+    "free_waits",
+    "busy_waits",
+    "read_waits",
+    "dirty",
+    "failed",
+    "metadata_loads",
+    "metadata_waits",
+)
 
 
 def device_status(name=UPPER_NAME):
@@ -63,11 +72,25 @@ def device_status(name=UPPER_NAME):
     free_waits: writes that waited for a free entry of the cache;
     busy_waits: writes that waited for an entry under write back;
     read_waits: reads of the lower device that waited for the write back of their chunk;
-    dirty: entries with data not yet on the lower device; failed: entries whose write back failed.
+    dirty: entries with data not yet on the lower device; failed: entries whose write back failed;
+    metadata_loads: metadata areas of regions read from the lower device;
+    metadata_waits: waits for a metadata area to be let go, as all were in use.
     """
     fields = run("dmsetup", "status", name).stdout.split()
     assert fields[2] == "corrdm", fields
     return dict(zip(STATUS_FIELDS, map(int, fields[3:]), strict=True))
+
+
+def drop_metadata(name=UPPER_NAME):
+    """Makes the driver forget the metadata it keeps in RAM, as a suspend does.
+
+    A test that changes metadata on the lower device needs it, or the driver goes on with the copy.
+    After the resume udev reads the start and the end of the device, which reads the metadata of
+    the first and the last region again; the other regions stay out of RAM.
+    """
+    run("dmsetup", "suspend", name)
+    run("dmsetup", "resume", name)
+    run("udevadm", "settle")
 
 
 def pytest_terminal_summary(terminalreporter):
@@ -161,6 +184,9 @@ class Stack:
 
     def status(self):
         return device_status()
+
+    def drop_metadata(self):
+        drop_metadata()
 
     def map_waits(self):
         """How many times the driver made a read wait for a place among the parts in flight."""

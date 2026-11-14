@@ -4,54 +4,38 @@
 
 /// @brief Initializes struct trn_mr_rq
 /// @details
-/// Takes a page for the metadata from the page pool and sets up
-/// part->meta_bio to read the chunk metadata sector into it.
+/// Copies the entry of the chunk from the metadata cache, which reads the
+/// metadata area of the region first if it is not in RAM.
 ///
-/// Expected execution context - process, may sleep: waits for a page
-/// from the pool if memory is short, and never fails.
+/// Expected execution context - dm_map, may sleep: waits for the metadata
+/// area of the region, see metadata_get, and never fails to allocate.
 /// @param meta   Structure to initialize, inside part
 /// @param part   Parent struct trn_p_rq for chunk transformation
 /// @param dm_ctx Driver context
-void trn_mr_rq_init(struct trn_mr_rq *meta,
-                    struct trn_p_rq *part,
-                    struct dm_context *dm_ctx)
+/// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk does not read
+blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
+                            struct trn_p_rq *part,
+                            struct dm_context *dm_ctx)
 {
     DM_DEBUG("part=%p bio_sector=%llu\n", part, (unsigned long long)part->bio->bi_iter.bi_sector);
 
-    meta->first_sector = (u8)(align_data_sector(part->bio->bi_iter.bi_sector) - part->index);
+    meta->first_sector = (u8)(part->sector % DATA_SIZE_SECTORS);
     meta->nr_sectors = bio_sectors(part->bio);
     meta->part = part;
-    meta->metadata_page = mempool_alloc(dm_ctx->page_pool, GFP_NOIO);
-
-    metadata_bio_init(part, meta->metadata_page, 0, REQ_OP_READ);
 
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->first_sector, meta->nr_sectors);
-    DM_DEBUG_BIO(&part->meta_bio);
-}
 
-/// @brief Frees all resources of struct trn_mr_rq
-/// @details
-/// Releases the metadata bio and returns the page to the pool.
-///
-/// Expected execution context - process.
-/// @param meta Metadata transformation structure
-void complete_trn_mr_rq(struct trn_mr_rq *meta)
-{
-    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
-             meta, meta->first_sector, meta->nr_sectors);
-
-    bio_uninit(&meta->part->meta_bio);
-    mempool_free(meta->metadata_page, meta->part->dm_ctx->page_pool);
+    return metadata_copy_entry(dm_ctx->metadata, part->sector, &meta->md);
 }
 
 /// @brief Verifies CRC of read data against chunk metadata
 /// @details
 /// Runs as work in the transform_wq after successful completion
-/// of bio reading data and chunk metadata (both completed via trn_p_rq_end_io).
+/// of the bio reading the data, completed via trn_p_rq_end_io.
 ///
 /// Computes CRC64 for each data sector of bio,
-/// comparing the result with the corresponding record on disk.
+/// comparing the result with the copy of the entry of the chunk.
 /// On CRC mismatch, sets the status of the part
 /// and outputs error to the log.
 ///
@@ -64,8 +48,7 @@ void check_crc(struct trn_mr_rq *meta)
     DM_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
              part, meta->first_sector, meta->nr_sectors);
 
-    void *base = kmap_local_page(meta->metadata_page);
-    struct chunk_metadata *md = base + part->metadata_offset;
+    const struct chunk_metadata *md = &meta->md;
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = 0;
     u64 expected_crc = 0;
@@ -113,8 +96,6 @@ void check_crc(struct trn_mr_rq *meta)
     }
 
 out:
-    kunmap_local(base);
-
     if (crc_error)
     {
         DM_ERR("CRC mismatch at sector %llu (+%u on chunk): expected_crc=%llu, computed_crc=%llu\n",

@@ -35,8 +35,8 @@ in a run, **From reading** means it was only found in the code.
   misdirected write would pass the same way. Fix: mix the sector number into the seed.
 - **Data and CRC are not written atomically.** From reading: they are two independent bios, so
   after a power loss a chunk may have new data and an old CRC, and reads fail on data that
-  is fine. It is the same when the metadata bio of a partial write, its read of the old
-  metadata or its write of the new, fails after its data bio succeeded. Confirmed by the crash tests, which are strict `xfail` for it. Two CRCs are to be tried first, see
+  is fine. It is the same when the metadata bio of a write back fails after its data bio
+  succeeded. Confirmed by the crash tests, which are strict `xfail` for it. Two CRCs are to be tried first, see
   "Cache" in `ARCHITECTURE.md`.
 - **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
   operation other than read, write and an empty flush. Discard needs the "never written" state,
@@ -82,12 +82,14 @@ Carried over from the previous list.
 - **Move `first_sector` and `nr_sectors` into `struct trn_p_rq`.**
 - **Use preallocation where possible.**
 - **Use the Crypto API to speed up CRC64.**
-- **Metadata is not kept in RAM.** From reading: the cache holds only dirty data. A read of sectors not in the
-  cache reads the metadata sector of the chunk along with the data, also right after a write back, as a written
-  entry is freed at once (`cache_finish_entry`). Every write back reads the metadata sector first, as it holds
-  the entries of 8 chunks, so the metadata write waits for a lower read, and the write backs of the chunks of one
-  sector go one at a time. Two CRCs need the old CRCs of every chunk written back as well. Fix: keep metadata
-  sectors in RAM, clean and dirty, kept in step with write back; the next step of the cache.
+- **A read of a region whose metadata is not in RAM blocks `dm_map`.** By decision, for simplicity: the read of
+  the metadata area is waited for in `dm_map`, so a submitter with many requests in flight stalls for one lower
+  read each time a request comes to a new region. Fix: a list of the parts waiting for an area, started by the
+  end of its read.
+- **A metadata area whose read fails is read again by every request.** By decision, so that a sector that reads
+  again is seen: an area with failed sectors is not kept. On a failing device each request then costs a read of
+  64 KiB and one read per sector of the area. Fix, if it matters: keep the area and read again only its failed
+  sectors.
 - **A write to a chunk under write back waits.** By decision, for simplicity: a hot chunk stalls its writers
   for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does. A cheaper partial
   fix: a mask of the sectors under write back, so that only writes to those sectors wait.
@@ -126,9 +128,9 @@ Carried over from the previous list.
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
 2. **Cache.** Designed in `ARCHITECTURE.md`. Written so far: the cache with a write back of one chunk
-   at a time, kept apart from reads by the tree of reads in flight instead of chunk locks. Left, in this
-   order: metadata in an area per region, metadata in RAM, two CRCs, neighbouring chunks written back as
-   one bio, a place to plug in the reserved area, then the cause of the unstable test of memory.
+   at a time, kept apart from reads by the tree of reads in flight instead of chunk locks, metadata in an
+   area per region, and metadata in RAM. Left, in this order: two CRCs, neighbouring chunks written back
+   as one bio, a place to plug in the reserved area, then the cause of the unstable test of memory.
 3. **Integrity and format.** Old or new contents after a crash, superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
    write backs.

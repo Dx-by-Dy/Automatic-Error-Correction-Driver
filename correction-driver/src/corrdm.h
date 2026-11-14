@@ -11,16 +11,11 @@
 #include <linux/bvec.h>
 #include <linux/crc64.h>
 #include <linux/workqueue.h>
-#include <linux/mempool.h>
 #include <linux/semaphore.h>
 #include <linux/atomic.h>
 
 #include "bio_helper.h"
 #include "trn_p_rq.h"
-
-/// @brief Number of metadata pages kept in reserve for when memory is short
-/// @details A part takes one page, so any reserve lets parts go on one at a time.
-#define PAGE_POOL_RESERVE 128
 
 /// @brief Number of parts that may be in flight at once
 /// @details
@@ -31,12 +26,13 @@
 #define MAX_PARTS_IN_FLIGHT 4096
 
 struct cache;
+struct metadata_cache;
 
 /// @brief DM target context
 /// @details
 /// Created in dm_ctr and stored in ti->private.
 /// Contains all resources necessary for request processing:
-/// lower-level device, work queue, metadata page pool and the cache.
+/// lower-level device, work queue, the metadata cache and the data cache.
 struct dm_context
 {
     /// @brief Write back cache that every write goes through
@@ -48,8 +44,8 @@ struct dm_context
     /// @brief Work queue for asynchronous bio processing
     struct workqueue_struct *transform_wq;
 
-    /// @brief Pages for chunk metadata, one per part
-    mempool_t *page_pool;
+    /// @brief Metadata areas of the regions kept in RAM
+    struct metadata_cache *metadata;
 
     /// @brief Free places for parts in flight, MAX_PARTS_IN_FLIGHT at most
     /// @details Taken in dm_map, given back in complete_work before bio_endio.

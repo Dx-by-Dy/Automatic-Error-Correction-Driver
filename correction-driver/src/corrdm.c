@@ -1,5 +1,6 @@
 #include "corrdm.h"
 #include "cache.h"
+#include "metadata.h"
 #include "macros.h"
 
 MODULE_LICENSE("GPL");
@@ -18,12 +19,14 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// A write goes into the cache, see cache_write. A read takes from the cache
 /// what it holds, see cache_read; for the rest it is put into the tree of reads
 /// of the cache, takes a place among the parts in flight, initializes the
-/// trn_p_rq in the per-bio data of the bio and processes it asynchronously. It waits if MAX_PARTS_IN_FLIGHT parts are in
-/// flight, or for memory, which blocks the submitter as a full request queue of
-/// a disk would. Waiting belongs here and in the worker of the cache, never in
-/// transform_wq: its workers run the complete_work that gives places and
-/// memory back. dm_map never waits for a lower bio of its own, which stays on
-/// current->bio_list until it returns.
+/// trn_p_rq in the per-bio data of the bio and processes it asynchronously.
+/// It waits if MAX_PARTS_IN_FLIGHT parts are in flight, which blocks the
+/// submitter as a full request queue of a disk would, and while the metadata
+/// area of its region is read, see metadata_get. Waiting belongs here and in
+/// the worker of the cache, never in transform_wq: its workers run the
+/// complete_work that gives places back. dm_map never waits for a lower bio of
+/// its own, which stays on current->bio_list until it returns: the metadata
+/// area is read by a worker of the metadata cache.
 ///
 /// Other operations are refused: device mapper sends none of them, as the
 /// target does not offer them, and remapping one would bypass the CRC.
@@ -74,7 +77,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         down(&dm_ctx->parts_in_flight);
     }
 
-    trn_p_rq_init(part, bio, dm_ctx, TRANSFORM_READ);
+    trn_p_rq_init(part, bio, dm_ctx, TRANSFORM_READ, NULL);
     queue_work(dm_ctx->transform_wq, &part->submit_work);
     return DM_MAPIO_SUBMITTED;
 }
@@ -84,7 +87,7 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 /// Expects a single argument argv[0] — path to the lower-level device.
 ///
 /// Sequentially allocates and initializes all resources:
-/// work queue, metadata page pool, lower-level device and the cache.
+/// work queue, lower-level device, the metadata cache and the data cache.
 ///
 /// On error at any stage, frees all previously allocated resources
 /// in reverse order of allocation.
@@ -123,15 +126,6 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_alloc_workqueue;
     }
 
-    dm_ctx->page_pool = mempool_create_page_pool(PAGE_POOL_RESERVE, 0);
-    if (!dm_ctx->page_pool)
-    {
-        ti->error = "page pool alloc failed";
-        DM_ERR("mempool_create_page_pool failed\n");
-        r = -ENOMEM;
-        goto error_page_pool;
-    }
-
     sema_init(&dm_ctx->parts_in_flight, MAX_PARTS_IN_FLIGHT);
     atomic64_set(&dm_ctx->map_waits, 0);
 
@@ -153,14 +147,22 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_dm_get_device;
     }
 
+    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev);
+    if (IS_ERR(dm_ctx->metadata))
+    {
+        ti->error = "metadata cache alloc failed";
+        r = PTR_ERR(dm_ctx->metadata);
+        DM_ERR("metadata_cache_create failed, err=%d\n", r);
+        goto error_metadata;
+    }
+
     dm_ctx->cache = cache_create(dm_ctx);
     if (IS_ERR(dm_ctx->cache))
     {
         ti->error = "cache alloc failed";
         r = PTR_ERR(dm_ctx->cache);
         DM_ERR("cache_create failed, err=%d\n", r);
-        dm_put_device(ti, dm_ctx->dev);
-        goto error_dm_get_device;
+        goto error_cache;
     }
 
     ti->private = dm_ctx;
@@ -173,9 +175,11 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
     return 0;
 
+error_cache:
+    metadata_cache_destroy(dm_ctx->metadata);
+error_metadata:
+    dm_put_device(ti, dm_ctx->dev);
 error_dm_get_device:
-    mempool_destroy(dm_ctx->page_pool);
-error_page_pool:
     destroy_workqueue(dm_ctx->transform_wq);
 error_alloc_workqueue:
     kfree(dm_ctx);
@@ -197,8 +201,8 @@ static void dm_dtr(struct dm_target *ti)
     cache_destroy(dm_ctx->cache);
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
+    metadata_cache_destroy(dm_ctx->metadata);
     dm_put_device(ti, dm_ctx->dev);
-    mempool_destroy(dm_ctx->page_pool);
     kfree(dm_ctx);
 }
 
@@ -206,12 +210,15 @@ static void dm_dtr(struct dm_target *ti)
 /// @details
 /// Device mapper calls it before a table is replaced or destroyed, so nothing
 /// written is left behind in the cache, but chunks whose write back fails.
+/// Then forgets the metadata in RAM, as the device below may change before
+/// the device is resumed.
 /// @param ti DM target
 static void dm_target_postsuspend(struct dm_target *ti)
 {
     struct dm_context *dm_ctx = ti->private;
 
     cache_suspend(dm_ctx->cache);
+    metadata_drop(dm_ctx->metadata);
 }
 
 /// @brief Lets the cache write back by age again
@@ -229,7 +236,9 @@ static void dm_target_resume(struct dm_target *ti)
 /// reads in dm_map for a place among the parts in flight, waits of writes for a
 /// free entry of the cache, waits of writes for an entry under write back,
 /// reads that waited for the write back of their chunk, entries holding data
-/// not yet on the lower device, entries whose write back failed.
+/// not yet on the lower device, entries whose write back failed, metadata
+/// areas read from the lower device, waits for a metadata area when all were
+/// in use.
 /// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
@@ -247,12 +256,14 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->read_waits),
-               dirty, failed);
+               dirty, failed,
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->loads),
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->waits));
         break;
     case STATUSTYPE_TABLE:
     case STATUSTYPE_IMA:

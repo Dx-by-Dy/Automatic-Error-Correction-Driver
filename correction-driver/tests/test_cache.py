@@ -7,11 +7,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, make_lower
-from harness import DATA_SECTORS, SECTOR_SIZE, BlockDevice, metadata_sector, pattern, physical_sector, run
+from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, drop_metadata, make_lower
+from harness import (
+    DATA_SECTORS,
+    REGION_DATA_SECTORS,
+    SECTOR_SIZE,
+    BlockDevice,
+    metadata_sector,
+    pattern,
+    physical_sector,
+    run,
+)
 
+# In region 1: udev reads the start and the end of the device after it is resumed, so the metadata
+# of the first and the last region is back in RAM at once, and only that of the others is not.
 CHUNK = 5
-FIRST = CHUNK * DATA_SECTORS
+FIRST = REGION_DATA_SECTORS + CHUNK * DATA_SECTORS
 CACHE_MIB = 64
 AGE_SECONDS = 1
 WAIT_SECONDS = 10
@@ -149,13 +160,13 @@ class DelayedStack:
     The rest of the lower device is dm-linear, and writes to those sectors go down at once.
     dm-delay holds a bio back before it sends it, so a delayed read sees what was written meanwhile.
 
-    With the metadata sector of CHUNK delayed, every write back of the chunks of that sector reads
-    their old CRCs for a second. With the data of CHUNK delayed, a read of the chunk gets its CRCs
-    at once and its data a second later, so a write back that does not wait for the read lands in
-    between.
+    The first write reads the metadata of the region into RAM; the driver then forgets it, so that
+    the next to need it reads it again. With the metadata sector of CHUNK delayed, that read takes a
+    second. With the data of CHUNK delayed, a read of the chunk gets its CRCs at once and its data a
+    second later, so a write back that does not wait for the read lands in between.
     """
 
-    def __init__(self, slow, count, lower_mib=4):
+    def __init__(self, slow, count, lower_mib=12):
         sectors = lower_mib * 2048
         lower = make_lower(sectors)
         end = slow + count
@@ -171,6 +182,7 @@ class DelayedStack:
         self.original = pattern("original", DATA_SECTORS)
         self.upper.write(FIRST, self.original)
         self.upper.flush()
+        drop_metadata()
 
     def in_background(self, action):
         """Starts an I/O in another thread and gives it time to reach the lower device."""
@@ -216,10 +228,11 @@ def test_a_write_back_waits_for_a_read_in_flight(delayed_data):
     assert delayed.upper.read(FIRST, DATA_SECTORS) == new
 
 
-def test_the_write_backs_of_a_chunk_go_one_at_a_time(delayed):
-    """Sectors 1 and 5 are written back by two lower writes, each merging its CRC into the old ones.
+def test_the_write_backs_of_a_chunk_wait_for_its_metadata(delayed):
+    """Sectors 1 and 5 are written back by two lower writes, each merging its CRC into the others.
 
-    At once, both would read the old CRCs and the later one would undo the earlier.
+    Both wait for the metadata of the region to be read; without that, they would merge their CRCs
+    into what the memory held before, and the other sectors of the chunk would fail to read.
     """
     one, five = pattern("one", 1), pattern("five", 1)
     delayed.upper.write(FIRST + 1, one)
@@ -229,10 +242,11 @@ def test_the_write_backs_of_a_chunk_go_one_at_a_time(delayed):
     assert delayed.upper.read(FIRST, DATA_SECTORS) == expected
 
 
-def test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time(delayed):
+def test_the_write_backs_of_chunks_sharing_a_metadata_sector_wait_for_its_metadata(delayed):
     """CHUNK and the chunk after it keep their CRCs in one sector, and each write back merges into it.
 
-    At once, both would read the old sector and the later one would undo the CRCs of the earlier.
+    The write back of the neighbour also waits for the metadata of the region, which holds the
+    entry of CHUNK; without that, the sector would get whatever the memory held for it.
     """
     neighbour = pattern("neighbour", DATA_SECTORS)
     one = pattern("one", 1)

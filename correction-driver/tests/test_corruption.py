@@ -1,4 +1,8 @@
-"""Damage on the lower device is detected, and only where the damage is."""
+"""Damage on the lower device is detected, and only where the damage is.
+
+The driver keeps the metadata of the regions it used in RAM, so a test that damages metadata makes it
+read the metadata again, as it would after a suspend.
+"""
 
 import errno
 
@@ -62,6 +66,7 @@ def test_any_bit_of_a_sector_is_covered(stack, written, position):
 @pytest.mark.parametrize("in_chunk", range(DATA_SECTORS))
 def test_crc_corruption_fails_only_that_sector(stack, written, in_chunk):
     stack.lower.flip_bit(metadata_sector(FIRST), byte=metadata_offset(FIRST) + in_chunk * CRC_SIZE, bit=0)
+    stack.drop_metadata()
 
     assert_read_fails(stack.upper, FIRST + in_chunk)
     for current in range(DATA_SECTORS):
@@ -73,12 +78,14 @@ def test_crc_corruption_fails_only_that_sector(stack, written, in_chunk):
 def test_zeroed_metadata_is_detected(stack, written):
     """The scenario of the original tests.py, without damaging the entries of the neighbouring chunks."""
     stack.lower.patch(metadata_sector(FIRST), metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
+    stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
     assert stack.upper.read(FIRST + DATA_SECTORS) == sector_of(written, FIRST + DATA_SECTORS)
 
 
 def test_a_zeroed_metadata_sector_fails_every_chunk_it_covers(stack, written):
     stack.lower.write(metadata_sector(FIRST), bytes(SECTOR_SIZE))
+    stack.drop_metadata()
     for chunk_start in (FIRST - DATA_SECTORS, FIRST, FIRST + DATA_SECTORS):
         assert_read_fails(stack.upper, chunk_start, DATA_SECTORS)
 
@@ -86,6 +93,7 @@ def test_a_zeroed_metadata_sector_fails_every_chunk_it_covers(stack, written):
 def test_the_entry_of_a_neighbour_does_not_cover_this_chunk(stack, written):
     neighbour = FIRST + DATA_SECTORS
     stack.lower.flip_bit(metadata_sector(neighbour), byte=metadata_offset(neighbour), bit=0)
+    stack.drop_metadata()
     assert stack.upper.read(FIRST, DATA_SECTORS) == written[DATA_SECTORS * SECTOR_SIZE :][: DATA_SECTORS * SECTOR_SIZE]
     assert_read_fails(stack.upper, neighbour)
 
@@ -125,6 +133,7 @@ def test_corruption_is_detected_after_recreating_the_device(stack, written):
 def test_zeroed_chunk_is_detected(stack, written):
     stack.lower.write(physical_sector(FIRST), bytes(DATA_SECTORS * SECTOR_SIZE))
     stack.lower.patch(metadata_sector(FIRST), metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
+    stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
 
 
@@ -135,4 +144,5 @@ def test_chunk_copied_elsewhere_is_detected(stack, written):
     offset = metadata_offset(FIRST)
     entry = stack.lower.read(metadata_sector(FIRST))[offset : offset + METADATA_ENTRY_SIZE]
     stack.lower.patch(metadata_sector(target), metadata_offset(target), entry)
+    stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST + DATA_SECTORS, DATA_SECTORS)

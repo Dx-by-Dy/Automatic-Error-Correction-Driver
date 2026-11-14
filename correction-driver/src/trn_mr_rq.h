@@ -6,15 +6,15 @@
 #include <linux/bio.h>
 
 #include "alignment.h"
-#include "bio_helper.h"
+#include "metadata.h"
 
 struct trn_p_rq;
 struct dm_context;
 
 /// @brief Structure representing chunk metadata transformation on read
 /// @details
-/// Part of trn_p_rq for read operations. Holds the memory page into which
-/// part->meta_bio reads the chunk metadata sector.
+/// Part of trn_p_rq for read operations. Holds a copy of the entry of the
+/// chunk, taken from the metadata cache when the read is set up.
 struct trn_mr_rq
 {
     /// @brief Reference to the parent struct trn_p_rq for chunk transformation
@@ -28,21 +28,19 @@ struct trn_mr_rq
     /// Used to compute corresponding metadata for the request.
     u8 nr_sectors;
 
-    /// @brief Memory page to store read chunk metadata, from dm_context->page_pool
-    /// @details Used as a buffer for part->meta_bio.
-    struct page *metadata_page;
+    /// @brief Copy of the entry of the chunk, which the read checks the data against
+    struct chunk_metadata md;
 
     /// @brief Saved iter for bio from struct trn_p_rq
     /// @details Used to extract data from bio after its return
-    /// from the lower level and for further data analysis and CRC verification from metadata_page.
+    /// from the lower level and for further data analysis and CRC verification against md.
     /// Initialized by parent struct trn_p_rq during its initialization.
     struct bvec_iter saved_iter;
 };
 
-void trn_mr_rq_init(struct trn_mr_rq *meta,
-                    struct trn_p_rq *part,
-                    struct dm_context *dm_ctx);
-void complete_trn_mr_rq(struct trn_mr_rq *meta);
+blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
+                            struct trn_p_rq *part,
+                            struct dm_context *dm_ctx);
 void check_crc(struct trn_mr_rq *meta);
 
 #endif

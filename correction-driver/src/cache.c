@@ -5,14 +5,16 @@
 
 #include "corrdm.h"
 #include "cache.h"
+#include "metadata.h"
 #include "trn_p_rq.h"
 #include "macros.h"
 
 /// @brief Lower write of one run of dirty sectors of an entry
 /// @details
 /// The bio goes through the same path as a write did before the cache: a part
-/// in trn_p_rq writes the data and the metadata, merging the CRCs of the other
-/// sectors for a partial chunk. Jobs come from a table allocated in cache_create.
+/// in trn_p_rq writes the data and the metadata sector of the chunk, from the
+/// metadata area of its region in RAM, which the job holds until it ends. Jobs
+/// come from a table allocated in cache_create.
 struct cache_job
 {
     /// @brief Part that writes the bio, as the per-bio data of device mapper would hold it
@@ -29,6 +31,9 @@ struct cache_job
 
     /// @brief Cache of the entry
     struct cache *cache;
+
+    /// @brief Metadata area of the region of the chunk, held by the job
+    struct metadata_area *area;
 
     /// @brief Node in the list of free jobs, or in the queued list of the job in flight on its sector
     struct list_head list;
@@ -489,9 +494,10 @@ static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
 /// @brief Completion of a write back job
 /// @details
 /// complete_work of the part calls it through bio_endio, as the last thing it
-/// does. Starts the next job of the metadata sector, if one is queued, which
-/// takes its place in the tree of jobs in flight. The last job of an entry
-/// frees it, or marks it failed.
+/// does. Lets the metadata area go first, so that it can be dropped once the
+/// write backs are over. Starts the next job of the metadata sector, if one is
+/// queued, which takes its place in the tree of jobs in flight. The last job of
+/// an entry frees it, or marks it failed.
 ///
 /// Expected execution context - process, a worker of transform_wq.
 static void cache_job_end_io(struct bio *bio)
@@ -504,6 +510,7 @@ static void cache_job_end_io(struct bio *bio)
     struct cache_job *next;
 
     bio_uninit(bio);
+    metadata_put(cache->dm_ctx->metadata, job->area);
 
     spin_lock(&cache->lock);
     if (status && !entry->status)
@@ -548,13 +555,16 @@ static struct cache_job *cache_get_job(struct cache *cache)
 
 /// @brief Writes back one run of sectors of an entry
 /// @details
-/// The jobs of one metadata sector go one after another: a job reads the
-/// sector, merges the CRCs of its own sectors and writes it back, so two jobs
-/// of one sector at once would lose the CRCs of one of them. This holds for
-/// the jobs of one entry and for those of the neighbouring chunks that share
-/// the sector. The job starts at once if no job of its sector is in flight,
-/// and is queued on the job in flight otherwise; the end of the job before it
-/// starts it.
+/// Gets the metadata area of the region of the chunk first, which may wait
+/// while it is read.
+///
+/// The jobs of one metadata sector go one after another: a job puts its CRCs
+/// into the area in RAM and writes the sector from there, so a second job at
+/// once would change the memory under the write of the first, and the device
+/// below could get the CRCs of data not yet written. This holds for the jobs
+/// of one entry and for those of the neighbouring chunks that share the sector.
+/// The job starts at once if no job of its sector is in flight, and is queued
+/// on the job in flight otherwise; the end of the job before it starts it.
 static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
                              unsigned int first, unsigned int sectors)
 {
@@ -566,6 +576,7 @@ static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
 
     job->entry = entry;
     job->cache = cache;
+    job->area = metadata_get(dm_ctx->metadata, entry->chunk * DATA_SIZE_SECTORS);
     job->sector = entry->chunk / CHUNKS_PER_METADATA_SECTOR;
     INIT_LIST_HEAD(&job->queued);
 
@@ -576,7 +587,7 @@ static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
 
     // The worker may wait here: the completions that give places back run in transform_wq.
     down(&dm_ctx->parts_in_flight);
-    trn_p_rq_init(&job->part, bio, dm_ctx, TRANSFORM_WRITE);
+    trn_p_rq_init(&job->part, bio, dm_ctx, TRANSFORM_WRITE, job->area);
 
     spin_lock(&cache->lock);
     head = cache_find_sector(cache, job->sector);

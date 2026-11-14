@@ -1,6 +1,6 @@
 # Driver tests
 
-194 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+199 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 194 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 154 tests, about 4 minutes
+deploy/vm.sh test                                     # all 198 tests but the unstable one
+deploy/vm.sh test -m "not slow"                       # the fast ones: 159 tests, about 5 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -43,6 +43,12 @@ lower device, or damages it, flushes first. A failed write may be reported by th
 sectors for the copy of the metadata of the region before, 128 sectors of its own metadata and 8192 sectors
 of data; an entry of 8 CRCs of 8 bytes per chunk, 8 entries to a metadata sector. A change of layout has to be
 made there as well. `test_layout_of_the_first_chunks_of_two_regions` spells the positions out apart from it.
+
+**Metadata in RAM.** The driver keeps the metadata of the regions it used in RAM until a suspend, so a test that
+changes metadata on the lower device calls `drop_metadata()` from `conftest.py` afterwards, which suspends and
+resumes the device. udev reads the start and the end of a device when it is created and after each resume,
+which reads the metadata of the first and the last region again; the tests that count reads of metadata, or
+need it out of RAM, use region 1.
 
 **Kernel log.** Each test reads the kernel log it caused. An unknown `BUG`, `WARNING`, `Oops`, KASAN,
 UBSAN, lockdep or hung task report fails the test. `KNOWN_KERNEL_REPORTS` in `conftest.py` lists the
@@ -91,15 +97,16 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 
 ### `test_cache.py`: the write back cache (12 tests)
 
-What reaches the lower device and when, and what reads see before it does. The chunk under test is written
-and flushed first where the lower device has to hold it.
+What reaches the lower device and when, and what reads see before it does. The chunk under test is in region 1,
+and is written and flushed first where the lower device has to hold it.
 
 The last four tests put `dm-delay` under the driver for some sectors of the lower device: reads of them are
 answered a second late, writes at once, and the rest of the lower device is `dm-linear`. `dm-delay` holds a bio
-back before it sends it, so a delayed read sees what was written meanwhile. With the data of the chunk delayed,
-a read of it from the lower device has its CRCs at once and its data a second later. With its metadata sector
-delayed, every write back of the chunks of that sector reads the old CRCs for a second. So the races between
-reads and write backs, and between write backs, happen every time.
+back before it sends it, so a delayed read sees what was written meanwhile. The chunk is written, then the
+metadata in RAM dropped. With the data of the chunk delayed, a read of it from the lower device has its CRCs at
+once and its data a second later. With its metadata sector delayed, the first write back or read of the region
+waits a second for its metadata area. So the races between reads and write backs, and with the read of the
+metadata, happen every time.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
@@ -112,8 +119,8 @@ reads and write backs, and between write backs, happen every time.
 | `test_a_dirty_sector_reads_while_a_clean_one_is_damaged` | 1 | A damaged clean sector fails, the dirty one and the sectors before it read |
 | `test_writes_larger_than_the_cache_go_through` | 1 | `slow`: 96 MiB through a cache of 64 MiB, without a flush in between, all read back. Waits for free entries are not checked deterministically yet, see `TODO.md` |
 | `test_a_write_back_waits_for_a_read_in_flight` | 1 | Data delayed: a read of the chunk waits for its data while the chunk is written and flushed: the read gets the old data without an error, then the new data reads |
-| `test_the_write_backs_of_a_chunk_go_one_at_a_time` | 1 | Metadata delayed: sectors 1 and 5 written back by two lower writes, each reading the old CRCs: after the flush the whole chunk reads |
-| `test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
+| `test_the_write_backs_of_a_chunk_wait_for_its_metadata` | 1 | Metadata delayed: sectors 1 and 5 written back by two lower writes, which wait for the metadata area: after the flush the whole chunk reads |
+| `test_the_write_backs_of_chunks_sharing_a_metadata_sector_wait_for_its_metadata` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
 | `test_a_read_of_a_clean_sector_waits_for_the_write_back` | 1 | Metadata delayed: a read of sector 5 while sector 1 is written back waits for it, counted in `read_waits`, and reads the old data |
 
 ### `test_corruption.py`: damage is detected, and only where it is (29 tests)
@@ -162,7 +169,7 @@ The format is that of `replay-log` from xfstests, which is not needed.
 | `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
 | `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush and FUA write after `mkfs`. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA. With the cache a flush reaches the disk only after every write back before it, so nothing of the driver is in flight at these points |
 
-### `test_lower_errors.py`: the lower device fails (11 tests)
+### `test_lower_errors.py`: the lower device fails (13 tests)
 
 `dm-dust` with 512-byte blocks fails reads of chosen sectors of the lower device, and writes to them a
 chosen number of times; a write to such a sector clears it. One test loads `dm-flakey` in its place.
@@ -171,12 +178,28 @@ chosen number of times; a write to such a sector clears it. One test loads `dm-f
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_failed_data_sector_fails_only_its_reads` | 2 | First and last data sector: read one at a time, only that sector fails; a read over all the chunks fails; the first chunk reads correctly |
-| `test_failed_metadata_sector_fails_only_the_chunks_it_covers` | 1 | Every sector of the 8 chunks of that metadata sector fails, the other 8 chunks read |
-| `test_device_works_again_once_the_sector_reads` | 1 | A failed data and metadata sector, then cleared: everything reads back, no error state stays in the driver |
-| `test_write_fails_when_the_old_metadata_does_not_read` | 3 | A whole chunk, one sector, and a whole neighbouring chunk with its entry in the same sector: the write or its flush fails with `EIO`, as it reads the sector first; the other chunks read. What the chunk holds after it is open |
-| `test_failed_write_is_reported` | 2 | The data of a whole chunk or of one sector fails to write once: the write or its flush fails with `EIO`, the next one succeeds, the other chunks read. A failed metadata write needs `dm-flakey`, as `dm-dust` fails the read of the sector first |
+| `test_failed_metadata_sector_fails_only_the_chunks_it_covers` | 1 | Metadata dropped from RAM first: every sector of the 8 chunks of that metadata sector fails, the other 8 chunks read, as the failed read of the area is retried one sector at a time |
+| `test_device_works_again_once_the_sector_reads` | 1 | Metadata dropped from RAM first. A failed data and metadata sector, then cleared: everything reads back, no error state stays in the driver, an area that failed to read is not kept |
+| `test_write_fails_when_its_metadata_sector_does_not_read` | 3 | Metadata dropped from RAM first. A whole chunk, one sector, and a whole neighbouring chunk with its entry in the same sector: the write or its flush fails with `EIO`, as the sector holds the entries it has to keep; the other chunks read. What the chunk holds after it is open |
+| `test_failed_write_is_reported` | 4 | The data or the metadata sector of a whole chunk or of one sector fails to write once: the write or its flush fails with `EIO`, the next one succeeds, the other chunks read. The metadata is in RAM, so the write back does not read the sector, which `dm-dust` would fail too |
 | `test_writes_fail_while_reads_go_on` | 1 | `dm-flakey` with `error_writes`: whole, partial and crossing writes fail on their flush and stay in the cache, so they read back, and every flush fails; once `dm-linear` is back a flush writes them back and the device takes writes again |
 | `test_a_cache_full_of_failed_chunks_refuses_writes` | 1 | `dm-flakey` with `error_writes` under a device larger than the cache: writes of 1 MiB are taken in until every entry has failed, at most 64 MiB, then refused with `EIO`; what was taken in reads back, and reaches the lower device once `dm-linear` is back |
+
+### `test_metadata.py`: metadata in RAM (6 tests)
+
+What keeping the metadata of a region in RAM saves on the lower device, counted in `/sys/block/<lower>/stat`,
+and when the driver reads it again, counted in `metadata_loads` of `dmsetup status`. 64 areas are kept.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_a_write_back_reads_nothing_when_the_metadata_is_in_ram` | 1 | After a first write of the region, a one-sector write and a write of the neighbouring chunk, with their flushes, read nothing from the lower device; every sector reads with its CRC |
+| `test_a_read_takes_one_lower_read_when_the_metadata_is_in_ram` | 1 | A read of a chunk written before reads the lower device once, for its data |
+| `test_a_region_is_read_once` | 1 | Reads of 11 chunks of a region read its metadata once, a read in the next region once more |
+| `test_a_suspend_drops_the_metadata` | 1 | A second read of a region reads no metadata, a read after a suspend and resume does |
+| `test_the_least_recently_used_region_is_dropped` | 1 | 64 regions fill the areas, the first is used again, then a new region takes the place of the second, not the first |
+| `test_data_is_right_after_its_region_was_dropped` | 1 | A chunk and then one sector of it written in each of 66 regions, so areas are dropped and read again in between: after the metadata is dropped, every sector reads with its CRC |
+
+The fio tests on 512 MiB, 128 regions, drop and read areas again all the time.
 
 ### `test_lifecycle.py`: the device and the module come and go (4 tests)
 
@@ -185,14 +208,15 @@ chosen number of times; a write to such a sector clears it. One test loads `dm-f
 | `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds. Whether writes wait in `dm_map` for a free entry depends on the speed of the write back and is not checked, see `TODO.md` |
 | `test_table_reload_under_load` | 1 | `slow`: the same with `dmsetup reload` and `resume`, which builds a new target and destroys the old one |
 | `test_module_unloads_only_without_devices` | 1 | `rmmod` fails while a device exists, succeeds without one; loaded again, the device works |
-| `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: the rescuer threads of its two workqueues are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
+| `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: the rescuer threads of its three workqueues are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
 
 `kmemleak` does not catch everything here. A context left behind by `dm_dtr` was not reported in a minute of
 scans, and showed up only after more devices had come and gone. The likely reason: per-bio data is not cleared
 when a bio is allocated again, so bios in the reserves of the bio pools still hold the old `part->dm_ctx`, and
 `kmemleak` takes that for a reference. It also reports a leak only a few scans after it, so a leak from an
 earlier test of the same boot may show up in this one. The workqueues are checked directly for that reason.
-The pages of the cache come from `alloc_page`, which `kmemleak` does not track, and are not checked. The
+The pages of the cache and of the metadata in RAM come from `alloc_page`, which `kmemleak` does not track, and
+are not checked. The
 tables of the device are small enough for `kmalloc`, so `/proc/vmallocinfo` does not show them; it showed the
 lock table, which is gone.
 
@@ -222,16 +246,15 @@ lock table, which is gone.
 | `test_reads_and_writes_competing` | 3 | The same with `randrw`, `bs` of `512`, `4k`, `32k`, 8 jobs: no read gets a CRC error. With the cache a read rarely meets the write back of its chunk here, see `test_cache.py` |
 | `test_jobs_competing_beyond_the_worker_limit` | 6 | The same as the first with `32k/8`, `16k/32`, `1m/8`: more items than the workqueue runs at a time, which hangs if a worker ever sleeps on a chunk |
 
-### `test_memory.py`: I/O when memory is short (16 tests)
+### `test_memory.py`: I/O when memory is short (5 tests)
 
-Failures come from the kernel's fault injection (`failslab`, `fail_page_alloc`), limited to one thread and to
-allocations whose stack passes through given code. How the driver uses memory is in "Memory" in `README.md`.
+Failures come from the kernel's fault injection (`failslab`), limited to one thread and to allocations whose
+stack passes through given code. How the driver uses memory is in "Memory" in `README.md`. The two tests of the
+pool of metadata pages were removed with the pool: the I/O path takes no page any more.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_io_takes_nothing_from_slab_in_the_driver` | 2 | `read`, `write` and flush of 64 chunks while every slab allocation through the driver fails, for a write in any task, as the write back runs in the worker of the cache: no error and correct data |
-| `test_failed_page_allocation_does_not_fail_the_io` | 10 | `read`, `write` and flush of 64 chunks with one metadata page failing at a varying place, which must have happened: the reserve takes over, no error and correct data |
-| `test_write_goes_on_with_only_the_page_reserve` | 1 | All new metadata pages fail, and a write of 1 MiB and its flush, more pages than the reserve holds, must finish and read back |
 | `test_write_goes_on_with_only_the_bio_reserve` | 1 | `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
 | `test_ordinary_load_does_not_wait` | 1 | `fio` `randrw` with `bs=128k`, `iodepth=16`, at most 512 parts: `dmsetup status` shows no wait for a place among the parts in flight |
 | `test_memory_of_requests_in_flight_is_limited` | 1 | `slow`: `fio` with `bs=1m`, 8 jobs, `iodepth=128` takes less than 512 MiB more through the driver than on the lower device, and writes waited for a free entry of the cache. Measured before the cache: 1074 MiB on the lower device, 1052 MiB through the driver. `unstable`: no write waits when the whole file runs, see `TODO.md` |
@@ -280,7 +303,8 @@ DM splitting requests at chunk boundaries:
 | No `dm_set_target_max_io_len` | Failed, a kernel report | `test_data.py`, sixth test |
 | Reading the part after `bio_endio` in `complete_work` | **Not caught**, and KASAN reports nothing | `test_single_job[4k]` |
 
-Memory on the I/O path:
+Memory on the I/O path, checked when the metadata pages came from a pool; the tests of the pool are gone with
+it:
 
 | Change | Result | Where |
 | ------ | ------ | ----- |
@@ -319,6 +343,17 @@ Lifecycle, with `test_lifecycle.py`:
 | `cache_free` does not destroy the workqueue of the write back | Failed, one rescuer thread more | `test_nothing_leaks` |
 | `dm_dtr` does not destroy the workqueue | Failed, one rescuer thread more | `test_nothing_leaks` |
 | `dm_dtr` does not free the context | **Not caught**, see above | `test_nothing_leaks` |
+
+Metadata in RAM:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The driver before it (`1c44ae2`), with `test_metadata.py` | Failed, 6 | The two tests that count lower reads: 2 more for the two write backs, 2 lower reads for a read instead of 1; the other 4 for want of the counter |
+| An area let go goes to the head of the LRU, not the tail | Failed | `test_the_least_recently_used_region_is_dropped` |
+| No drop on suspend | Failed, 18 | `test_a_suspend_drops_the_metadata`, every test of damaged metadata in `test_corruption.py` (one of them an `XPASS(strict)`) and every test of a failed metadata read in `test_lower_errors.py` |
+| An area with failed sectors is kept | Failed, 4 | `test_device_works_again_once_the_sector_reads`, the 3 cases of `test_write_fails_when_its_metadata_sector_does_not_read` |
+| A failed read of an area marks all its sectors failed, without reading them one at a time | Failed | `test_failed_metadata_sector_fails_only_the_chunks_it_covers` |
+| Whoever starts the read of an area does not wait for it | Failed, 3 | The 3 tests of `test_cache.py` with the metadata delayed |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 

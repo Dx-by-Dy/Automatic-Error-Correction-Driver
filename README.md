@@ -64,15 +64,30 @@ new writes fail.
 1. Splitting the request into chunks;
 2. Copying each piece into the entry of its chunk in the cache, and completing it;
 3. Writing back the entry later, once no read of the chunk is in flight: one lower write per run of its dirty
-   sectors, each of which calculates the checksums, writes the data, reads the metadata sector of the chunk,
-   merges the new checksums into it and writes it back.
+   sectors, each of which calculates the checksums, puts them into the metadata of the region in RAM, and writes
+   the data and the metadata sector of the chunk from there. Nothing is read first.
 
 ### Read Path
 
 1. Splitting the request into chunks;
 2. Copying the sectors held in the cache, and completing them;
-3. For the others: registering the read in the cache, reading data and metadata, unregistering it,
-   calculating and verifying the checksums, completing the request.
+3. For the others: registering the read in the cache, copying the checksums of the chunk from the metadata of
+   its region in RAM, reading the data, unregistering it, calculating and verifying the checksums, completing
+   the request.
+
+### Metadata in RAM
+
+The driver keeps the metadata areas of the regions it used in RAM: 64 areas of 64 KiB, 4 MiB per device, which
+cover 256 MiB of data. The first read or write back that needs a region reads its whole area, in one request,
+on a workqueue of its own; whoever needs it meanwhile waits, `dm_map` included. Then reads and write backs of
+the region take the checksums from RAM, and a write back changes them there in place before it writes the
+sector. So the area always holds what the lower device holds, or is about to, and is never written as a whole.
+
+When another region needs a place, the area used longest ago that no write back holds is dropped. A suspend
+drops all of them, as the lower device may change before the device is resumed; damage done to metadata on
+the lower device is not seen until then. If the read of an area fails, its sectors are read one at a time, and
+only the chunks whose entries are in a failed sector fail; such an area is not kept, so the next request reads
+it again.
 
 ### Flushes
 
@@ -95,15 +110,16 @@ them apart, the way `dm-integrity` keeps its ranges in flight:
 * New reads of the clean sectors of an entry under write back wait in `dm_map`, so the reads of a chunk end.
   Reads of its dirty sectors are copied from the cache.
 * The lower writes of the chunks of one metadata sector go one at a time, those of one entry and of its
-  neighbours alike, as each merges its checksums into that sector: the end of one starts the next, without a
-  worker waiting.
+  neighbours alike, as each writes that sector from the same memory: a second one would change it under the
+  first, which could then carry the checksums of data not yet written. The end of one starts the next,
+  without a worker waiting.
 
 The cache has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O. Every
 read from the lower device takes it twice.
 
 ### Memory
 
-Nothing on the I/O path can fail to allocate. The cache, with its pages and 256 write back jobs, is allocated when the target is created. A part lives in the per-bio data of its bio, or in a write back job, with its metadata structure and its metadata bio embedded in it, and the page for the metadata sector comes from a mempool with a reserve of 128 pages. When memory is short, `dm_map` or the worker of the cache waits for a page that another part gives back; the workers of `transform_wq` never wait, as they run the completions that give it back.
+Nothing on the I/O path allocates memory. The cache, with its pages and 256 write back jobs, and the metadata in RAM, with its 64 areas, are allocated when the target is created. A part lives in the per-bio data of its bio, or in a write back job, with its metadata structure and its metadata bio embedded in it: a read keeps a copy of the entry of its chunk, a write writes its metadata sector from the area in RAM. `dm_map` and the worker of the cache wait for an area to be read, or to be let go when all are in use; the workers of `transform_wq` never wait, as they run the completions that let areas go.
 
 At most 4096 parts, reads and write back jobs, are in flight per device. A bio-based device has no request queue with tags, so `dm_map` and the worker wait for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
 
@@ -161,7 +177,7 @@ Show the counters:
 dmsetup status corrdm
 ```
 
-After the usual `<start> <length> corrdm`, it prints six counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, and the entries whose write back failed.
+After the usual `<start> <length> corrdm`, it prints eight counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, and how many times anything waited for a metadata area as all were in use.
 
 ## Usage
 

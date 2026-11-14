@@ -159,45 +159,6 @@ def test_io_takes_nothing_from_slab_in_the_driver(stack, injection, operation):
     assert stack.upper.read(0, SECTORS) == expected
 
 
-@pytest.mark.parametrize("interval", [1, 7, 13, 29, 53])
-@pytest.mark.parametrize("operation", ["read", "write"])
-def test_failed_page_allocation_does_not_fail_the_io(stack, injection, operation, interval):
-    """One metadata page fails to allocate at a varying place, and the reserve must take its place.
-
-    A request of 64 chunks takes 64 pages, so every interval here lands within it.
-    """
-    old, new = pattern(1, SECTORS), pattern(2, SECTORS)
-    written_and_flushed(stack, old)
-    injection.arm(
-        "fail_page_alloc", function_range("trn_p_rq_init"), interval=interval, this_thread=operation == "read"
-    )
-    if operation == "write":
-        outcome = injection.run(lambda: write_and_flush(stack.upper, new))
-        assert not isinstance(outcome, OSError), outcome
-        expected = new
-    else:
-        outcome = injection.run(lambda: stack.upper.read(0, SECTORS))
-        assert outcome == old
-        expected = old
-    assert injection.fired("fail_page_alloc"), "no allocation failed, so this tested nothing"
-    injection.disarm()
-    assert stack.upper.read(0, SECTORS) == expected
-
-
-def test_write_goes_on_with_only_the_page_reserve(stack, injection):
-    """All new metadata pages of this thread fail, so only the reserve of the driver is left.
-
-    A write of 1 MiB takes 256 pages, more than the reserve holds, so parts must wait for pages
-    that others give back, and it must still finish.
-    """
-    data = pattern(1, 2048)
-    injection.arm("fail_page_alloc", function_range("trn_p_rq_init"), times=-1, this_thread=False)
-    outcome = injection.run(lambda: write_and_flush(stack.upper, data))
-    assert outcome is not STUCK
-    assert not isinstance(outcome, OSError), outcome
-    assert injection.run(lambda: stack.upper.read(0, 2048)) == data
-
-
 @pytest.mark.slow
 def test_write_goes_on_with_only_the_bio_reserve(stack, injection):
     """All new bios of this thread fail, as when memory is short, so only the reserves are left.

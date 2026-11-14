@@ -70,14 +70,6 @@ static inline sector_t metadata_sector(sector_t sector)
            sector % REGION_DATA_SECTORS / DATA_SIZE_SECTORS / CHUNKS_PER_METADATA_SECTOR;
 }
 
-/// @brief Calculates where the metadata of the chunk of a logical sector is in its metadata sector
-/// @param sector Logical sector
-/// @return Offset in bytes of the entry of the chunk
-static inline unsigned int metadata_offset(sector_t sector)
-{
-    return (unsigned int)(sector / DATA_SIZE_SECTORS % CHUNKS_PER_METADATA_SECTOR) * METADATA_ENTRY_SIZE;
-}
-
 /// @brief Calculates available device capacity
 /// @details
 /// Whole regions, plus the whole chunks that fit into the last one after its

@@ -136,12 +136,12 @@ def kmemleak_reports_of_the_driver():
     return [leak for leak in leaks if f"[{MODULE}]" in leak]
 
 
-RESCUERS = ("kworker/R-transformation_wq", "kworker/R-corrdm_write_back")
+RESCUERS = ("kworker/R-transformation_wq", "kworker/R-corrdm_write_back", "kworker/R-corrdm_metadata")
 
 
 def resources_of_the_driver():
     """What a device of the driver holds that can be seen from outside: the rescuer threads of its
-    two workqueues. Other kworkers keep the name of the last workqueue they served, so only rescuers
+    three workqueues. Other kworkers keep the name of the last workqueue they served, so only rescuers
     count. Its tables are small enough for kmalloc, so they are not in /proc/vmallocinfo.
     """
     comms = run("ps", "-eo", "comm").stdout.split()
