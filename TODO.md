@@ -153,16 +153,17 @@ Carried over from the previous list.
    at a time, kept apart from reads by the tree of reads in flight instead of chunk locks, metadata in an
    area per region, metadata in RAM, and both copies of the metadata written, the trailing one after a flush.
    The two copies are the two CRCs: the leading one before the data, a flush before a chunk is written back
-   again, and a read of a chunk whose copies differ. Left, in this order: neighbouring chunks written back as
-   one bio, a place to plug in the reserved area, then the cause of the unstable test of memory.
+   again, and a read of a chunk whose copies differ. Left: the cause of the unstable test of memory.
 3. **Integrity and format.** Superblock and version, seed and
    position in the CRC after the threat research, discard, whether to add a reserved area for failed
-   write backs.
-4. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,
+   write backs, and the place in the cache where it plugs in.
+4. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
+   as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
+5. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,
    queue limits, the README.
-5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
+6. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
    the cache and for the cache.
-6. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
+7. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
    implement recovery.
-7. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
+8. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
    flight, guided by the baseline.

@@ -220,6 +220,13 @@ complexity and bugs.
   its own.
 - **A suspend cannot fail**, so a chunk that still fails to write when the device is suspended for a removal or
   a reload is lost, with its number in the kernel log. The reserved area will give it somewhere to go.
+- **Runs**, decided on 2026-11-14 and left until after the format: a run is a contiguous range of dirty
+  sectors inside one region, written as one FUA write of its range of leading metadata sectors, then one data
+  bio. A clean hole in a chunk breaks the run, with no read to fill it; dirty neighbours join it before they
+  are due by age; the longest run comes from `max_sectors` of the lower device; runs that share a metadata sector
+  at their ends go one after another. A failed run fails all its chunks. The limits, the age of neighbours and a
+  scheme without the queue (the leading copies of a batch, then all its data) are tuned in the optimization
+  stage.
 - **The lock of a chunk moved into the cache**, after the first version of the cache and before runs: a read of
   the lower device registers its range in the tree of the cache while in flight, and a write back waits for the
   reads in flight on its chunks, while new reads of their clean sectors wait for it. A run spans many chunks, and
@@ -321,4 +328,5 @@ it counts.
 | 2026-11-14 | Metadata in RAM: the area of a region as the unit, a pool of its own, clean areas dropped by LRU and on a suspend, entries changed in place by the write back | No read before a metadata write, one lower read per chunk read; two pools, as one shared with data brings deadlocks and policies whose gain is not measured |
 | 2026-11-14 | The two copies of the metadata are the two CRC slots: the leading copy is written with the write back, the trailing one after the flush that makes the data durable; both in RAM; a failed trailing write is counted and warned about, not failed | No change of format, the copy guards a lost sector in the steady state; only a crash together with a lost sector of the other copy is not covered |
 | 2026-11-14 | The leading copy is a FUA write before the data; a chunk written back since the last flush waits for a flush (a barrier); a chunk whose copies differ is read before its write back, and the matching CRC goes into the trailing copy with FUA | A completed write is not durable, so two write backs between flushes leave three versions for two slots; the read settles a crash left over without a superblock or an epoch |
+| 2026-11-14 | Runs move after the format stage, before the baseline; their shape is decided now. The place to plug in the reserved area moves into the format stage | Runs change no logic or guarantee, and the format may change what a write back writes; the baseline should measure the cache with them. The reserved area needs a superblock, and whether to have it is decided there |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |
