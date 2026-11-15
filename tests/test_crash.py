@@ -35,7 +35,7 @@ from logwrites import FLUSH, FUA, mark_index, read_log, replay
 LOWER_MIB = 32
 LOG_MIB = 128
 LOG_OFFSET_MIB = 256
-MOUNTPOINT = "/mnt/corrdm_crash"
+MOUNTPOINT = "/mnt/dcorr_crash"
 FILES = 8
 # test_ext4_survives_a_crash_at_any_flush checks every flush and every FUA_STRIDE-th FUA write.
 FUA_STRIDE = 4
@@ -69,7 +69,7 @@ class LoggedStack:
         return capacity(self.lower_sectors)
 
     def create_upper(self, lower):
-        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {self.lower_sectors} corrdm {lower}\n")
+        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {self.lower_sectors} dcorr {lower}\n")
         self.upper_path = f"/dev/mapper/{UPPER_NAME}"
 
     def mark(self, name):

@@ -162,7 +162,7 @@ def slow_writes():
     sectors = 2 * CACHE_MIB * 2048
     lower = make_lower(sectors)
     run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 0 {lower} 0 {WRITE_DELAY_MS}\n")
-    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
     upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
     yield upper
     upper.close()
@@ -210,7 +210,7 @@ class DelayedStack:
             f"{end} {sectors - end} linear {lower} {end}\n"
         )
         run("dmsetup", "create", FAULTY_NAME, stdin=table)
-        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
         self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
         self.threads = ThreadPoolExecutor(max_workers=1)
         self.original = pattern("original", DATA_SECTORS)

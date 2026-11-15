@@ -788,7 +788,7 @@ struct metadata_cache *metadata_cache_create(struct block_device *bdev, sector_t
     atomic64_set(&cache->settle_mismatches, 0);
 
     cache->areas = kvcalloc(METADATA_AREAS, sizeof(*cache->areas), GFP_KERNEL);
-    cache->wq = alloc_workqueue("corrdm_metadata", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    cache->wq = alloc_workqueue("dcorr_metadata", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     cache->chunk_page = alloc_page(GFP_KERNEL);
     if (!cache->areas || !cache->wq || !cache->chunk_page)
         goto error;

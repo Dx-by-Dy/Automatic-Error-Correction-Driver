@@ -59,7 +59,7 @@ class FaultyStack:
         self.lower = make_lower(sectors)
         self.lower_sectors = sectors
         run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} dust {self.lower} 0 512\n")
-        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
         self.sectors = capacity(sectors)
         self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
 

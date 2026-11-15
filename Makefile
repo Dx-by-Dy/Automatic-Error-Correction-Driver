@@ -1,6 +1,6 @@
-obj-m := correction_driver.o
+obj-m := dm-dcorr.o
 
-correction_driver-objs := src/corrdm.o src/bio_helper.o src/trn_p_rq.o src/trn_mw_rq.o src/trn_mr_rq.o src/cache.o src/metadata.o
+dm-dcorr-objs := src/dm-dcorr.o src/bio_helper.o src/trn_p_rq.o src/trn_mw_rq.o src/trn_mr_rq.o src/cache.o src/metadata.o
 
 ifdef DM_DEBUG_ENABLED
     ccflags-y += -DDM_DEBUG_ENABLED

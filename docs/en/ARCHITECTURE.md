@@ -1,8 +1,8 @@
 # Architecture
 
 Draft. This file holds the global decisions: what the driver protects against, what it promises to the layer
-above, the on-disk format and the shape of the I/O path. How the driver works today is in [README.md](README.md),
-what is not done yet is in [TODO.md](TODO.md), the reasons behind the decisions are in [RESEARCH.md](RESEARCH.md).
+above, the on-disk format and the shape of the I/O path. How the driver works today is in [README.md](../../README.md),
+what is not done yet is in [TODO.md](../../TODO.md), the reasons behind the decisions are in [RESEARCH.md](RESEARCH.md).
 
 Each point is marked:
 
@@ -110,7 +110,7 @@ the chunk is written.
 - There is no "never written" state. A device has to be zeroed before use; a chunk of zeros with zero metadata
   passes the check.
 - Only a lower device with 512-byte logical blocks works, as metadata is written as one 512-byte sector.
-- The tests have their own copy of the layout in `correction-driver/tests/harness.py`.
+- The tests have their own copy of the layout in `tests/harness.py`.
 
 **Decided** on 2026-11-11, replacing metadata next to each chunk. The driver is for SSDs and HDDs both, so the
 metadata lives in areas of its own, one per region, as in `dm-integrity`:
@@ -199,7 +199,7 @@ new CRCs merged in, with FUA, and the data bio once it completes. The parts of t
 sector go one at a time. A read takes the sectors the cache holds from it; the
 rest is a part in the per-bio data of its bio, registered in the tree of reads of the cache while in flight,
 which reads from the lower device and checks the CRC in a worker. Details are in
-[README.md](README.md).
+[README.md](../../README.md).
 
 **Decided**, why this has to change: upper bios are tied to lower bios one chunk at a time. A large request
 becomes many 4 KiB pieces, each with its own metadata request, and a read takes two lower requests per chunk.
@@ -322,7 +322,7 @@ it counts.
 
 **Decided:**
 
-- Everything runs in the development VM with a debug kernel, never on the host: [deploy/README.md](deploy/README.md).
+- Everything runs in the development VM with a debug kernel, never on the host: [deploy/README.md](../../deploy/README.md).
 - Crash consistency is tested with `dm-log-writes` below the driver, and a replay of its log in the tests
   (the format of `replay-log` from xfstests): the log holds every lower request with its flushes and FUA, and
   replaying a prefix of it to a clean device gives the state after a crash at that point. A crash right after

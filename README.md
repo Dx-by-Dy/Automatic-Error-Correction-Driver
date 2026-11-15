@@ -1,10 +1,10 @@
-# Automatic-Error-Correction-Driver
+# dm-dcorr
 
 Linux Device Mapper target providing block-level data integrity verification using CRC64 checksums.
 
 ## Overview
 
-Correction Driver is a Linux kernel module implemented as a Device Mapper target. The driver creates a virtual block device on top of an existing storage device and transparently intercepts read and write requests.
+dm-dcorr, disk correction, is a Linux kernel module implemented as a Device Mapper target. The driver creates a virtual block device on top of an existing storage device and transparently intercepts read and write requests.
 
 For each data block, the driver calculates a CRC64 checksum and stores it in a dedicated metadata area. During read operations, the checksum is recalculated and compared with the stored value, allowing detection of silent data corruption.
 
@@ -24,7 +24,7 @@ The project serves as a foundation for future implementation of Error Correcting
 ## Architecture
 
 The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
-[ARCHITECTURE.md](ARCHITECTURE.md). This section describes the driver as it is.
+[ARCHITECTURE.md](docs/en/ARCHITECTURE.md). This section describes the driver as it is.
 
 The virtual device is divided into chunks of 4 KiB, 8 sectors, and the chunks into regions of 1024 chunks,
 4 MiB of data, as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per
@@ -161,7 +161,7 @@ make
 The resulting module:
 
 ```text
-correction_driver.ko
+dm-dcorr.ko
 ```
 
 ## Installation
@@ -169,13 +169,13 @@ correction_driver.ko
 Load the module:
 
 ```bash
-sudo insmod correction_driver.ko
+sudo insmod dm-dcorr.ko
 ```
 
 Verify that the module is loaded:
 
 ```bash
-lsmod | grep correction_driver
+lsmod | grep dm_dcorr
 ```
 
 ## Device Mapper Setup
@@ -183,35 +183,35 @@ lsmod | grep correction_driver
 Example target creation:
 
 ```bash
-echo "0 <sectors> correction_driver <underlying_device>" | dmsetup create corrdm
+echo "0 <sectors> dcorr <underlying_device>" | dmsetup create dcorr
 ```
 
 Verify device creation:
 
 ```bash
-ls -l /dev/mapper/corrdm
+ls -l /dev/mapper/dcorr
 ```
 
 Show the counters:
 
 ```bash
-dmsetup status corrdm
+dmsetup status dcorr
 ```
 
-After the usual `<start> <length> corrdm`, it prints thirteen counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy, how many times it flushed before writing back a chunk written back since the last flush, how many chunks it read before a write back as their two copies of the metadata differed, and how many sectors so read matched neither copy or did not read.
+After the usual `<start> <length> dcorr`, it prints thirteen counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy, how many times it flushed before writing back a chunk written back since the last flush, how many chunks it read before a write back as their two copies of the metadata differed, and how many sectors so read matched neither copy or did not read.
 
 ## Usage
 
 Create a filesystem:
 
 ```bash
-mkfs.ext4 /dev/mapper/corrdm
+mkfs.ext4 /dev/mapper/dcorr
 ```
 
 Mount:
 
 ```bash
-mount /dev/mapper/corrdm /mnt/test
+mount /dev/mapper/dcorr /mnt/test
 ```
 
 Unmount:
@@ -223,14 +223,14 @@ umount /mnt/test
 Remove Device Mapper target:
 
 ```bash
-dmsetup remove corrdm
+dmsetup remove dcorr
 ```
 
 ## Testing
 
 The driver is built, loaded and tested only in a development VM with a debug kernel, never on the host:
 see [deploy/README.md](deploy/README.md). The tests are described in
-[correction-driver/tests/README.md](correction-driver/tests/README.md).
+[tests/README.md](tests/README.md).
 
 ### Write and Read Benchmarks
 
@@ -238,7 +238,7 @@ Uncompetitive write benchmark:
 
 ```bash
 fio --name=test                               \
-    --filename=/dev/mapper/corrdm             \
+    --filename=/dev/mapper/dcorr             \
     --rw=write                                \
     --bs=16k                                  \
     --direct=1                                \
@@ -253,7 +253,7 @@ Competitive write benchmark:
 
 ```bash
 fio --name=test                               \
-    --filename=/dev/mapper/corrdm             \
+    --filename=/dev/mapper/dcorr             \
     --rw=write                                \
     --bs=16k                                  \
     --direct=1                                \
@@ -268,7 +268,7 @@ Uncompetitive read benchmark:
 
 ```bash
 fio --name=test                               \
-    --filename=/dev/mapper/corrdm             \
+    --filename=/dev/mapper/dcorr             \
     --rw=read                                 \
     --bs=16k                                  \
     --direct=1                                \
@@ -283,7 +283,7 @@ Competitive read benchmark:
 
 ```bash
 fio --name=test                               \
-    --filename=/dev/mapper/corrdm             \
+    --filename=/dev/mapper/dcorr             \
     --rw=read                                 \
     --bs=16k                                  \
     --direct=1                                \
@@ -296,7 +296,7 @@ fio --name=test                               \
 
 ## Performance Characteristics
 
-See [docs](/docs/full_docs.pdf).
+See [docs](docs/ru/full_docs.pdf).
 
 ## Current Status
 

@@ -17,7 +17,7 @@ from harness import pattern, run
 
 TRACING = "/sys/kernel/tracing"
 EVENT = f"{TRACING}/events/block/block_bio_queue/enable"
-MOUNTPOINT = "/mnt/corrdm_durability"
+MOUNTPOINT = "/mnt/dcorr_durability"
 FS_LOWER_MIB = 64
 CACHE_AGE_SECONDS = 1
 

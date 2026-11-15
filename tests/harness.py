@@ -5,7 +5,7 @@ import os
 import signal
 import subprocess
 
-HANG_FILE = "/run/corrdm-tests.hung"
+HANG_FILE = "/run/dcorr-tests.hung"
 HANG_EXIT_CODE = 3
 KILL_GRACE_SECONDS = 20
 FIO_SECONDS = 300

@@ -67,6 +67,6 @@ cmd_status() {
     fi
     echo "SSH: ssh -i $VM_DIR/id_ed25519 -p $SSH_PORT $GUEST_USER@127.0.0.1"
     gssh 'echo "Kernel: $(uname -r)"
-        lsmod | grep -q "^correction_driver " && echo "Driver: loaded" || echo "Driver: not loaded"
-        echo "Device: $(sudo dmsetup table corrdm 2>/dev/null || echo none)"'
+        lsmod | grep -q "^dm_dcorr " && echo "Driver: loaded" || echo "Driver: not loaded"
+        echo "Device: $(sudo dmsetup table dcorr 2>/dev/null || echo none)"'
 }

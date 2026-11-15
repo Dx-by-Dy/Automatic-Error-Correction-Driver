@@ -9,7 +9,7 @@ from harness import run
 
 FILE_MIB = 128
 LOWER_MIB = 512
-MOUNTPOINT = "/mnt/corrdm_test"
+MOUNTPOINT = "/mnt/dcorr_test"
 
 
 def sha256(path):

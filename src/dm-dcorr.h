@@ -1,5 +1,5 @@
-#ifndef CORRECTION_DRIVER_H
-#define CORRECTION_DRIVER_H
+#ifndef DM_DCORR_H
+#define DM_DCORR_H
 
 #include <linux/module.h>
 #include <linux/device-mapper.h>

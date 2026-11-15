@@ -11,8 +11,8 @@ import pytest
 from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove
 from harness import fio, run
 
-MODULE = "correction_driver"
-MODULE_FILE = Path(__file__).resolve().parents[1] / f"{MODULE}.ko"
+MODULE = "dm_dcorr"  # as lsmod shows it; the file has a dash
+MODULE_FILE = Path(__file__).resolve().parents[1] / "dm-dcorr.ko"
 KMEMLEAK = "/sys/kernel/debug/kmemleak"
 LOAD_MIB = 64
 SUSPEND_LOAD_MIB = 480  # with its metadata, within the first 512 MiB of the test disk
@@ -136,7 +136,7 @@ def kmemleak_reports_of_the_driver():
     return [leak for leak in leaks if f"[{MODULE}]" in leak]
 
 
-RESCUERS = ("kworker/R-transformation_wq", "kworker/R-corrdm_write_back", "kworker/R-corrdm_metadata")
+RESCUERS = ("kworker/R-transformation_wq", "kworker/R-dcorr_write_back", "kworker/R-dcorr_metadata")
 
 
 def resources_of_the_driver():

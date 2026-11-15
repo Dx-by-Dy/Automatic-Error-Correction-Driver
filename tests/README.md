@@ -1,7 +1,7 @@
 # Driver tests
 
 222 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
-as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../../deploy/README.md).
+as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
 
@@ -27,11 +27,11 @@ pytest through `deploy/vm/guest.sh`. Logs go to `~/vms/corrdm/logs/`: the test o
 ## How a test runs
 
 **Device.** The `stack` fixture gives each test a new device, `make_stack(lower_mib)` one of a chosen
-size. The stack is `corrdm-test` (the driver) on `corrdm-test-lower` (`dm-linear` over the start of
+size. The stack is `dcorr-test` (the driver) on `dcorr-test-lower` (`dm-linear` over the start of
 `/dev/vdb`). The lower device is zeroed first, 16 MiB by default. Two files build stacks of their own, with a
-third layer between the two: `test_crash.py` puts `dm-log-writes` there (`corrdm-test-log`, its log on
-`corrdm-test-logdev` at 256 MiB of `/dev/vdb`), `test_lower_errors.py` puts `dm-dust` or `dm-flakey` there
-(`corrdm-test-faulty`).
+third layer between the two: `test_crash.py` puts `dm-log-writes` there (`dcorr-test-log`, its log on
+`dcorr-test-logdev` at 256 MiB of `/dev/vdb`), `test_lower_errors.py` puts `dm-dust` or `dm-flakey` there
+(`dcorr-test-faulty`).
 
 **I/O.** `BlockDevice` in `harness.py` reads and writes whole sectors with `O_DIRECT`. The page cache
 would hide reads from the driver, and a buffered write to the lower device writes a whole 4 KiB block
@@ -302,7 +302,7 @@ that window would go unseen.
 ## Do the tests catch bugs?
 
 Checked by breaking the driver on purpose, in the copy inside the VM, and running the fast tests with
-`deploy/vm.sh test --no-sync`, see [deploy/README.md](../../deploy/README.md):
+`deploy/vm.sh test --no-sync`, see [deploy/README.md](../deploy/README.md):
 
 | Change | Failed | Where |
 | ------ | ------ | ----- |

@@ -5,7 +5,7 @@
 #include <linux/workqueue.h>
 #include <linux/list.h>
 
-#include "corrdm.h"
+#include "dm-dcorr.h"
 #include "cache.h"
 #include "alignment.h"
 #include "trn_mw_rq.h"

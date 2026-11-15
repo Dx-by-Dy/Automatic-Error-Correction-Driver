@@ -1,4 +1,4 @@
-#include "corrdm.h"
+#include "dm-dcorr.h"
 #include "cache.h"
 #include "metadata.h"
 #include "macros.h"
@@ -283,7 +283,7 @@ static void dm_status(struct dm_target *ti, status_type_t type,
 }
 
 static struct target_type target = {
-    .name = "corrdm",
+    .name = "dcorr",
     .version = {1, 0, 0},
     .module = THIS_MODULE,
     .ctr = dm_ctr,

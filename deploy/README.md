@@ -24,7 +24,7 @@ deploy/vm.sh stop
   the kernel console in `serial.log`, the console of the boot before in `serial.prev.log`.
 - The working tree is copied to `~/corrdm` in the VM, including uncommitted changes. Edit on the host, not in
   the VM: the next sync overwrites the copy.
-- The tests are described in [correction-driver/tests/README.md](../correction-driver/tests/README.md).
+- The tests are described in [tests/README.md](../tests/README.md).
 
 ## The test disk
 
@@ -90,7 +90,7 @@ To check that the tests catch a bug, break the copy in the VM and test it withou
 
 ```bash
 deploy/vm.sh sync
-deploy/vm.sh ssh                       # edit ~/corrdm/correction-driver/src/ in the VM
+deploy/vm.sh ssh                       # edit ~/corrdm/src/ in the VM
 deploy/vm.sh test --no-sync -m "not slow"
 deploy/vm.sh sync                      # restore the copy
 ```

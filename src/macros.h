@@ -1,4 +1,4 @@
-#define DM_MSG_PREFIX "correction-driver"
+#define DM_MSG_PREFIX "dcorr"
 
 #define DM_ERR(fmt, ...) \
     pr_err("[ERROR] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)

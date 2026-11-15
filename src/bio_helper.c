@@ -1,5 +1,5 @@
 #include "bio_helper.h"
-#include "corrdm.h"
+#include "dm-dcorr.h"
 #include "macros.h"
 
 /// @brief Sets up the metadata bio of a part

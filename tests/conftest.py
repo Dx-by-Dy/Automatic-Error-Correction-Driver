@@ -1,4 +1,4 @@
-"""Fixtures: a fresh corrdm device per test, and a check of the kernel log around each test.
+"""Fixtures: a fresh dcorr device per test, and a check of the kernel log around each test.
 
 Tests run as root in the development VM, see deploy/vm.sh. Each device sits on a small
 dm-linear region of the test disk, so zeroing it for every test stays fast.
@@ -18,14 +18,14 @@ import pytest
 from harness import BlockDevice, capacity, declare_hang, run
 
 TEST_DISK = "/dev/vdb"
-REINIT_DEVICE = "corrdm"
-LOWER_NAME = "corrdm-test-lower"
-UPPER_NAME = "corrdm-test"
+REINIT_DEVICE = "dcorr"
+LOWER_NAME = "dcorr-test-lower"
+UPPER_NAME = "dcorr-test"
 # The crash tests put dm-log-writes between the driver and the lower device, with a log of its own.
-LOG_NAME = "corrdm-test-log"
-LOG_DEVICE_NAME = "corrdm-test-logdev"
+LOG_NAME = "dcorr-test-log"
+LOG_DEVICE_NAME = "dcorr-test-logdev"
 # The tests of lower device errors put dm-dust or dm-flakey there.
-FAULTY_NAME = "corrdm-test-faulty"
+FAULTY_NAME = "dcorr-test-faulty"
 # Removed in this order, the devices on top first.
 TEST_DEVICES = (UPPER_NAME, LOG_NAME, FAULTY_NAME, LOG_DEVICE_NAME, LOWER_NAME)
 DEFAULT_LOWER_MIB = 16
@@ -75,7 +75,7 @@ STATUS_FIELDS = (
 
 
 def device_status(name=UPPER_NAME):
-    """The counters of the driver in dmsetup status, see dm_status in corrdm.c.
+    """The counters of the driver in dmsetup status, see dm_status in dm-dcorr.c.
 
     map_waits: reads that waited in dm_map for a place among the parts in flight;
     free_waits: writes that waited for a free entry of the cache;
@@ -91,7 +91,7 @@ def device_status(name=UPPER_NAME):
     settle_mismatches: sectors so read that matched neither copy, or did not read.
     """
     fields = run("dmsetup", "status", name).stdout.split()
-    assert fields[2] == "corrdm", fields
+    assert fields[2] == "dcorr", fields
     return dict(zip(STATUS_FIELDS, map(int, fields[3:]), strict=True))
 
 
@@ -134,8 +134,8 @@ def environment():
         pytest.exit("not a virtual machine, refusing to overwrite the test disk", returncode=2)
     if os.geteuid() != 0:
         pytest.exit("the tests must run as root", returncode=2)
-    if "corrdm" not in run("dmsetup", "targets").stdout:
-        pytest.exit("the corrdm target is not loaded, run: deploy/vm.sh reinit", returncode=2)
+    if "dcorr" not in run("dmsetup", "targets").stdout:
+        pytest.exit("the dcorr target is not loaded, run: deploy/vm.sh reinit", returncode=2)
     for name in (*TEST_DEVICES, REINIT_DEVICE):
         if device_exists(name):
             dmsetup_remove(name)
@@ -204,7 +204,7 @@ def read_kmsg(fd):
 
 @dataclass
 class Stack:
-    """A corrdm device on top of a fresh, zeroed lower device."""
+    """A dcorr device on top of a fresh, zeroed lower device."""
 
     lower_sectors: int
     lower_path: str
@@ -237,7 +237,7 @@ class Stack:
                 device.close()
 
     def recreate_upper(self):
-        """Removes the corrdm device and creates it again on the same data."""
+        """Removes the dcorr device and creates it again on the same data."""
         self.upper.close()
         dmsetup_remove(UPPER_NAME)
         run("dmsetup", "create", UPPER_NAME, stdin=self.table)
@@ -261,7 +261,7 @@ def make_stack():
     def create(lower_mib=DEFAULT_LOWER_MIB):
         sectors = lower_mib * 2048
         lower_path = make_lower(sectors)
-        table = f"0 {sectors} corrdm {lower_path}\n"
+        table = f"0 {sectors} dcorr {lower_path}\n"
         run("dmsetup", "create", UPPER_NAME, stdin=table)
         stack = Stack(sectors, lower_path, f"/dev/mapper/{UPPER_NAME}", table)
         stack.open()

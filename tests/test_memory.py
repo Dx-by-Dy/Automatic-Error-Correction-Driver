@@ -21,7 +21,7 @@ STUCK = object()
 
 SECTORS = 64 * DATA_SECTORS
 
-# MAX_PARTS_IN_FLIGHT in src/corrdm.h.
+# MAX_PARTS_IN_FLIGHT in src/dm-dcorr.h.
 MAX_PARTS_IN_FLIGHT = 4096
 LIMIT_LOWER_MIB = 64
 LIMIT_READ_MIB = 32
@@ -54,7 +54,7 @@ def driver_range():
     addresses = [
         address
         for address, kind, _, module in text_symbols()
-        if kind in "tT" and module == ["[correction_driver]"]
+        if kind in "tT" and module == ["[dm_dcorr]"]
     ]
     return min(addresses), max(addresses) + 4096
 
@@ -195,7 +195,7 @@ def slow_reads():
     sectors = LIMIT_LOWER_MIB * 2048
     lower = make_lower(sectors)
     run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 {READ_DELAY_MS} {lower} 0 0\n")
-    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} corrdm /dev/mapper/{FAULTY_NAME}\n")
+    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
     upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
     for region in range(-(-LIMIT_READ_MIB * 2048 // REGION_DATA_SECTORS)):
         upper.read(region * REGION_DATA_SECTORS)

@@ -14,7 +14,7 @@ REPEATS = 10
 SSD_LABEL = "SSD"
 
 DEVICES = {
-    "corrdm": "/dev/mapper/corrdm",
+    "dcorr": "/dev/mapper/dcorr",
     "vdb": "/dev/vdb",
 }
 

@@ -1,9 +1,9 @@
 # TODO
 
 How the driver works is in [README.md](README.md) and `docs/`; the global decisions (threat model,
-contract, format, cache) are in [ARCHITECTURE.md](ARCHITECTURE.md); how to build and
+contract, format, cache) are in [ARCHITECTURE.md](docs/en/ARCHITECTURE.md); how to build and
 run it is in [deploy/README.md](deploy/README.md); the tests are described in
-[correction-driver/tests/README.md](correction-driver/tests/README.md). This file holds only what is
+[tests/README.md](tests/README.md). This file holds only what is
 not done yet.
 The order of work is in [Stages](#stages), at the end.
 
@@ -60,7 +60,7 @@ in a run, **From reading** means it was only found in the code.
 
 ## Device Mapper integration
 
-- **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 corrdm` with no
+- **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 dcorr` with no
   arguments, as `.status` gives nothing for `STATUSTYPE_TABLE`, so the table cannot be saved and
   reloaded. `dmsetup status` has only the counters of waits and of dirty and failed entries of the
   cache; counters such as CRC mismatches do not exist yet.
@@ -122,6 +122,18 @@ Carried over from the previous list.
   trailing copy is written, so random writes over many regions without flushes from above cost a flush of the
   lower device every 16 regions. Counted in `dmsetup status`. Fix, if it matters: more areas, or a pin that
   does not hold the whole area.
+- **A chunk written back again before a flush forces a flush (a barrier).** By decision, see "On-disk format" in
+  `ARCHITECTURE.md`: after a write back the drive may hold the old or the new version of each sector until a
+  flush, and a second write back would make a third with two slots of metadata. Counted as `barriers`. Options,
+  asked about by the user on 2026-11-15:
+  - **Keep such a chunk dirty until the next flush instead of forcing one**, the choice of the user: the newer
+    data waits in the cache, so the drive never holds more than the old and the new version, and the flush
+    that comes anyway (from above, or of the trailing copies) settles it. Under memory pressure the worker may
+    still have to flush.
+  - Take the barrier only where the sectors of the two write backs overlap; the code takes it for the whole
+    chunk. Helps partial writes, not full rewrites of a chunk.
+  - FUA data writes, after which the trailing copy can take the new CRC at once: cheap on SSDs with power loss
+    protection, slow on HDDs.
 - **A write to a chunk under write back waits.** By decision, for simplicity: a hot chunk stalls its writers
   for the length of a lower write. Fix: a second copy of the chunk, as `dm-writecache` does. A cheaper partial
   fix: a mask of the sectors under write back, so that only writes to those sectors wait.
@@ -136,8 +148,7 @@ Carried over from the previous list.
 
 ## Documentation
 
-- **The README uses the wrong target name.** Confirmed: it says `correction_driver`, the target is
-  `corrdm`, so its `dmsetup create` command fails. It also passes a length that is not used.
+- **The README passes a length that is not used**, see "The table length is ignored".
 - **The README claims functional testing is done**, and does not mention the VM.
 - **`MODULE_DESCRIPTION` says "Linux Kernel 6.16"**, while the driver builds on 7.1 and 7.2.
 

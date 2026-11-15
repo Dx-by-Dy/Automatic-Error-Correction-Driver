@@ -1,5 +1,5 @@
 #!/bin/bash
-# Development VM for the corrdm driver: the latest Fedora with its debug kernel
+# Development VM for the dm-dcorr driver: the latest Fedora with its debug kernel
 # (KASAN, lockdep, UBSAN, kmemleak), plain QEMU, reachable over SSH on localhost.
 # The driver is only ever loaded inside this VM, never on the host. See deploy/README.md.
 #

@@ -3,7 +3,7 @@
 #include <linux/highmem.h>
 #include <linux/slab.h>
 
-#include "corrdm.h"
+#include "dm-dcorr.h"
 #include "cache.h"
 #include "metadata.h"
 #include "trn_p_rq.h"
@@ -934,7 +934,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
 
     cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
     cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);
-    cache->wq = alloc_ordered_workqueue("corrdm_write_back", WQ_MEM_RECLAIM);
+    cache->wq = alloc_ordered_workqueue("dcorr_write_back", WQ_MEM_RECLAIM);
     if (!cache->entries || !cache->job_table || !cache->wq)
         goto error;
 
