@@ -86,23 +86,36 @@ the chunk is written.
 
 **Current.** Version 1, not final: nothing has been released, so a change of format needs no migration yet.
 
-- The lower device is `[area of copy 0 | regions 0 .. M - 1 | area of copy 1 | regions M .. R - 1]`, with
-  `M = R / 2`, as `src/dcorr-format.h` computes it for the driver and `dcorrsetup` both. An area is a header
-  of 4 KiB and the blocks of the bitmap of written chunks, 4 KiB with a header of 32 bytes for 32512 chunks
-  each, rounded up to 1 MiB. The header holds magic, version, the number of the copy, a generation, flags, a
+- The lower device is a sequence of **groups** of one size, a power of two from 16 MiB to 4 GiB, 1 GiB by
+  default (`dcorrsetup format --group-size`), as `src/dcorr-format.h` computes it for the driver and
+  `dcorrsetup` both. A group is `[header of 1 MiB | as many whole regions as fit | unused]`: 248 regions at
+  1 GiB and nothing unused, 1 to 3.6 MiB unused at the other sizes. The last group may be short, with the same
+  header and at least 2 regions; a smaller tail of the device is not used. At least 2 groups.
+- The header of group `g` holds a full copy of the superblock with the number of the group, the leading copy
+  of the bitmap of written chunks of `g`, the trailing copy of the one of `g - 1` (of the last group for group
+  0), and two blocks for the dirty stripes of the parity, zeroed until the correction stage defines them; the
+  rest is reserved. The superblock is 4 KiB: magic, version, the number of the group, a generation, flags, a
   UUID, a salt, the size of the lower device, the capacity, all parameters of the layout and a CRC64 over it.
-- `dcorrsetup format` writes both areas, with empty bitmaps of generation 1, and nothing else. The driver
-  reads both headers in the constructor, never writes them, takes the valid one with the larger generation,
-  warns about a copy that is not valid, and refuses the device when neither is, when its size is not the one
-  formatted for, or when the length of the table is not the capacity. Two regions at least; the bitmap and
-  the salt are not used yet.
+  A block of a bitmap is 4 KiB with a header of 32 bytes (CRC, generation, group, index, role) for 32512
+  slots; its CRC starts from the salt, so a block of another device does not pass.
+- **Parity columns.** The slots of a group, numbered across its regions, are cut into 32 columns of equal
+  length, 32 slots per region of the group. The first 30 hold the data, in order; the last 2 are kept for P+Q
+  parity, a stripe being the same offset in every column, and are not part of the capacity. A parity slot is an
+  ordinary slot with its own metadata. The capacity is 7680 sectors per region; 930 MiB per group of 1 GiB.
+- `dcorrsetup format` writes the header of every group, with empty bitmaps of generation 1, and wipes the
+  starts of group 1 of the smaller sizes, where an old format would have left a copy; nothing else. The driver
+  reads the superblocks of groups 0 and 1 in the constructor, never writes them, takes the valid one with the
+  larger generation, warns about a copy that is not valid, and refuses the device when neither is, when its
+  size is not the one formatted for, or when the length of the table is not the capacity. With group 0 not
+  valid, the start of group 1 is probed for each size of a group. The other headers, the bitmap and the salt
+  are not used yet.
 - A chunk is 8 data sectors, 4 KiB. Its metadata is an entry of 64 bytes: 8 `__le64` values, `crc64_be` of
   each data sector with a zero seed, in order. A metadata sector holds the entries of 8 neighbouring chunks.
-- The data is a sequence of regions, as in `dm-integrity`. A region holds 1024 chunks, 4 MiB of data,
-  and is laid out as `[trailing copy of the metadata of the region before | leading copy of this region |
-  data]`: 128 sectors, 128 sectors, 8192 sectors, 8448 in all. The trailing copy of the last region goes into
-  region 0. The leading copy and the data of a region are one contiguous range, and the data stays aligned to
-  4 KiB.
+- The slots of a group are a sequence of regions, as in `dm-integrity`. A region holds 1024 slots of a chunk,
+  4 MiB, and is laid out as `[trailing copy of the metadata of the region before | leading copy of this region |
+  slots]`: 128 sectors, 128 sectors, 8192 sectors, 8448 in all. The trailing copy of the last region of a group
+  goes into the first region of the same group. The leading copy and the slots of a region are one contiguous
+  range, and the data stays aligned to 128 KiB on the device; the header and the groups are aligned to 1 MiB.
 - The leading copy is written with each write back of a chunk, with FUA, and the data only once it
   completes; the trailing one after the lower device has flushed that write back, and the device is flushed
   again. Once everything is flushed both copies are equal. A read accepts a sector that matches either, so
@@ -115,8 +128,6 @@ the chunk is written.
   every chunk read or written with one copy. A sector failed in both copies fails the reads of its 8 chunks,
   and the writes to them, as a write needs the other entries of the sector. A trailing sector that fails to
   write is counted in `dmsetup status`; it does not fail a flush, as the data and the leading copy are there.
-- The last region may be shorter: it keeps its whole metadata area and as many whole chunks as fit. The
-  capacity is 8192 sectors per whole region, plus the chunks of the last one.
 - There is no "never written" state yet. A device has to be zeroed before it is formatted; a chunk of zeros
   with zero metadata passes the check.
 - Only a lower device with 512-byte logical blocks works, as metadata is written as one 512-byte sector.
@@ -179,8 +190,8 @@ writing its leading copy over a trailing one that does not match the data would 
   part of the area of the superblock and is kept in both its copies; when a bit reaches the device against the
   flushes is settled in the plan of the stage.
 - **The superblock in two copies**, an idea of the user: at the start of the lower device and at a region
-  boundary in its middle, so that a lost range rarely takes both. The number and the places of the copies are to
-  become a choice at format time. Each copy names itself: magic, version, number of the copy, generation, CRC.
+  boundary in its middle, so that a lost range rarely takes both. Each copy names itself: magic, version, number
+  of the copy, generation, CRC. Replaced later on 2026-11-15 by a copy in every group, see below.
 - **All layout parameters live in the superblock**: the chunk, the region, the places of the copies, the size of
   the bitmap. Version 1 accepts only the current values, so the I/O path keeps its constants for now.
 - **A device is formatted by a utility in userspace, in C**, which writes the superblock to the lower device, as
@@ -347,6 +358,24 @@ it counts.
   (`dm-flakey` with `drop_writes`) are to be tested in the format stage: a lost write is detected once the flush
   after its write back has passed, and passes as the old contents before it.
 
+**Decided** on 2026-11-15, an idea of the user, replacing the copy of the superblock in the middle: **groups.**
+
+- **The device is a sequence of groups of one size**, each with a header and whole regions, the trailing copies
+  of the metadata cycling inside the group. Growing adds groups of the same size, so recovery of the
+  superblock probes the start of group 1 for each size of the list. A header of a fixed 1 MiB, chosen by the
+  user: the groups stay aligned to 1 MiB, and the header keeps room for later versions. Whole regions only, the
+  rest of a group unused, also the choice of the user, to be looked at in the optimization stage.
+- **A full copy of the superblock in every group**, with the number of the group, so that a header in the wrong
+  place is seen. The constructor reads only groups 0 and 1; the others are to be checked when the bitmap reads
+  every header.
+- **The bitmap of written chunks of a group** leads in its header and trails in the header of the next group,
+  as the metadata of the regions does.
+- **Parity in fixed columns at the end of each group, P+Q over 30 + 2**, RAID 4 inside a group without
+  rotation, chosen by both: a damaged range shorter than a column takes at most one member of a stripe, two
+  across a column boundary, which two parity members cover. Data stays contiguous in the first 30/32 of a
+  group, so runs and the mapping stay simple. How and when parity is updated is for the correction stage; the
+  space is reserved now, so that the layout does not change when ECC comes.
+
 ## Decision log
 
 | Date | Decision | Why |
@@ -370,3 +399,4 @@ it counts.
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |
 | 2026-11-15 | The threat model is settled: zeroed ranges and misdirected writes in scope, lost writes in scope where the layout detects them; the CRC stays per 512-byte sector; the seed is nonzero, with the logical sector and a salt per device; a bitmap of written chunks in the superblock and in RAM; no reserved area | [Drive failures](RESEARCH.md#drive-failures): a write error reaching the host means the spare of the drive is gone; shorn writes come in units of 512 bytes; the seed costs nothing; the bitmap lies apart from the data it describes, an idea of the user |
 | 2026-11-15 | The superblock in two copies, at the start and in the middle; all layout parameters in it, version 1 accepting only the current values; the bitmap part of it; formatting by a utility in C, control through `dmsetup message` | Two places far apart on an HDD; a format open to change without variables on the I/O path; formatting in userspace, as in `dm-integrity`, keeps the constructor simple |
+| 2026-11-15 | Groups of 16 MiB to 4 GiB, 1 GiB by default, each a header of 1 MiB with a full superblock and the bitmaps, and whole regions; parity reserved in 2 of 32 columns at the end of each group; the constructor reads groups 0 and 1 and probes group 1 for every size | A superblock in every group survives a lost range and allows growing; parity far from its data within a group, room for ECC now so the layout does not change; the user chose the fixed header and whole regions |

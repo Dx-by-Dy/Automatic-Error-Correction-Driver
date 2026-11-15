@@ -34,9 +34,21 @@ in a run, **From reading** means it was only found in the code.
 - **A damaged copy of the superblock stays damaged.** By decision, for now: the driver never writes the header,
   and warns about a copy that is not valid each time the device is created. Fix: write it from the other copy,
   in the driver or with a command of `dcorrsetup`.
+- **Only the superblocks of groups 0 and 1 are read.** By decision on 2026-11-15: the constructor reads those
+  two, and the copies in the headers of the other groups are never checked, so damage to them is not seen
+  until they are needed, by recovery or by growing. Fix: check every header in step 2 of the format stage,
+  when the bitmap is read from every one, with a counter and a warning; or a `dcorrsetup check`.
+- **A stale copy of group 1 in the data can win the probe.** From reading: with group 0 damaged the driver
+  takes the first valid copy of group 1 for any size of a group, from the smallest. `dcorrsetup format` wipes
+  the starts of group 1 of the smaller sizes, but data written later that holds the image of such a
+  superblock for the same device size, a dump of the lower device stored on it, would be taken as well.
+  Fix, if it matters: prefer the copy that agrees with other groups, or ask the user to name the size.
 - **The device cannot grow.** By decision on 2026-11-15: the size of the lower device must be the one it was
-  formatted for, as copy 1 of the superblock and the regions after it lie where that size puts them. Fix: a
-  feature of its own, moving copy 1 and the regions after it.
+  formatted for. Fix: a feature of its own, adding groups of the same size, as `xfs_growfs` does, rewriting
+  every superblock and one trailing copy of the bitmap.
+- **The unused end of every group is lost.** By decision on 2026-11-15: a group holds whole regions only, so
+  1 to 3.6 MiB of a group of a size other than 1 GiB is not used, and so is a tail of the device shorter than
+  a header and two regions. Fix, if it matters: short regions, in the optimization stage.
 - **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
   another chunk reads back without an error, as the sector number is not part of the CRC. A
   misdirected write would pass the same way, and so would a table whose offset is wrong by a whole number of
@@ -160,8 +172,8 @@ Carried over from the previous list.
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
 2. **Integrity and format.** The bitmap of written chunks for "never written", a nonzero seed with the logical
-   sector and a salt, discard and write zeroes, a test of lost writes. The threat model was settled and the
-   superblock written on 2026-11-15; no reserved area.
+   sector and a salt, discard and write zeroes, a test of lost writes. The threat model was settled, the
+   superblock written and the device laid out in groups with room for parity on 2026-11-15; no reserved area.
 3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
 4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits, the

@@ -9,13 +9,13 @@ from pathlib import Path
 import pytest
 
 from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove
-from harness import fio, run
+from harness import fio, lower_mib_for_capacity, run
 
 MODULE = "dm_dcorr"  # as lsmod shows it; the file has a dash
 MODULE_FILE = Path(__file__).resolve().parents[1] / "dm-dcorr.ko"
 KMEMLEAK = "/sys/kernel/debug/kmemleak"
 LOAD_MIB = 64
-SUSPEND_LOAD_MIB = 480  # with its metadata, within the first 512 MiB of the test disk
+SUSPEND_LOAD_MIB = 480
 CYCLES_PAUSE = 0.2
 KMEMLEAK_MIN_AGE_SECONDS = 6
 # kmemleak reported a leak only some scans after it, a few seconds apart.
@@ -67,7 +67,7 @@ def under_load(stack, action, **options):
 
 @pytest.fixture
 def loaded(make_stack):
-    return make_stack(LOAD_MIB + 8)
+    return make_stack(lower_mib_for_capacity(LOAD_MIB))
 
 
 @pytest.mark.slow
@@ -83,7 +83,7 @@ def test_suspend_and_resume_under_load(make_stack):
         run("dmsetup", "suspend", UPPER_NAME)
         run("dmsetup", "resume", UPPER_NAME)
 
-    stack = make_stack(SUSPEND_LOAD_MIB + 8)
+    stack = make_stack(lower_mib_for_capacity(SUSPEND_LOAD_MIB))
     area = f"{SUSPEND_LOAD_MIB // 4}m"
     options = {"bs": "1m", "iodepth": 128, "size": area, "offset_increment": area, "loops": 1}
     assert under_load(stack, suspend_and_resume, **options) > 0
@@ -161,7 +161,7 @@ def test_nothing_leaks(make_stack):
         pytest.fail("kmemleak is not available, see KERNEL_ARGS in deploy/vm/config.sh")
     kmemleak("clear")
     before = resources_of_the_driver()
-    stack = make_stack(LOAD_MIB + 8)
+    stack = make_stack(lower_mib_for_capacity(LOAD_MIB))
     verified_load(stack.upper_path, loops=1)
     during = resources_of_the_driver()
     assert all(now > then for now, then in zip(during, before)), (before, during)

@@ -28,7 +28,6 @@ from conftest import (
 from harness import (
     CHUNKS_PER_METADATA_SECTOR,
     DATA_SECTORS,
-    REGION_DATA_SECTORS,
     BlockDevice,
     capacity,
     lower_mib_for_regions,
@@ -36,13 +35,14 @@ from harness import (
     metadata_sectors,
     pattern,
     physical_sector,
+    region_sector,
     run,
 )
 
-# A whole region and a short one, with copy 1 of the superblock between them; the trailing copy of
-# region 0 is in region 1. dm-dust takes an empty flush, whose sector is 0, for a write to block 0,
-# which clears a bad block 0 or fails the flush: block 0 is the superblock, which is never made bad.
-LOWER_MIB = 9
+# Two groups of 16 MiB; the trailing copy of region 0 is in region 1. dm-dust takes an empty flush,
+# whose sector is 0, for a write to block 0, which clears a bad block 0 or fails the flush: block 0 is
+# the superblock of group 0, which is never made bad.
+LOWER_MIB = 32
 CACHE_MIB = 64
 # Two metadata sectors of chunks: BAD_CHUNK and its neighbours share the first.
 CHUNKS = 2 * CHUNKS_PER_METADATA_SECTOR
@@ -204,7 +204,7 @@ def test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy():
         faulty.fail(lead)
         drop_metadata()
         for region in range(1, regions):
-            faulty.upper.read(region * REGION_DATA_SECTORS, DATA_SECTORS)
+            faulty.upper.read(region_sector(region, faulty.lower_sectors), DATA_SECTORS)
         first = BAD_CHUNK * DATA_SECTORS
         new = pattern("after", DATA_SECTORS)
         flushed_write(faulty.upper, first, new)
@@ -333,7 +333,7 @@ def test_a_cache_full_of_failed_chunks_refuses_writes():
 
     What was taken in stays readable, and reaches the lower device once it takes writes again.
     """
-    faulty = FaultyStack(CACHE_MIB + 32)
+    faulty = FaultyStack(2 * CACHE_MIB)  # 90 MiB on top, more than the cache takes
     try:
         faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
         accepted = 0

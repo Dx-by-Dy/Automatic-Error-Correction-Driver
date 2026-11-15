@@ -41,8 +41,10 @@ READ_DELAY_MS = 1000
 SETTLE_SECONDS = 0.3
 # Every write to the lower device waits this long on the stack with slow writes.
 WRITE_DELAY_MS = 5
-# The size of the lower device of DelayedStack.
-DELAYED_LOWER_MIB = 12
+# The size of the lower device of DelayedStack: two groups.
+DELAYED_LOWER_MIB = 32
+# A lower device whose capacity, 135 MiB, holds more than the 96 MiB the tests write past the cache.
+LARGE_LOWER_MIB = 3 * CACHE_MIB
 
 
 def on_lower(stack, logical=FIRST, count=DATA_SECTORS):
@@ -157,7 +159,7 @@ def test_writes_larger_than_the_cache_go_through(make_stack):
     Whether one writer of 1 MiB at a time outruns the write back depends on the speed of the lower
     device, so the waits for free entries are checked on a slow one, in the next test.
     """
-    stack = make_stack(2 * CACHE_MIB)
+    stack = make_stack(LARGE_LOWER_MIB)
     mib = 3 * CACHE_MIB // 2
     blocks = [os.urandom(1 << 20) for _ in range(mib)]
     for index, block in enumerate(blocks):
@@ -170,7 +172,7 @@ def test_writes_larger_than_the_cache_go_through(make_stack):
 @pytest.fixture
 def slow_writes():
     """The driver on dm-delay, which holds every write to the lower device back WRITE_DELAY_MS."""
-    sectors = 2 * CACHE_MIB * 2048
+    sectors = LARGE_LOWER_MIB * 2048
     lower = make_lower(sectors)
     run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 0 {lower} 0 {WRITE_DELAY_MS}\n")
     create_dcorr(f"/dev/mapper/{FAULTY_NAME}", sectors)

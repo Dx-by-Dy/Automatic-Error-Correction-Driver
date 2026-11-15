@@ -244,7 +244,7 @@ static void metadata_load_held(struct metadata_cache *cache, struct metadata_are
 /// @return The area, VALID and held
 struct metadata_area *metadata_get(struct metadata_cache *cache, sector_t sector)
 {
-    sector_t region = sector / REGION_DATA_SECTORS;
+    sector_t region = sector_region(cache->layout, sector);
     struct metadata_area *area;
 
     spin_lock(&cache->lock);
@@ -341,7 +341,7 @@ blk_status_t metadata_copy_entries(struct metadata_cache *cache, sector_t sector
                                    struct chunk_metadata md[METADATA_COPIES])
 {
     struct metadata_area *area = metadata_get(cache, sector);
-    unsigned int index = metadata_area_sector(sector);
+    unsigned int index = metadata_area_sector(area, sector);
     blk_status_t status = BLK_STS_OK;
     bool single;
 
@@ -385,14 +385,14 @@ blk_status_t metadata_copy_entries(struct metadata_cache *cache, sector_t sector
 void metadata_written(struct metadata_cache *cache, struct metadata_area *area, sector_t sector,
                       u8 mask, bool ok)
 {
-    unsigned int chunk = (unsigned int)(sector % REGION_DATA_SECTORS / DATA_SIZE_SECTORS);
+    unsigned int chunk = metadata_area_chunk(area, sector);
 
     spin_lock(&cache->lock);
     __set_bit(chunk, area->written);
     if (ok)
     {
         area->sectors[chunk] |= mask;
-        __clear_bit(metadata_area_sector(sector), area->bad[METADATA_LEAD]);
+        __clear_bit(metadata_area_sector(area, sector), area->bad[METADATA_LEAD]);
     }
     if (!ok)
         __set_bit(chunk, area->write_failed);
@@ -411,7 +411,7 @@ bool metadata_written_since_flush(struct metadata_cache *cache, struct metadata_
     bool written;
 
     spin_lock(&cache->lock);
-    written = test_bit((unsigned int)(sector % REGION_DATA_SECTORS / DATA_SIZE_SECTORS), area->written);
+    written = test_bit(metadata_area_chunk(area, sector), area->written);
     spin_unlock(&cache->lock);
 
     return written;
@@ -609,8 +609,8 @@ static int metadata_read_chunk(struct metadata_cache *cache, sector_t sector)
 /// @param mask   Sectors of the chunk the write back will write
 void metadata_settle(struct metadata_cache *cache, struct metadata_area *area, sector_t sector, u8 mask)
 {
-    unsigned int index = metadata_area_sector(sector);
-    unsigned int chunk = (unsigned int)(sector % REGION_DATA_SECTORS / DATA_SIZE_SECTORS);
+    unsigned int index = metadata_area_sector(area, sector);
+    unsigned int chunk = metadata_area_chunk(area, sector);
     struct chunk_metadata md[METADATA_COPIES];
     u8 differ = 0;
     u8 to_trail = 0;

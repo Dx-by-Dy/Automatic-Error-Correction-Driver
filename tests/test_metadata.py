@@ -14,7 +14,15 @@ regions between them.
 import os
 
 from conftest import wait_for_write_back
-from harness import DATA_SECTORS, REGION_DATA_SECTORS, SECTOR_SIZE, lower_mib_for_regions, metadata_sectors, pattern
+from harness import (
+    DATA_SECTORS,
+    REGION_DATA_SECTORS,
+    SECTOR_SIZE,
+    lower_mib_for_regions,
+    metadata_sectors,
+    pattern,
+    region_sector,
+)
 
 # METADATA_AREAS and METADATA_CROWDED in src/metadata.h.
 METADATA_AREAS = 32
@@ -89,9 +97,9 @@ def test_a_region_is_read_once(make_stack):
     stack.drop_metadata()
     first = loads(stack)
     for chunk in range(0, REGION_DATA_SECTORS // DATA_SECTORS, 97):
-        stack.upper.read(REGION_DATA_SECTORS + chunk * DATA_SECTORS, DATA_SECTORS)
+        stack.upper.read(region_sector(1, stack.lower_sectors) + chunk * DATA_SECTORS, DATA_SECTORS)
     assert loads(stack) == first + 1
-    stack.upper.read(2 * REGION_DATA_SECTORS, DATA_SECTORS)
+    stack.upper.read(region_sector(2, stack.lower_sectors), DATA_SECTORS)
     assert loads(stack) == first + 2
 
 
@@ -117,7 +125,7 @@ def test_the_least_recently_used_region_is_dropped(make_stack):
     stack.drop_metadata()
 
     def read_region(region):
-        stack.upper.read(region * REGION_DATA_SECTORS, DATA_SECTORS)
+        stack.upper.read(region_sector(region, stack.lower_sectors), DATA_SECTORS)
 
     for region in range(1, last):
         read_region(region)
@@ -136,18 +144,22 @@ def test_data_is_right_after_its_region_was_dropped(make_stack):
     """Chunks written in more regions than there are areas read back right once they are read again."""
     regions = METADATA_AREAS + 2
     stack = make_stack(lower_mib_for_regions(regions))
+
+    def start(region):
+        return region_sector(region, stack.lower_sectors) + CHUNK * DATA_SECTORS
+
     for region in range(regions):
-        written_and_flushed(stack, region * REGION_DATA_SECTORS + FIRST, pattern(region, DATA_SECTORS))
+        written_and_flushed(stack, start(region), pattern(region, DATA_SECTORS))
     for region in range(regions):
         partial = pattern(f"partial {region}", 1)
-        written_and_flushed(stack, region * REGION_DATA_SECTORS + FIRST + 3, partial)
+        written_and_flushed(stack, start(region) + 3, partial)
     assert loads(stack) > regions, "no area was dropped, so this tested nothing"
     stack.drop_metadata()
     for region in range(regions):
         expected = bytearray(pattern(region, DATA_SECTORS))
         expected[3 * 512 : 4 * 512] = pattern(f"partial {region}", 1)
         for index in range(DATA_SECTORS):
-            sector = region * REGION_DATA_SECTORS + FIRST + index
+            sector = start(region) + index
             assert stack.upper.read(sector) == expected[index * 512 :][:512], f"region {region}, sector {index}"
 
 
@@ -162,7 +174,7 @@ def test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned(make_stack)
     stack = make_stack(lower_mib_for_regions(regions + 2))
 
     def start(region):
-        return region * REGION_DATA_SECTORS + CHUNK * DATA_SECTORS
+        return region_sector(region, stack.lower_sectors) + CHUNK * DATA_SECTORS
 
     for region in range(1, METADATA_CROWDED - 2):
         stack.upper.write(start(region), pattern(region, DATA_SECTORS))

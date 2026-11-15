@@ -26,40 +26,48 @@ The project serves as a foundation for future implementation of Error Correcting
 The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
 [ARCHITECTURE.md](docs/en/ARCHITECTURE.md). This section describes the driver as it is.
 
-The lower device starts with a superblock, written by `dcorrsetup format`, and holds a second copy of it in
-the middle. The virtual device is divided into chunks of 4 KiB, 8 sectors, and the chunks into regions of 1024
-chunks, 4 MiB of data, as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per
-sector, 64 bytes; a metadata sector holds the entries of 8 neighbouring chunks. The metadata of a region is
-kept in two copies: the leading one next to its data, the trailing one in the next region.
+The lower device is a sequence of groups of one size, 1 GiB by default, each with a header of 1 MiB written by
+`dcorrsetup format`: a copy of the superblock and the bitmaps of written chunks. The virtual device is divided
+into chunks of 4 KiB, 8 sectors, and the slots of the chunks on the lower device into regions of 1024, 4 MiB,
+as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per sector, 64 bytes; a
+metadata sector holds the entries of 8 neighbouring chunks. The metadata of a region is kept in two copies: the
+leading one next to its slots, the trailing one in the next region of the group.
 
 ### Layout
 
 ```text
-+-----------+-----------------+-----------+-------------------+
-| area of   | regions         | area of   | regions           |
-| copy 0    | 0 .. M - 1      | copy 1    | M .. R - 1        |
-+-----------+-----------------+-----------+-------------------+
-                                              M = R / 2
+lower device
++---------+---------+-----+-------------+
+| group 0 | group 1 | ... | group G - 1 |    the last group may be short
++---------+---------+-----+-------------+
 
-region 0                                  region 1
-+-----------+-----------+-------------+   +-----------+-----------+-------------+
-| trailing  | leading   | data        |   | trailing  | leading   | data        |
-| region N  | region 0  | 1024 chunks |   | region 0  | region 1  | 1024 chunks | ...
-| 128 sect. | 128 sect. | 8192 sect.  |   | 128 sect. | 128 sect. | 8192 sect.  |
-+-----------+-----------+-------------+   +-----------+-----------+-------------+
+group of 1 GiB
++--------+-----------+-----------+-----+-------------+
+| header | region 0  | region 1  | ... | region 247  |    other sizes leave the end of the group unused
+| 1 MiB  | 4.125 MiB | 4.125 MiB |     | 4.125 MiB   |
++--------+-----------+-----------+-----+-------------+
+ slots of the group in 32 columns: 30 of data, in order, then 2 kept for parity
+
+region i of a group
++------------+------------+-------------+
+| trailing   | leading    | slots       |
+| region i-1 | region i   | 1024 chunks |    region 0 holds the trailing copy of the last region of the group
+| 128 sect.  | 128 sect.  | 8192 sect.  |
++------------+------------+-------------+
 ```
 
-An area of the superblock is a header of 4 KiB and the blocks of a bitmap of written chunks, 4 KiB each for
-32512 chunks, rounded up to 1 MiB: 1 MiB up to about 32 GiB of data. The header holds the version of the format,
-the number of the copy, a generation, a UUID, a random salt, the size of the lower device, all parameters of the
-layout and a CRC64. The driver reads both copies when the target is created, takes the valid one with the
-larger generation, and refuses a device with neither, or of another size than it was formatted for. The
-bitmap is written, but not read yet. The layout is computed by `src/dcorr-format.h`, which the driver and
-`dcorrsetup` share.
+The header of a group holds the superblock, 4 KiB, with the version of the format, the number of the group, a
+generation, a UUID, a random salt, the size of the lower device, all parameters of the layout and a CRC64; then
+the leading copy of the bitmap of the group and the trailing copy of the one of the group before, 4 KiB blocks
+of 32512 bits each, and room for the dirty stripes of the parity. The driver reads the superblocks of groups 0
+and 1 when the target is created, takes the valid one with the larger generation, and refuses a device with
+neither, or of another size than it was formatted for; with group 0 damaged it looks for group 1 at each size
+of a group. The bitmap is written, but not read yet, and the parity columns are reserved, not written. The
+layout is computed by `src/dcorr-format.h`, which the driver and `dcorrsetup` share.
 
-The leading copy of a region and its data are one contiguous range, and the data stays aligned to 4 KiB. The
-trailing copy of the last region is at the start of region 0. The last region may be shorter: it keeps both of
-its metadata areas and as many whole chunks as fit.
+The logical chunks of a group take the first 30/32 of its slots in order, so the leading copy of a region and its
+data stay one contiguous range, aligned to 128 KiB. About 930 MiB of a group of 1 GiB hold data: the header
+0.1%, the metadata 3%, the parity 6.25%.
 
 The leading copy is written with each write back of a chunk, the trailing one after the lower device has
 flushed that write back, so once everything is flushed both copies hold the same. A read takes the checksum of
@@ -204,8 +212,9 @@ tools/dcorrsetup format <underlying_device>
 tools/dcorrsetup table <underlying_device> | dmsetup create dcorr
 ```
 
-`dcorrsetup format` refuses a device in use, and one that already holds a valid superblock unless given
-`--force`. `dcorrsetup dump <underlying_device>` prints the superblock and the layout. Until the bitmap is read,
+`dcorrsetup format` refuses a device in use, one smaller than two groups, and one that already holds a valid
+superblock unless given `--force`. `--group-size SIZE` chooses the size of a group, a power of two from `16M`
+to `4G`, `1G` by default. `dcorrsetup dump <underlying_device>` prints the superblock and the layout. Until the bitmap is read,
 the underlying device has to be zeroed before it is formatted: chunks never written are read and checked.
 
 Verify device creation:

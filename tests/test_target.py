@@ -8,7 +8,7 @@ from harness import DATA_SECTORS, BlockDevice, capacity, format_device, pattern,
 
 @pytest.fixture
 def lower():
-    sectors = 16 * 2048
+    sectors = 32 * 2048  # two groups
     path = make_lower(sectors)
     format_device(path)
     yield path, sectors

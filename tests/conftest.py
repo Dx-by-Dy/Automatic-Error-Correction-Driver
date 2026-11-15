@@ -28,7 +28,7 @@ LOG_DEVICE_NAME = "dcorr-test-logdev"
 FAULTY_NAME = "dcorr-test-faulty"
 # Removed in this order, the devices on top first.
 TEST_DEVICES = (UPPER_NAME, LOG_NAME, FAULTY_NAME, LOG_DEVICE_NAME, LOWER_NAME)
-DEFAULT_LOWER_MIB = 16
+DEFAULT_LOWER_MIB = 32  # two groups of 16 MiB, the size harness.py formats with
 
 HUNG_TASK_SECONDS = 30
 TEST_SECONDS = 180
@@ -108,8 +108,8 @@ def drop_metadata(name=UPPER_NAME):
 
     A test that changes metadata on the lower device needs it, or the driver goes on with the copy.
     After the resume udev reads the start and the end of the device, which reads the metadata of
-    the first region and of the last one again, and of the one before it when the last is short, as on
-    16 MiB; the other regions stay out of RAM.
+    the first region and of the last one again, and of the one before it when the end of the device is
+    near the start of the last region; the other regions stay out of RAM.
     """
     run("dmsetup", "suspend", name)
     run("dmsetup", "resume", name)
@@ -257,7 +257,7 @@ def make_lower(sectors, name=LOWER_NAME, offset_mib=0):
     run("dmsetup", "create", name, stdin=f"0 {sectors} linear {TEST_DISK} {offset_mib * 2048}\n")
     path = f"/dev/mapper/{name}"
     # Direct, so that nothing of this stays in the page cache of the test disk.
-    run("dd", "if=/dev/zero", f"of={path}", "bs=1M", "oflag=direct", f"count={sectors // 2048}")
+    run("dd", "if=/dev/zero", f"of={path}", "bs=1M", "oflag=direct", "iflag=count_bytes", f"count={sectors * 512}")
     return path
 
 

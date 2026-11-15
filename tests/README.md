@@ -1,6 +1,6 @@
 # Driver tests
 
-256 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+302 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 256 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 215 tests, about 6 minutes
+deploy/vm.sh test                                     # all 302 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 261 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -28,8 +28,11 @@ pytest through `deploy/vm/guest.sh`. Logs go to `~/vms/corrdm/logs/`: the test o
 
 **Device.** The `stack` fixture gives each test a new device, `make_stack(lower_mib)` one of a chosen
 size. The stack is `dcorr-test` (the driver) on `dcorr-test-lower` (`dm-linear` over the start of
-`/dev/vdb`). The lower device is zeroed first, 16 MiB by default, then formatted with `tools/dcorrsetup`, and
-the table gets the capacity `harness.py` computes, which the driver checks against the superblock. Every stack
+`/dev/vdb`). The lower device is zeroed first, 32 MiB by default, then formatted with `tools/dcorrsetup` with
+groups of 16 MiB, the smallest size, so that even a small device has two groups, and the table gets the
+capacity `harness.py` computes, which the driver checks against the superblock. Tests that need a device that
+holds a given amount use `lower_mib_for_capacity`, as the headers, the metadata and the parity take a quarter of
+a group of 16 MiB. Every stack
 formats through its top layer, so `test_crash.py` formats through `dm-log-writes` and every replay has the
 superblock with its salt. Two files build stacks of their own, with a
 third layer between the two: `test_crash.py` puts `dm-log-writes` there (`dcorr-test-log`, its log on
@@ -42,22 +45,24 @@ back, damaging its neighbours. Tests damage data through `stack.lower` and use i
 A write through the driver is sure to be on the lower device only after `flush()`, so a test that looks at the
 lower device, or damages it, flushes first. A failed write may be reported by the write or by the flush.
 
-**Layout.** `harness.py` has its own copy of the on-disk layout, `layout(lower_sectors)`, apart from
-`src/dcorr-format.h`, which the driver and `dcorrsetup` share: two areas of the superblock of at least 1 MiB,
-one at the start and one before region `R // 2`; regions of 1024 chunks, each with 128 sectors for the copy of
-the metadata of the region before, 128 sectors of its own metadata and 8192 sectors of data; an entry of 8 CRCs
-of 8 bytes per chunk, 8 entries to a metadata sector. The positions depend on the size of the lower device, so
-`physical_sector` and `metadata_sector` take it. A change of layout has to be made there as well.
-`test_layout_of_the_first_chunks_of_two_regions` spells the positions out apart from both, and
+**Layout.** `harness.py` has its own copy of the on-disk layout, `layout(lower_sectors, group_sectors)`, apart
+from `src/dcorr-format.h`, which the driver and `dcorrsetup` share: groups of one size, each a header of 1 MiB
+and as many whole regions as fit, the last group possibly short; regions of 1024 slots, each with 128 sectors for
+the copy of the metadata of the region before in the group, 128 sectors of its own metadata and 8192 sectors of
+slots; the slots of a group in 32 columns, the first 30 of data; an entry of 8 CRCs of 8 bytes per chunk, 8
+entries to a metadata sector. The positions depend on the size of the lower device and of a group, so
+`physical_sector`, `metadata_sector` and `region_sector`, the logical start of a region, take them, the size of a
+group 16 MiB unless given. A change of layout has to be made there as well.
+`test_layout_of_the_chunks_at_the_borders` spells the positions out apart from both, and
 `test_dcorrsetup_gives_the_layout_of_the_tests` compares `dcorrsetup dump` with `harness.py`. `crc64_be` there is
-the CRC of the kernel, so that the tests can build a header by hand.
+the CRC of the kernel, so that the tests can build a superblock and a block of the bitmap by hand.
 
 **Metadata in RAM.** The driver keeps the metadata of the regions it used in RAM until a suspend, so a test that
 changes metadata on the lower device calls `drop_metadata()` from `conftest.py` afterwards, which suspends and
 resumes the device. udev reads the start and the end of a device when it is created and after each resume,
-which reads the metadata of the first and the last region again, and of the one before the last when that is
-short, as on 16 MiB, where regions 0, 2 and 3 come back; the tests that count reads of metadata, or need it out
-of RAM, use region 1, or a larger device.
+which reads the metadata of the first and the last region again, and of the one before it when the end of the
+device is near the start of the last region; the tests that count reads of metadata, or need it out of RAM, use
+region 1, or a larger device.
 
 **Kernel log.** Each test reads the kernel log it caused. An unknown `BUG`, `WARNING`, `Oops`, KASAN,
 UBSAN, lockdep or hung task report fails the test. `KNOWN_KERNEL_REPORTS` in `conftest.py` lists the
@@ -83,16 +88,16 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 
 ## What is tested
 
-### `test_data.py`: data reads back unchanged and lands where the layout says (79 tests)
+### `test_data.py`: data reads back unchanged and lands where the layout says (80 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_capacity_excludes_metadata` | 1 | The device size on 16 MiB: two areas of the superblock, 3 whole regions and a short one, without metadata |
-| `test_layout_of_the_first_chunks_of_two_regions` | 1 | The first chunks of regions 0 and 1 at the positions written out by hand: both copies of the superblock, at 0 and 18944; region 0 at 2048, data after 256 sectors of it, the entry first in the leading metadata sector at 128 of it, the rest of the sector zero; the trailing copy of each at the start of the next region, region 2 after copy 1, equal to the leading one; the trailing area of the last region, at the start of region 0, zero |
+| `test_capacity_excludes_metadata_and_parity` | 1 | The device size on 32 MiB: two groups of 3 regions, each region adding 30/32 of its chunks |
+| `test_layout_of_the_chunks_at_the_borders` | 1 | Positions written out by hand: the superblocks at 0 and 32768; the first chunks of regions 0 and 1, the last chunk of data of group 0 in region 2 and the first of group 1 in region 3 at their places, 256 sectors into their regions; the first slot of parity zero; the entry of each in its leading metadata sector, the rest of the sector zero, and the trailing copy equal to it at the start of the next region of the group, region 0 for region 2; the trailing area of region 5, at the start of region 3, zero |
 | `test_fresh_device_reads_zeros` | 1 | A zeroed lower device reads as zeros, without CRC errors |
 | `test_roundtrip` | 50 | Write and read back, 10 sizes from 1 to 2048 sectors at 5 start positions |
-| `test_data_lands_at_the_layout_position` | 2 | Every sector of 4 chunks is at its expected place on the lower device, at the start of a region and across the boundary of two |
-| `test_the_last_chunk_of_a_short_region` | 1 | The last chunk of the device, in the short last region, lands where it should and reads back |
+| `test_data_lands_at_the_layout_position` | 3 | Every sector of 4 chunks is at its expected place on the lower device, at the start of a region, across the boundary of two and across the boundary of two groups |
+| `test_the_last_chunk_of_the_device` | 1 | The last chunk of the device, before the parity of the last group, lands where it should and reads back |
 | `test_metadata_is_written_outside_the_data` | 1 | Only the entry of the chunk changes in its metadata sector, in both copies; the next metadata sector does not |
 | `test_partial_write_to_an_empty_chunk` | 8 | A one-sector write, for each sector of a chunk; the rest stays zero |
 | `test_partial_write_keeps_the_crcs_of_its_neighbours` | 8 | After a one-sector write, each sector still reads on its own |
@@ -197,7 +202,7 @@ is started again from the state of a replay, and the entries of both run in a ro
 `dm-dust` with 512-byte blocks fails reads of chosen sectors of the lower device, and writes to them a
 chosen number of times; a write to such a sector clears it. One test loads `dm-flakey` in its place.
 16 chunks are written first, whose entries fill two metadata sectors, and the second chunk gets the failures.
-The device has three regions, so that the trailing copy of region 0 is in region 1: `dm-dust` takes an empty
+The device has two groups of three regions, so that the trailing copy of region 0 is in region 1: `dm-dust` takes an empty
 flush, whose sector is 0, for a write to block 0. A failed metadata sector is failed in both copies, but where
 a test says one copy; a write is followed by two flushes, so that the trailing copy is written before the test
 goes on.
@@ -232,7 +237,7 @@ with both copies; and when the trailing copy is written.
 | `test_the_trailing_copy_is_written_after_a_flush` | 1 | A chunk written back by age has its leading copy on the lower device and not yet the trailing one; after a flush the two are equal, and the driver flushed nothing by itself |
 | `test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned` | 1 | Chunks written back by age in 13 regions leave the trailing copies unwritten; in 36 regions, more than there are areas, the driver flushes and writes them by itself (`crowded_flushes`) instead of waiting for an area for ever; every chunk reads back after the metadata is read again |
 
-The fio tests on 512 MiB, 128 regions, drop and read areas again all the time.
+The fio tests, on more than 500 MiB, drop and read areas again all the time.
 
 ### `test_lifecycle.py`: the device and the module come and go (4 tests)
 
@@ -263,32 +268,41 @@ lock table, which is gone.
 | `test_table_shows_the_lower_device` | 1 | **xfail**: `dmsetup table` does not show the device |
 | `test_target_may_start_after_sector_0` | 1 | With a table that puts the target after sector 0, its first sector lands on sector 0 of the lower device |
 
-### `test_superblock.py`: the superblock and `dcorrsetup` (33 tests)
+### `test_superblock.py`: the superblock and `dcorrsetup` (78 tests)
 
-The header is also built by hand, with the layout and `crc64_be` of `harness.py`, so that the driver is seen to
-take a header made apart from `dcorrsetup` and to refuse each field that is wrong. The reasons are read from the
-kernel log.
+The superblock is also built by hand, with the layout and `crc64_be` of `harness.py`, so that the driver is
+seen to take one made apart from `dcorrsetup` and to refuse each field that is wrong. The reasons are read from
+the kernel log. The device is two groups of 16 MiB unless said otherwise.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_the_header_built_by_the_tests_is_taken` | 1 | The control of the tests below: `crc64_be` of the tests gives the check value of CRC-64/ECMA-182 and the CRC `dcorrsetup` wrote, and a header rewritten with it is taken |
-| `test_a_device_without_a_superblock_is_refused` | 1 | A zeroed device: no magic in either copy |
-| `test_a_wrong_field_in_both_copies_is_refused` | 10 | Version, flags, the size of a chunk, of a region and of a block of the bitmap, the size of the device, the capacity, the number of regions, the middle region, the size of an area: each with its reason |
-| `test_a_copy_with_the_number_of_the_other_is_refused` | 1 | The two copies with each other's number, as after misdirected writes |
-| `test_a_damaged_crc_is_refused` | 1 | A bit flipped in the reserved bytes, which only the CRC covers |
-| `test_one_damaged_copy_is_covered_by_the_other` | 2 | Copy 0 or copy 1 zeroed: the device comes up from the other with a warning, and the data written before reads |
+| `test_the_superblock_built_by_the_tests_is_taken` | 1 | The control of the tests below: `crc64_be` of the tests gives the check value of CRC-64/ECMA-182 and the CRC `dcorrsetup` wrote, and superblocks rewritten with it are taken |
+| `test_a_device_without_a_superblock_is_refused` | 1 | A zeroed device: no magic in group 0, no copy of group 1 for any size |
+| `test_a_wrong_field_in_both_copies_is_refused` | 15 | Version, flags, the size of a chunk, of a region and of a block of the bitmap, the columns, the parity columns, the header, a size of a group not in the list, the size of the device, the capacity, the groups, the regions of a group and of the last one, the blocks of the bitmap: each with its reason for group 0 |
+| `test_a_wrong_field_in_group_1_is_seen` | 17 | The same fields, the number of another group, and a size of a group other than that of its place, in group 1 only: the device comes up from group 0 and names the reason for group 1 |
+| `test_a_group_size_with_too_few_groups_is_refused` | 1 | Group 0 says 32 MiB on a device of 32 MiB, one group |
+| `test_copies_with_the_numbers_swapped_are_refused` | 1 | Groups 0 and 1 with each other's number, as after misdirected writes |
+| `test_a_damaged_crc_is_refused` | 1 | A bit flipped in the reserved bytes of both, which only the CRC covers |
+| `test_one_damaged_copy_is_covered_by_the_other` | 2 | Group 0 or group 1 zeroed: the device comes up from the other with a warning, and the data written before in both groups reads |
+| `test_group_1_is_found_for_each_size_when_group_0_is_damaged` | 4 | Groups of 16, 32, 64 MiB and 1 GiB, group 0 zeroed: the probe finds group 1 at its size, past the smaller sizes inside group 0, and the data reads |
+| `test_a_format_with_larger_groups_wipes_group_1_of_the_smaller_sizes` | 1 | Formatted with 16 MiB, then with 32 MiB: the old copy of group 1 is zeroed and the probe finds the new one; the positive control: with the old copy put back, the probe takes it |
 | `test_both_damaged_copies_are_refused` | 1 | Both copies zeroed |
-| `test_the_copy_with_the_larger_generation_is_taken` | 2 | Generation 2 in copy 0 or in copy 1 |
-| `test_copies_that_differ_in_the_same_generation_warn` | 1 | Another salt in copy 1: a warning, copy 0 taken |
+| `test_the_copy_with_the_larger_generation_is_taken` | 2 | Generation 2 in group 0 or in group 1 |
+| `test_copies_that_differ_in_the_same_generation_warn` | 2 | Another salt or UUID in group 1: a warning, group 0 taken |
 | `test_copies_that_agree_do_not_warn` | 1 | The control of the test above |
-| `test_a_device_of_another_size_is_refused` | 1 | Formatted on 16 MiB, the device below grown by 1 MiB |
-| `test_the_smallest_device` | 2 | Two regions, the second with one chunk, is taken by both; one chunk less, `dcorrsetup` and the driver refuse it as too small |
-| `test_dcorrsetup_gives_the_layout_of_the_tests` | 4 | `dump` and `table` against `harness.py` on 9, 16 and 100 MiB and on 16 MiB and 300 sectors, and the driver takes the device |
-| `test_every_region_lies_where_the_layout_says` | 1 | The first and the last chunk of every region on 16 MiB land where `harness.py` puts them, on both sides of copy 1 |
-| `test_a_large_device_with_a_larger_area` | 1 | A sparse file of 40 GiB on a loop device: 256 blocks of the bitmap make the area 2 MiB; `dump` agrees with `harness.py`, and the first chunk, the first of the middle region and the last land where it says |
+| `test_a_device_of_another_size_is_refused` | 1 | The device below grown by 1 MiB |
+| `test_the_smallest_device` | 2 | A group and a short one of two regions is taken by both; a chunk less, `dcorrsetup` refuses it as too small and the driver finds no superblock |
+| `test_dcorrsetup_gives_the_layout_of_the_tests` | 7 | `dump` and `table` against `harness.py` on the smallest device, 32 MiB, 32 MiB and 300 sectors, 42 MiB with a short group and 100 MiB with groups of 16 MiB, 100 MiB with 32 MiB and 2 GiB with 1 GiB, and the driver takes the device |
+| `test_the_header_of_every_group_holds_its_superblock_and_bitmaps` | 2 | With groups of 16 MiB and 1 GiB: in every header a superblock with its number and the layout, the leading bitmap of the group and the trailing one of the group before with their group, index and role, empty, with a CRC that starts from the salt, and the dirty stripes zero |
+| `test_dcorrsetup_refuses_a_size_of_a_group_not_in_the_list` | 7 | `3M`, `8M`, `24M`, `8G`, `0M`, `16`, `16K` |
+| `test_dcorrsetup_formats_with_groups_of_1_gib_by_default` | 1 | 2 GiB without `--group-size`: two groups of 248 regions |
+| `test_every_region_lies_where_the_layout_says` | 1 | On three groups, the last short, the first and the last chunk of data of every region land where `harness.py` puts them |
+| `test_data_never_lands_in_the_parity_columns_nor_outside_the_regions` | 1 | The whole device written: every slot of the parity columns and the unused end of every group stay zero, and every header keeps its superblock |
+| `test_a_large_device` | 2 | A sparse file of 40 GiB on a loop device, groups of 1 and 4 GiB: `dump` agrees with `harness.py`, and the first and the last chunk of groups 0, 1 and the last land where it says |
 | `test_format_keeps_a_valid_superblock_without_force` | 1 | `format` again fails and keeps the UUID; with `--force` the UUID changes |
+| `test_format_keeps_a_superblock_found_only_in_group_1` | 1 | With group 0 zeroed, `format` without `--force` still finds group 1 and refuses |
 | `test_format_refuses_a_device_in_use` | 1 | With the driver on top, `format --force` fails: the device is opened with `O_EXCL` |
-| `test_dump_of_a_device_without_a_superblock_fails` | 1 | `dump` of a zeroed device fails and names both copies |
+| `test_dump_of_a_device_without_a_superblock_fails` | 1 | `dump` of a zeroed device fails and names both reasons |
 
 ### `test_filesystem.py`: files survive on a filesystem (2 tests, `slow`)
 
@@ -454,8 +468,17 @@ The superblock, with `test_superblock.py` and `test_data.py`:
 | ------ | ------ | ----- |
 | The driver does not check the CRC of the header | Failed | `test_a_damaged_crc_is_refused` |
 | The copy with the smaller generation is taken | Failed, 2 | Both cases of `test_the_copy_with_the_larger_generation_is_taken` |
-| The driver reads copy 1 8 sectors off its place | Failed | `test_one_damaged_copy_is_covered_by_the_other[0]`; with copy 0 valid nothing else notices |
-| No shift after copy 1 in `dcorr_region_start`, for the driver and `dcorrsetup` both | Failed, 4 | `test_every_region_lies_where_the_layout_says`, `test_a_large_device_with_a_larger_area`, `test_layout_of_the_first_chunks_of_two_regions`, `test_the_last_chunk_of_a_short_region`; `dump` agrees with `harness.py`, as the fields stay the same |
+| The driver does not check the number of the group | Failed, 2 | `test_a_wrong_field_in_group_1_is_seen[group]`, `test_copies_with_the_numbers_swapped_are_refused` |
+| The probe of group 1 starts at 1 GiB instead of 16 MiB | Failed, 5 | `test_group_1_is_found_for_each_size_when_group_0_is_damaged` for 16, 32 and 64 MiB, `test_one_damaged_copy_is_covered_by_the_other[0]`, `test_a_format_with_larger_groups_wipes_group_1_of_the_smaller_sizes` |
+| The slot of a chunk ignores the groups, `sector / 8`, so data runs into the parity columns | Failed, 7 | `test_layout_of_the_chunks_at_the_borders`, `test_data_lands_at_the_layout_position[across groups]`, `test_the_last_chunk_of_the_device`, `test_every_region_lies_where_the_layout_says`, `test_data_never_lands_in_the_parity_columns_nor_outside_the_regions`, both cases of `test_a_large_device` |
+| The trailing copy of the last region of a group goes into the next group | Failed | `test_layout_of_the_chunks_at_the_borders` only; the other tests see both copies equal wherever they are |
+| One region less per group, for the driver and `dcorrsetup` both | Failed, 129 | Nearly every test of `test_superblock.py`, `test_data.py`, `test_target.py`: `harness.py` gives another capacity |
+| No short last group, for both | Failed, 8 | The smallest device, the layouts on 25.25 and 42 MiB, the probe on 2.5 groups, the headers on 42 MiB, the regions, the parity columns |
+| `dcorrsetup` leaves the salt out of the CRC of a block of the bitmap | Failed, 2 | Both cases of `test_the_header_of_every_group_holds_its_superblock_and_bitmaps` |
+| `dcorrsetup` does not wipe the starts of group 1 of smaller sizes | Failed | `test_a_format_with_larger_groups_wipes_group_1_of_the_smaller_sizes` |
+
+The groups, on 1b, ran with `test_superblock.py`, `test_data.py` and `test_target.py` only. The mutations of
+step 1 about copy 1 in the middle no longer apply, as there is no middle copy.
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 

@@ -2,9 +2,10 @@
 
 import pytest
 
-from harness import SECTOR_SIZE, fio
+from harness import SECTOR_SIZE, fio, lower_mib_for_capacity
 
-LOWER_MIB = 512
+# 8 jobs on separate areas 48 MiB apart need 368 MiB.
+LOWER_MIB = lower_mib_for_capacity(384)
 BLOCK_SIZES = ["512", "4k", "16k", "32k", "64k", "128k", "1m"]
 
 OVERLAP_MIB = 64

@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, create_dcorr, device_status, dmsetup_remove, make_lower
-from harness import DATA_SECTORS, REGION_DATA_SECTORS, BlockDevice, declare_hang, fio, pattern, run
+from harness import DATA_SECTORS, BlockDevice, declare_hang, fio, layout, pattern, run
 
 FAULTS = "/sys/kernel/debug"
 IO_SECONDS = 15
@@ -197,8 +197,11 @@ def slow_reads():
     run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 {READ_DELAY_MS} {lower} 0 0\n")
     create_dcorr(f"/dev/mapper/{FAULTY_NAME}", sectors)
     upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
-    for region in range(-(-LIMIT_READ_MIB * 2048 // REGION_DATA_SECTORS)):
-        upper.read(region * REGION_DATA_SECTORS)
+    device = layout(sectors)
+    for region in range(device.regions):
+        start = device.region_logical(region)
+        if start is not None and start < LIMIT_READ_MIB * 2048:
+            upper.read(start)
     upper.close()
     yield f"/dev/mapper/{UPPER_NAME}"
     for name in (UPPER_NAME, FAULTY_NAME, LOWER_NAME):

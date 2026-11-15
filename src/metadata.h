@@ -227,16 +227,22 @@ void metadata_write_trails(struct metadata_cache *cache);
 void metadata_unpin_all(struct metadata_cache *cache);
 void metadata_drop(struct metadata_cache *cache);
 
-/// @brief Index of the metadata sector of the chunk of a logical sector in the area of its region
-static inline unsigned int metadata_area_sector(sector_t sector)
+/// @brief Index of the chunk of a logical sector in the area of its region
+static inline unsigned int metadata_area_chunk(const struct metadata_area *area, sector_t sector)
 {
-    return (unsigned int)(sector % REGION_DATA_SECTORS / DATA_SIZE_SECTORS / CHUNKS_PER_METADATA_SECTOR);
+    return region_chunk(area->cache->layout, sector);
+}
+
+/// @brief Index of the metadata sector of the chunk of a logical sector in the area of its region
+static inline unsigned int metadata_area_sector(const struct metadata_area *area, sector_t sector)
+{
+    return metadata_area_chunk(area, sector) / CHUNKS_PER_METADATA_SECTOR;
 }
 
 /// @brief Whether the metadata sector of the chunk of a logical sector failed to read in both copies
 static inline bool metadata_sector_bad(const struct metadata_area *area, sector_t sector)
 {
-    unsigned int index = metadata_area_sector(sector);
+    unsigned int index = metadata_area_sector(area, sector);
 
     return test_bit(index, area->bad[METADATA_LEAD]) && test_bit(index, area->bad[METADATA_TRAIL]);
 }
@@ -244,7 +250,7 @@ static inline bool metadata_sector_bad(const struct metadata_area *area, sector_
 /// @brief Whether the metadata sector of the chunk of a logical sector is bad in one copy only
 static inline bool metadata_sector_single(const struct metadata_area *area, sector_t sector)
 {
-    unsigned int index = metadata_area_sector(sector);
+    unsigned int index = metadata_area_sector(area, sector);
 
     return test_bit(index, area->bad[METADATA_LEAD]) != test_bit(index, area->bad[METADATA_TRAIL]);
 }
@@ -257,7 +263,7 @@ static inline bool metadata_sector_single(const struct metadata_area *area, sect
 static inline struct page *metadata_sector_page(const struct metadata_area *area, enum metadata_copy copy,
                                                 sector_t sector, unsigned int *offset)
 {
-    unsigned int byte = metadata_area_sector(sector) * SECTOR_SIZE;
+    unsigned int byte = metadata_area_sector(area, sector) * SECTOR_SIZE;
 
     *offset = byte % PAGE_SIZE;
     return area->pages[copy][byte / PAGE_SIZE];
@@ -268,7 +274,7 @@ static inline struct page *metadata_sector_page(const struct metadata_area *area
 static inline struct chunk_metadata *metadata_entry(const struct metadata_area *area, enum metadata_copy copy,
                                                     sector_t sector)
 {
-    unsigned int byte = (unsigned int)(sector % REGION_DATA_SECTORS / DATA_SIZE_SECTORS) * METADATA_ENTRY_SIZE;
+    unsigned int byte = metadata_area_chunk(area, sector) * METADATA_ENTRY_SIZE;
 
     return page_address(area->pages[copy][byte / PAGE_SIZE]) + byte % PAGE_SIZE;
 }

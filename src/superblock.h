@@ -11,8 +11,8 @@ struct superblock_info
 {
     struct dcorr_layout layout;
     u8 salt[16];
-    /// @brief The copy it was taken from
-    unsigned int copy;
+    /// @brief The group whose copy it was taken from, 0 or 1
+    unsigned int group;
     u64 generation;
 };
 

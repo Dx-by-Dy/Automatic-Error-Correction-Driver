@@ -19,41 +19,48 @@ CRC_SIZE = 8
 # The metadata of a chunk: a CRC per data sector, CHUNKS_PER_METADATA_SECTOR chunks to a sector.
 METADATA_ENTRY_SIZE = DATA_SECTORS * CRC_SIZE
 CHUNKS_PER_METADATA_SECTOR = SECTOR_SIZE // METADATA_ENTRY_SIZE
-# A region: [trailing copy of the metadata of the region before | leading copy of its own | its data].
-# The trailing copy of the last region is in region 0.
+# A region: [trailing copy of the metadata of the region before | leading copy of its own | its slots].
+# The trailing copy of the last region of a group is in the first region of the group.
 REGION_CHUNKS = 1024
 REGION_METADATA_SECTORS = REGION_CHUNKS // CHUNKS_PER_METADATA_SECTOR
 REGION_DATA_SECTORS = REGION_CHUNKS * DATA_SECTORS
 REGION_DATA_OFFSET = 2 * REGION_METADATA_SECTORS
 REGION_SECTORS = REGION_DATA_OFFSET + REGION_DATA_SECTORS
-# The lower device: [area, copy 0 | regions 0 .. M - 1 | area, copy 1 | regions M .. R - 1], M = R // 2.
-# An area is the header of the superblock and the blocks of the bitmap, rounded up to 1 MiB.
-# A copy of src/dcorr-format.h of its own, so that the tests check the layout of the driver.
-HEADER_SECTORS = 8
-HEADER_SIZE = HEADER_SECTORS * SECTOR_SIZE
+# The lower device is a sequence of groups: [header of 1 MiB | whole regions | unused]. The last group may
+# be short, with at least MIN_GROUP_REGIONS regions. The slots of a group are cut into 32 columns; the first
+# 30 hold the data, in order, the last 2 are kept for parity. A copy of src/dcorr-format.h of its own, so
+# that the tests check the layout of the driver.
+SUPERBLOCK_SECTORS = 8
+SUPERBLOCK_SIZE = SUPERBLOCK_SECTORS * SECTOR_SIZE
 BITMAP_BLOCK_SECTORS = 8
-BITMAP_BLOCK_BITS = (BITMAP_BLOCK_SECTORS * SECTOR_SIZE - 32) * 8
-AREA_ALIGN_SECTORS = 2048
-MIN_REGIONS = 2
+BITMAP_BLOCK_SIZE = BITMAP_BLOCK_SECTORS * SECTOR_SIZE
+BITMAP_HEADER_SIZE = 32
+BITMAP_BLOCK_BITS = (BITMAP_BLOCK_SIZE - BITMAP_HEADER_SIZE) * 8
+GROUP_HEADER_SECTORS = 2048
+COLUMNS = 32
+PARITY_COLUMNS = 2
+DATA_COLUMNS = COLUMNS - PARITY_COLUMNS
+COLUMN_SLOTS_PER_REGION = REGION_CHUNKS // COLUMNS
+REGION_CAPACITY = DATA_COLUMNS * COLUMN_SLOTS_PER_REGION * DATA_SECTORS
+MIN_GROUPS = 2
+MIN_GROUP_REGIONS = 2
+GROUP_SIZES = [16 * 2048 << shift for shift in range(9)]  # 16 MiB to 4 GiB
+DEFAULT_GROUP_SECTORS = 1024 * 2048
+# The size of a group the tests format with, unless told otherwise: the smallest, so that a device of a few
+# tens of MiB has several groups.
+GROUP_SECTORS = GROUP_SIZES[0]
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "dcorrsetup")
 
 
-def regions_capacity(sectors):
-    """Logical sectors that regions laid out over this many sectors hold: whole regions, and the whole
-    chunks that fit into a last short one after its metadata areas."""
-    regions, rest = divmod(sectors, REGION_SECTORS)
-    last = max(rest - REGION_DATA_OFFSET, 0) // DATA_SECTORS * DATA_SECTORS
-    return regions * REGION_DATA_SECTORS + last
+def group_regions(sectors):
+    """Whole regions a group, or a short last one, of this many sectors holds after its header."""
+    return max(sectors - GROUP_HEADER_SECTORS, 0) // REGION_SECTORS
 
 
-def bitmap_blocks(capacity):
-    return -(-(capacity // DATA_SECTORS) // BITMAP_BLOCK_BITS)
-
-
-def area_sectors(capacity):
-    sectors = HEADER_SECTORS + bitmap_blocks(capacity) * BITMAP_BLOCK_SECTORS
-    return -(-sectors // AREA_ALIGN_SECTORS) * AREA_ALIGN_SECTORS
+def bitmap_blocks(regions):
+    """Blocks of one copy of the bitmap of written chunks of a group of this many regions."""
+    return -(-regions * REGION_CHUNKS // BITMAP_BLOCK_BITS)
 
 
 @dataclass(frozen=True)
@@ -61,92 +68,154 @@ class Layout:
     """Where everything lies on a lower device of a given size."""
 
     lower_sectors: int
-    area_sectors: int
+    group_sectors: int
+    groups: int
+    group_regions: int
+    last_group_regions: int
     capacity: int
-    regions: int
-    middle_region: int
     bitmap_blocks: int
 
-    def copy_start(self, copy):
-        """First sector of an area of the superblock."""
-        return 0 if copy == 0 else self.area_sectors + self.middle_region * REGION_SECTORS
+    @property
+    def group_capacity(self):
+        """Logical sectors of a group that is not short."""
+        return self.group_regions * REGION_CAPACITY
+
+    @property
+    def regions(self):
+        return (self.groups - 1) * self.group_regions + self.last_group_regions
+
+    def group_start(self, group):
+        """First sector of a group, where its header and its superblock are."""
+        return group * self.group_sectors
+
+    def regions_of_group(self, group):
+        return self.last_group_regions if group == self.groups - 1 else self.group_regions
 
     def region_start(self, region):
-        return (
-            self.area_sectors
-            + region * REGION_SECTORS
-            + (self.area_sectors if region >= self.middle_region else 0)
-        )
+        group, index = divmod(region, self.group_regions)
+        return self.group_start(group) + GROUP_HEADER_SECTORS + index * REGION_SECTORS
+
+    def trail_region(self, region):
+        """The region that holds the trailing copy of the metadata of this one, in the same group."""
+        group, index = divmod(region, self.group_regions)
+        return group * self.group_regions + (index + 1) % self.regions_of_group(group)
+
+    def slot(self, logical):
+        """The slot of the chunk of a logical sector, numbered across the regions of the device."""
+        group, in_group = divmod(logical, self.group_capacity)
+        return group * self.group_regions * REGION_CHUNKS + in_group // DATA_SECTORS
+
+    def data_slots(self, group):
+        """Slots of a group in its data columns, its first ones."""
+        return self.regions_of_group(group) * COLUMN_SLOTS_PER_REGION * DATA_COLUMNS
+
+    def region_logical(self, region):
+        """The logical sector of the first chunk of a region, None if the region holds only parity."""
+        group, index = divmod(region, self.group_regions)
+        if index * REGION_CHUNKS >= self.data_slots(group):
+            return None
+        return group * self.group_capacity + index * REGION_CHUNKS * DATA_SECTORS
+
+    def slot_sector(self, slot):
+        """First sector of a slot on the lower device."""
+        region, index = divmod(slot, REGION_CHUNKS)
+        return self.region_start(region) + REGION_DATA_OFFSET + index * DATA_SECTORS
+
+    def lead_bitmap_start(self, group):
+        return self.group_start(group) + SUPERBLOCK_SECTORS
+
+    def trail_bitmap_start(self, group):
+        """The trailing copy of the bitmap of a group, in the header of the next group."""
+        holder = (group + 1) % self.groups
+        return self.group_start(holder) + SUPERBLOCK_SECTORS + self.bitmap_blocks * BITMAP_BLOCK_SECTORS
+
+    def dirty_start(self, group):
+        return self.group_start(group) + SUPERBLOCK_SECTORS + 2 * self.bitmap_blocks * BITMAP_BLOCK_SECTORS
 
 
 @functools.cache
-def layout(lower_sectors):
-    """The layout of a lower device, None if it is too small."""
-    area = area_sectors(0)
-    while True:
-        if lower_sectors <= 2 * area:
-            return None
-        capacity = regions_capacity(lower_sectors - 2 * area)
-        if area_sectors(capacity) <= area:
-            break
-        area = area_sectors(capacity)
-    regions = -(-capacity // REGION_DATA_SECTORS)
-    if regions < MIN_REGIONS:
+def layout(lower_sectors, group_sectors=GROUP_SECTORS):
+    """The layout of a lower device, None if it holds fewer than MIN_GROUPS groups."""
+    assert group_sectors in GROUP_SIZES, f"{group_sectors} is not a size of a group"
+    full, rest = divmod(lower_sectors, group_sectors)
+    regions = group_regions(group_sectors)
+    last = group_regions(rest)
+    short = last >= MIN_GROUP_REGIONS
+    groups = full + short
+    if groups < MIN_GROUPS:
         return None
-    return Layout(lower_sectors, area, capacity, regions, regions // 2, bitmap_blocks(capacity))
+    last_regions = last if short else regions
+    capacity = ((groups - 1) * regions + last_regions) * REGION_CAPACITY
+    return Layout(lower_sectors, group_sectors, groups, regions, last_regions, capacity, bitmap_blocks(regions))
 
 
-def capacity(lower_sectors):
+def capacity(lower_sectors, group_sectors=GROUP_SECTORS):
     """Logical size in sectors of a device on top of a lower device of this size."""
-    return layout(lower_sectors).capacity
+    return layout(lower_sectors, group_sectors).capacity
 
 
-def lower_mib_for_regions(regions):
-    """The smallest lower device in MiB with at least this many whole regions of data."""
+def lower_mib_for_regions(regions, group_sectors=GROUP_SECTORS):
+    """The smallest lower device in MiB with at least this many regions, every one holding data."""
     mib = 1
-    while not layout(mib * 2048) or capacity(mib * 2048) < regions * REGION_DATA_SECTORS:
+    while True:
+        device = layout(mib * 2048, group_sectors)
+        if device and device.regions >= regions and all(device.region_logical(r) is not None for r in range(regions)):
+            return mib
         mib += 1
-    return mib
 
 
-def physical_sector(logical, lower_sectors):
+def lower_mib_for_capacity(mib, group_sectors=GROUP_SECTORS):
+    """The smallest lower device in MiB whose device on top holds at least this many MiB."""
+    lower = mib
+    while not layout(lower * 2048, group_sectors) or capacity(lower * 2048, group_sectors) < mib * 2048:
+        lower += 1
+    return lower
+
+
+def region_sector(region, lower_sectors, group_sectors=GROUP_SECTORS):
+    """The logical sector of the first chunk of a region."""
+    logical = layout(lower_sectors, group_sectors).region_logical(region)
+    assert logical is not None, f"region {region} holds no data"
+    return logical
+
+
+def physical_sector(logical, lower_sectors, group_sectors=GROUP_SECTORS):
     """Sector on the lower device that holds a logical data sector."""
-    region, in_region = divmod(logical, REGION_DATA_SECTORS)
-    return layout(lower_sectors).region_start(region) + REGION_DATA_OFFSET + in_region
+    device = layout(lower_sectors, group_sectors)
+    return device.slot_sector(device.slot(logical)) + logical % DATA_SECTORS
 
 
-def metadata_sector(logical, lower_sectors):
+def metadata_sector(logical, lower_sectors, group_sectors=GROUP_SECTORS):
     """Sector on the lower device that holds the leading copy of the CRCs for a logical data sector,
     among other chunks."""
-    region, in_region = divmod(logical, REGION_DATA_SECTORS)
-    return (
-        layout(lower_sectors).region_start(region)
-        + REGION_METADATA_SECTORS
-        + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
-    )
+    device = layout(lower_sectors, group_sectors)
+    region, index = divmod(device.slot(logical), REGION_CHUNKS)
+    return device.region_start(region) + REGION_METADATA_SECTORS + index // CHUNKS_PER_METADATA_SECTOR
 
 
-def trail_sector(logical, lower_sectors):
+def trail_sector(logical, lower_sectors, group_sectors=GROUP_SECTORS):
     """Sector on the lower device that holds the trailing copy of the CRCs for a logical data sector."""
-    region, in_region = divmod(logical, REGION_DATA_SECTORS)
-    device = layout(lower_sectors)
-    holder = 0 if region + 1 == device.regions else region + 1
-    return device.region_start(holder) + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+    device = layout(lower_sectors, group_sectors)
+    region, index = divmod(device.slot(logical), REGION_CHUNKS)
+    return device.region_start(device.trail_region(region)) + index // CHUNKS_PER_METADATA_SECTOR
 
 
-def metadata_sectors(logical, lower_sectors):
+def metadata_sectors(logical, lower_sectors, group_sectors=GROUP_SECTORS):
     """Both copies of the metadata sector of a logical data sector: the leading one, then the trailing one."""
-    return metadata_sector(logical, lower_sectors), trail_sector(logical, lower_sectors)
+    return metadata_sector(logical, lower_sectors, group_sectors), trail_sector(logical, lower_sectors, group_sectors)
 
 
 def metadata_offset(logical):
-    """Offset in bytes of the entry of the chunk of a logical sector in its metadata sector."""
+    """Offset in bytes of the entry of the chunk of a logical sector in its metadata sector.
+
+    A group adds a multiple of CHUNKS_PER_METADATA_SECTOR chunks to the capacity and to the slots, so
+    the offset does not depend on the layout."""
     return logical // DATA_SECTORS % CHUNKS_PER_METADATA_SECTOR * METADATA_ENTRY_SIZE
 
 
-def format_device(path, force=False):
-    """Writes a fresh superblock to a device with dcorrsetup."""
-    run(TOOL, "format", *(["--force"] if force else []), path)
+def format_device(path, force=False, group_sectors=GROUP_SECTORS):
+    """Writes a fresh superblock to a device with dcorrsetup, with groups of the size given."""
+    run(TOOL, "format", *(["--force"] if force else []), "--group-size", f"{group_sectors // 2048}M", path)
 
 
 def table_line(path):
