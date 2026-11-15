@@ -6,6 +6,7 @@
 #include "dm-dcorr.h"
 #include "cache.h"
 #include "metadata.h"
+#include "written.h"
 #include "trn_p_rq.h"
 #include "macros.h"
 
@@ -375,7 +376,12 @@ void cache_write(struct cache *cache, struct bio *bio)
 /// start that are all in the cache or all not in it; device mapper sends the
 /// rest as another bio. A run in the cache is copied and completed here.
 ///
-/// A run not in the cache goes to the device below by the caller. It is put
+/// A run not in the cache of a chunk never written back, whose bit in the
+/// bitmap of written chunks is clear, is zeros, completed here without a read.
+/// The bit is set under the lock when the first write back of the chunk ends,
+/// so it is tested under the same hold.
+///
+/// Any other run not in the cache goes to the device below by the caller. It is put
 /// into the tree of reads first, under the same hold of the lock, and stays
 /// there until cache_read_done, so a write back of the chunk waits for it. If
 /// the chunk is under write back already, the read waits for it to end
@@ -391,6 +397,7 @@ void cache_write(struct cache *cache, struct bio *bio)
 /// @return true if the bio was completed, false if it has to be read from below
 bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range)
 {
+    struct written_map *written = cache->dm_ctx->written;
     sector_t chunk = bio->bi_iter.bi_sector / DATA_SIZE_SECTORS;
     unsigned int first = bio->bi_iter.bi_sector % DATA_SIZE_SECTORS;
     unsigned int sectors = bio_sectors(bio);
@@ -398,6 +405,7 @@ bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range)
     unsigned int run = sectors;
     bool cached = false;
     bool waited = false;
+    bool unwritten = false;
 
     spin_lock(&cache->lock);
     for (;;)
@@ -421,16 +429,23 @@ bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range)
 
     if (cached)
         copy_from_entry(entry, bio, first, run);
+    else if (!written_test(written, bio->bi_iter.bi_sector))
+        unwritten = true;
     else
         cache_insert_read(cache, range, chunk);
     spin_unlock(&cache->lock);
 
     if (run < sectors)
         dm_accept_partial_bio(bio, run);
-    if (cached)
+    if (unwritten)
+    {
+        atomic64_inc(&written->unwritten_reads);
+        zero_fill_bio(bio);
+    }
+    if (cached || unwritten)
         bio_endio(bio);
 
-    return cached;
+    return cached || unwritten;
 }
 
 /// @brief Takes a read of the device below out of the tree of reads in flight
@@ -471,7 +486,9 @@ void cache_flush(struct cache *cache, struct bio *bio)
 
 /// @brief Ends the write back of an entry once its last job is done; the lock must be held
 /// @details
-/// A written entry is freed. A failed one keeps its data and waits for a retry.
+/// A written entry is freed, and the bit of its chunk set in the bitmap of
+/// written chunks, before a read can miss the entry and go below. A failed one
+/// keeps its data and waits for a retry, its bit as it was.
 static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
 {
     cache->nr_writing--;
@@ -484,6 +501,7 @@ static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
         return;
     }
 
+    written_set(cache->dm_ctx->written, entry->chunk * DATA_SIZE_SECTORS);
     rb_erase(&entry->node, &cache->tree);
     entry->state = CACHE_FREE;
     entry->mask = 0;
@@ -618,8 +636,10 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 /// first waits for the jobs in flight and runs cache_sync, which makes the data
 /// durable and puts its CRC into the trailing copy; this is counted as a
 /// barrier. Then metadata_settle reads the chunk if its copies still differ in
-/// the sectors to be written.
-static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entry)
+/// the sectors to be written. A chunk never written back is not read: its old
+/// contents are zeros whatever its copies hold.
+/// @param unwritten Whether the bit of the chunk in the bitmap of written chunks is clear
+static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entry, bool unwritten)
 {
     struct metadata_cache *metadata = cache->dm_ctx->metadata;
     sector_t sector = entry->chunk * DATA_SIZE_SECTORS;
@@ -632,7 +652,8 @@ static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entr
         cache_sync(cache, NULL, false);
     }
 
-    metadata_settle(metadata, area, sector, entry->mask);
+    if (!unwritten)
+        metadata_settle(metadata, area, sector, entry->mask);
     metadata_put(metadata, area);
 }
 
@@ -644,12 +665,35 @@ static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entr
 /// before the first job: a read that met a job could see the data of one
 /// version of a sector and the CRC of another. Then the metadata of the chunk
 /// is made ready, see cache_prepare_metadata.
+///
+/// The first write back of a chunk, whose bit in the bitmap of written chunks is
+/// clear, writes it whole, the sectors not written from above as zeros: once
+/// the bit is set they are read from the device below, where they hold
+/// whatever was there before the format.
 static void cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
 {
-    u8 mask = entry->mask;
+    bool unwritten;
     unsigned int first;
     unsigned int run;
     unsigned int jobs = 0;
+    u8 mask;
+
+    spin_lock(&cache->lock);
+    unwritten = !written_test(cache->dm_ctx->written, entry->chunk * DATA_SIZE_SECTORS);
+    if (unwritten && entry->mask != 0xff)
+    {
+        char *base = kmap_local_page(entry->page);
+
+        for (first = 0; first < DATA_SIZE_SECTORS; first++)
+        {
+            if (!(entry->mask & BIT(first)))
+                memset(base + (first << SECTOR_SHIFT), 0, SECTOR_SIZE);
+        }
+        kunmap_local(base);
+        entry->mask = 0xff;
+    }
+    mask = entry->mask;
+    spin_unlock(&cache->lock);
 
     for (first = 0; first < DATA_SIZE_SECTORS; first += run)
     {
@@ -665,7 +709,7 @@ static void cache_write_back_entry(struct cache *cache, struct cache_entry *entr
         cache_wait(cache);
     spin_unlock(&cache->lock);
 
-    cache_prepare_metadata(cache, entry);
+    cache_prepare_metadata(cache, entry, unwritten);
 
     for (first = 0; first < DATA_SIZE_SECTORS; first += run)
     {
@@ -681,16 +725,21 @@ static bool cache_under_pressure(struct cache *cache)
     return cache->nr_free + cache->nr_writing < CACHE_STOP_FREE;
 }
 
-/// @brief Flushes the device below, completes the flushes from above, then writes the trailing copies
+/// @brief Flushes the device below, writes the bitmap, completes the flushes from above, then writes the
+/// trailing copies
 /// @details
 /// No write back job may be in flight, and none may start until it returns.
-/// The flushes from above complete once the device below has flushed, as their
-/// data is durable then: with BLK_STS_IOERR if failed is set, as a flush
-/// promises that nothing is left only in RAM. Then the trailing copies of the
-/// metadata of the chunks written back before get the CRCs of that durable
-/// data, and the device below is flushed once more, so that both copies are
-/// durable before a chunk is written back again. If the first flush fails, the
-/// trailing copies are not written: the data may not be on the device.
+/// Once the device below has flushed, the data written back is durable, and
+/// the first copy of each block of the bitmap with new bits is written, then
+/// the device below is flushed again, see written_write_first: a bit on the
+/// device means durable data. The flushes from above complete then: with
+/// BLK_STS_IOERR if failed is set, as a flush promises that nothing is left
+/// only in RAM, or if a flush or a block of the bitmap failed. Then the
+/// trailing copies of the metadata of the chunks written back before get the
+/// CRCs of that durable data, the other copies of the blocks of the bitmap are
+/// written, and the device below is flushed once more, so that both copies are
+/// durable before a chunk is written back again. If a flush before fails, no
+/// trailing copy is written: the data may not be on the device.
 ///
 /// Expected execution context - the worker, or postsuspend once the worker is
 /// cancelled; may sleep.
@@ -701,12 +750,21 @@ static bool cache_under_pressure(struct cache *cache)
 static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed)
 {
     struct metadata_cache *metadata = cache->dm_ctx->metadata;
+    struct written_map *written = cache->dm_ctx->written;
     struct block_device *bdev = cache->dm_ctx->dev->bdev;
     blk_status_t status;
     struct bio *bio;
     int r;
 
     r = blkdev_issue_flush(bdev);
+    if (!r)
+    {
+        r = written_write_first(written);
+        if (r > 0)
+            r = blkdev_issue_flush(bdev);
+        else if (r < 0)
+            DM_ERR_LIMIT("the bitmap of written chunks failed to write, err=%d\n", r);
+    }
     status = failed ? BLK_STS_IOERR : errno_to_blk_status(r);
     while (flushes && (bio = bio_list_pop(flushes)))
     {
@@ -716,12 +774,14 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 
     if (r)
     {
-        DM_ERR_LIMIT("lower flush failed, err=%d, trailing metadata not written\n", r);
+        DM_ERR_LIMIT("lower flush or bitmap failed, err=%d, trailing metadata not written\n", r);
+        written_abort(written);
         metadata_unpin_all(metadata);
         return r;
     }
 
     metadata_write_trails(metadata);
+    written_write_second(written);
 
     r = blkdev_issue_flush(bdev);
     if (r)

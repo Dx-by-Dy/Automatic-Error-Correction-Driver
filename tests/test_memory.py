@@ -189,6 +189,7 @@ def test_ordinary_load_does_not_wait(stack):
 def slow_reads():
     """The driver on dm-delay, which holds every read of the lower device back READ_DELAY_MS.
 
+    The chunks read are written first, as a chunk never written reads as zeros without the lower device.
     The metadata of the regions read is in RAM first: a read waits in dm_map for the metadata of its
     region, so with it read late the load would come to the limit only after it.
     """
@@ -197,6 +198,7 @@ def slow_reads():
     run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 {READ_DELAY_MS} {lower} 0 0\n")
     create_dcorr(f"/dev/mapper/{FAULTY_NAME}", sectors)
     upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+    run("dd", "if=/dev/zero", f"of=/dev/mapper/{UPPER_NAME}", "bs=1M", f"count={LIMIT_READ_MIB}", "oflag=direct", "conv=fsync")
     device = layout(sectors)
     for region in range(device.regions):
         start = device.region_logical(region)

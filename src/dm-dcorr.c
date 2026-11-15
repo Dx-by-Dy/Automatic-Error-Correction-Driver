@@ -1,6 +1,7 @@
 #include "dm-dcorr.h"
 #include "cache.h"
 #include "metadata.h"
+#include "written.h"
 #include "macros.h"
 
 MODULE_LICENSE("GPL");
@@ -16,8 +17,10 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// flushes the lower device before completing it. Device mapper sends one for
 /// each REQ_PREFLUSH, and the data of such a bio comes afterwards without the flag.
 ///
-/// A write goes into the cache, see cache_write. A read takes from the cache
-/// what it holds, see cache_read; for the rest it is put into the tree of reads
+/// A write goes into the cache, see cache_write, unless its chunk lies in a
+/// block of the bitmap invalid in both copies: such a range is read only, and
+/// the write fails. A read takes from the cache what it holds, and gives zeros
+/// for a chunk never written, see cache_read; for the rest it is put into the tree of reads
 /// of the cache, takes a place among the parts in flight, initializes the
 /// trn_p_rq in the per-bio data of the bio and processes it asynchronously.
 /// It waits if MAX_PARTS_IN_FLIGHT parts are in flight, which blocks the
@@ -63,6 +66,13 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         break;
 
     case REQ_OP_WRITE:
+        if (written_read_only(dm_ctx->written, bio->bi_iter.bi_sector))
+        {
+            atomic64_inc(&dm_ctx->written->refused_writes);
+            DM_ERR_LIMIT("write to chunk %llu refused: its block of the bitmap is invalid in both copies\n",
+                         (unsigned long long)(bio->bi_iter.bi_sector / DATA_SIZE_SECTORS));
+            return DM_MAPIO_KILL;
+        }
         cache_write(dm_ctx->cache, bio);
         return DM_MAPIO_SUBMITTED;
 
@@ -89,7 +99,8 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 /// must be the capacity it records, as dcorrsetup table prints it.
 ///
 /// Sequentially allocates and initializes all resources: work queue,
-/// lower-level device, the superblock, the metadata cache and the data cache.
+/// lower-level device, the superblock, the bitmap of written chunks, which
+/// reads the header of every group, the metadata cache and the data cache.
 ///
 /// On error at any stage, frees all previously allocated resources
 /// in reverse order of allocation.
@@ -162,13 +173,22 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_metadata;
     }
 
+    dm_ctx->written = written_create(dm_ctx->dev->bdev, &dm_ctx->sb,
+                                     dm_table_get_mode(ti->table) & BLK_OPEN_WRITE, &ti->error);
+    if (IS_ERR(dm_ctx->written))
+    {
+        r = PTR_ERR(dm_ctx->written);
+        DM_ERR("written_create failed, err=%d\n", r);
+        goto error_metadata;
+    }
+
     dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, &dm_ctx->sb.layout);
     if (IS_ERR(dm_ctx->metadata))
     {
         ti->error = "metadata cache alloc failed";
         r = PTR_ERR(dm_ctx->metadata);
         DM_ERR("metadata_cache_create failed, err=%d\n", r);
-        goto error_metadata;
+        goto error_written;
     }
 
     dm_ctx->cache = cache_create(dm_ctx);
@@ -191,6 +211,8 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 error_cache:
     metadata_cache_destroy(dm_ctx->metadata);
+error_written:
+    written_destroy(dm_ctx->written);
 error_metadata:
     dm_put_device(ti, dm_ctx->dev);
 error_dm_get_device:
@@ -216,6 +238,7 @@ static void dm_dtr(struct dm_target *ti)
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
     metadata_cache_destroy(dm_ctx->metadata);
+    written_destroy(dm_ctx->written);
     dm_put_device(ti, dm_ctx->dev);
     kfree(dm_ctx);
 }
@@ -225,7 +248,8 @@ static void dm_dtr(struct dm_target *ti)
 /// Device mapper calls it before a table is replaced or destroyed, so nothing
 /// written is left behind in the cache, but chunks whose write back fails.
 /// Then forgets the metadata in RAM, as the device below may change before
-/// the device is resumed.
+/// the device is resumed. The bitmap stays: the driver alone writes it, and
+/// the suspend has written it out.
 /// @param ti DM target
 static void dm_target_postsuspend(struct dm_target *ti)
 {
@@ -233,6 +257,18 @@ static void dm_target_postsuspend(struct dm_target *ti)
 
     cache_suspend(dm_ctx->cache);
     metadata_drop(dm_ctx->metadata);
+}
+
+/// @brief Reads the bitmap of written chunks on the first resume of the table
+/// @details
+/// See written_load_once: on a reload the old table is suspended by now.
+/// @param ti DM target
+/// @return 0, or an error that fails the resume
+static int dm_target_preresume(struct dm_target *ti)
+{
+    struct dm_context *dm_ctx = ti->private;
+
+    return written_load_once(dm_ctx->written);
 }
 
 /// @brief Lets the cache write back by age again
@@ -256,7 +292,12 @@ static void dm_target_resume(struct dm_target *ti)
 /// flushes the worker made because too many metadata areas were busy, flushes
 /// it made before writing back a chunk written back since the last one, chunks
 /// read before a write back as their two copies of the metadata differed, and
-/// sectors so read that matched neither copy or did not read.
+/// sectors so read that matched neither copy or did not read; then, of the
+/// bitmap of written chunks: chunks read as zeros without a read of the device
+/// below, as never written, blocks invalid in both copies when the device was
+/// created, blocks with one valid copy then, copies of the superblock of groups
+/// 2 and on that are invalid or differ, copies of blocks that failed to write,
+/// and writes refused in a read only range.
 /// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
@@ -274,7 +315,7 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
@@ -286,7 +327,13 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                (unsigned long long)atomic64_read(&dm_ctx->cache->crowded_flushes),
                (unsigned long long)atomic64_read(&dm_ctx->cache->barriers),
                (unsigned long long)atomic64_read(&dm_ctx->metadata->settle_reads),
-               (unsigned long long)atomic64_read(&dm_ctx->metadata->settle_mismatches));
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->settle_mismatches),
+               (unsigned long long)atomic64_read(&dm_ctx->written->unwritten_reads),
+               (unsigned long long)atomic64_read(&dm_ctx->written->read_only_blocks),
+               (unsigned long long)atomic64_read(&dm_ctx->written->single_blocks),
+               (unsigned long long)atomic64_read(&dm_ctx->written->bad_superblocks),
+               (unsigned long long)atomic64_read(&dm_ctx->written->write_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->written->refused_writes));
         break;
     case STATUSTYPE_TABLE:
     case STATUSTYPE_IMA:
@@ -303,6 +350,7 @@ static struct target_type target = {
     .dtr = dm_dtr,
     .map = dm_map,
     .postsuspend = dm_target_postsuspend,
+    .preresume = dm_target_preresume,
     .resume = dm_target_resume,
     .status = dm_status,
 };

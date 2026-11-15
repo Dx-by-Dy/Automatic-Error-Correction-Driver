@@ -118,7 +118,8 @@ static const char *superblock_probe(struct block_device *bdev, struct dcorr_supe
 /// the same generation should be equal, as the driver never writes the
 /// superblock; if they are not, the one of group 0 is taken, with a warning.
 ///
-/// The copies in the other groups are not read here.
+/// The copies in the other groups are checked when the bitmap is read, see
+/// superblock_verify.
 ///
 /// Expected execution context - the constructor of the target, may sleep.
 /// @param bdev  The device below
@@ -176,6 +177,7 @@ int superblock_read(struct block_device *bdev, struct superblock_info *info, cha
         DM_WARN("the superblocks of groups 0 and 1 differ in the same generation, taking group 0\n");
 
     info->layout = layout[chosen];
+    memcpy(info->uuid, sb[chosen]->uuid, sizeof(info->uuid));
     memcpy(info->salt, sb[chosen]->salt, sizeof(info->salt));
     info->group = chosen;
     info->generation = le64_to_cpu(sb[chosen]->generation);
@@ -186,4 +188,28 @@ out:
     for (copy = 0; copy < SUPERBLOCK_COPIES; copy++)
         kfree(sb[copy]);
     return r;
+}
+
+/// @brief Checks the copy of the superblock of another group against the one the driver took
+/// @details
+/// The copy must be valid for its place and the size of the device below, and
+/// belong to the same device and generation: the same UUID, salt and generation.
+/// @param sb    The copy as read
+/// @param group The group whose header it was read from
+/// @param info  What superblock_read took
+/// @return NULL if the copy is valid and the same, or why it is not
+const char *superblock_verify(const struct dcorr_superblock *sb, unsigned int group,
+                              const struct superblock_info *info)
+{
+    struct dcorr_layout layout;
+    const char *reason;
+
+    reason = superblock_check(sb, group, info->layout.lower_sectors, info->layout.group_sectors, &layout);
+    if (reason)
+        return reason;
+    if (memcmp(sb->uuid, info->uuid, sizeof(info->uuid)) || memcmp(sb->salt, info->salt, sizeof(info->salt)))
+        return "the copy of another device";
+    if (le64_to_cpu(sb->generation) != info->generation)
+        return "another generation";
+    return NULL;
 }

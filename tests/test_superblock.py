@@ -28,6 +28,7 @@ from harness import (
     SUPERBLOCK_SECTORS,
     TOOL,
     BlockDevice,
+    bitmap_block_crc,
     capacity,
     crc64_be,
     format_device,
@@ -70,11 +71,6 @@ NO_GROUP_1 = "no valid copy at the start of group 1 for any size of a group"
 
 def superblock_crc(superblock):
     return crc64_be(0, bytes(superblock[:CRC_OFFSET]) + bytes(8) + bytes(superblock[CRC_OFFSET + 8 :]))
-
-
-def bitmap_block_crc(block, salt):
-    """The CRC of a block of the bitmap: over the salt of the device, then over the block with crc zeroed."""
-    return crc64_be(crc64_be(0, salt), bytes(8) + bytes(block[8:]))
 
 
 def get_field(superblock, name):

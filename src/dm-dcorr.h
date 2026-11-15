@@ -28,6 +28,7 @@
 
 struct cache;
 struct metadata_cache;
+struct written_map;
 
 /// @brief DM target context
 /// @details
@@ -50,6 +51,9 @@ struct dm_context
 
     /// @brief Metadata areas of the regions kept in RAM
     struct metadata_cache *metadata;
+
+    /// @brief The bitmap of written chunks, all of it in RAM
+    struct written_map *written;
 
     /// @brief Free places for parts in flight, MAX_PARTS_IN_FLIGHT at most
     /// @details Taken in dm_map, given back in complete_work before bio_endio.

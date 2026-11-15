@@ -43,17 +43,27 @@ FUA_STRIDE = 4
 
 
 class LoggedStack:
-    """The driver on dm-log-writes on a zeroed lower device.
+    """The driver on dm-log-writes on a zeroed lower device, or one filled with the bytes given.
 
     The device is formatted through dm-log-writes, so the superblock is in the log and every replay,
-    which starts from a zeroed device, has it.
+    which starts from the same zeroed or filled device, has it.
     """
 
-    def __init__(self):
+    def __init__(self, fill=None):
         self.lower_sectors = LOWER_MIB * 2048
         self.lower_path = make_lower(self.lower_sectors)
+        self.fill = fill
+        if fill:
+            self.write_fill()
         self.log_device_path = make_lower(LOG_MIB * 2048, LOG_DEVICE_NAME, LOG_OFFSET_MIB)
         self.start_log(format=True)
+
+    def write_fill(self):
+        lower = BlockDevice(self.lower_path)
+        try:
+            lower.write(0, self.fill)
+        finally:
+            lower.close()
 
     def start_log(self, format=False):
         """Puts dm-log-writes on the lower device as it is, with a fresh log, and the driver on it."""
@@ -91,7 +101,10 @@ class LoggedStack:
     def replay(self, entries):
         """The device after a crash with only these entries on its disk; close it after use."""
         dmsetup_remove(UPPER_NAME)
-        run("dd", "if=/dev/zero", f"of={self.lower_path}", "bs=1M", "oflag=direct", f"count={LOWER_MIB}")
+        if self.fill:
+            self.write_fill()
+        else:
+            run("dd", "if=/dev/zero", f"of={self.lower_path}", "bs=1M", "oflag=direct", f"count={LOWER_MIB}")
         lower = BlockDevice(self.lower_path)
         try:
             replay(entries, lower)
@@ -101,13 +114,25 @@ class LoggedStack:
         return BlockDevice(self.upper_path)
 
 
+def remove_logged():
+    run("umount", MOUNTPOINT, check=False)
+    for name in (UPPER_NAME, LOG_NAME, LOG_DEVICE_NAME, LOWER_NAME):
+        dmsetup_remove(name)
+
+
 @pytest.fixture
 def logged():
     stack = LoggedStack()
     yield stack
-    run("umount", MOUNTPOINT, check=False)
-    for name in (UPPER_NAME, LOG_NAME, LOG_DEVICE_NAME, LOWER_NAME):
-        dmsetup_remove(name)
+    remove_logged()
+
+
+@pytest.fixture
+def logged_random():
+    """A LoggedStack on a lower device of random data, as a device only formatted would be."""
+    stack = LoggedStack(fill=os.urandom(LOWER_MIB << 20))
+    yield stack
+    remove_logged()
 
 
 def write_and_flush(path, writes):
@@ -423,3 +448,41 @@ def test_ext4_survives_a_crash_at_any_flush(logged):
     fua_only = [point for point in points if not entries[point].flags & FLUSH]
     for point in sorted(flushes + fua_only[::FUA_STRIDE]):
         check_ext4_after_a_crash(logged, entries, point, written, marks)
+
+
+# First writes to chunks never written: a whole chunk, one sector of another, and chunk 4 between them,
+# which shares their metadata sector and is not written.
+FIRST_WRITES = [(3 * DATA_SECTORS, pattern("whole", DATA_SECTORS)), (5 * DATA_SECTORS + 2, pattern("part", 1))]
+
+
+def test_first_writes_cut_anywhere_read_zeros_or_new(logged_random):
+    """A crash at any entry of the first writes of chunks leaves each of them zeros or its new data, whole.
+
+    The lower device holds random data, so a chunk read without its bit, or a sector of a partial first
+    write left as it was, would fail its CRC. Some points leave zeros and some the new data, or the test
+    would check nothing.
+    """
+    zeros = bytes(DATA_SECTORS * 512)
+    new = {chunk: bytearray(zeros) for chunk in (3, 4, 5)}
+    for start, data in FIRST_WRITES:
+        chunk, first = divmod(start, DATA_SECTORS)
+        new[chunk][first * 512 : first * 512 + len(data)] = data
+    logged_random.mark("start")
+    write_and_flush(logged_random.upper_path, FIRST_WRITES)
+    logged_random.mark("new")
+    entries = logged_random.finish()
+
+    states = set()
+    for point in range(mark_index(entries, "start"), mark_index(entries, "new") + 1):
+        device = logged_random.replay(entries[: point + 1])
+        try:
+            for chunk, image in new.items():
+                try:
+                    data = device.read(chunk * DATA_SECTORS, DATA_SECTORS)
+                except OSError as error:
+                    pytest.fail(f"chunk {chunk} does not read after a crash at entry {point}: {error}")
+                assert data in (zeros, bytes(image)), f"chunk {chunk} after a crash at entry {point}"
+                states.add((chunk, data == zeros))
+        finally:
+            device.close()
+    assert {(3, True), (3, False), (5, True), (5, False)} <= states, states

@@ -71,6 +71,12 @@ STATUS_FIELDS = (
     "barriers",
     "settle_reads",
     "settle_mismatches",
+    "unwritten_reads",
+    "read_only_blocks",
+    "single_blocks",
+    "bad_superblocks",
+    "bitmap_write_errors",
+    "refused_writes",
 )
 
 
@@ -88,7 +94,13 @@ def device_status(name=UPPER_NAME):
     crowded_flushes: flushes the driver made by itself, as too many metadata areas were busy;
     barriers: flushes it made before writing back a chunk written back since the last flush;
     settle_reads: chunks it read before a write back, as their two copies of the metadata differed;
-    settle_mismatches: sectors so read that matched neither copy, or did not read.
+    settle_mismatches: sectors so read that matched neither copy, or did not read;
+    unwritten_reads: chunks read as zeros without a read of the lower device, as never written;
+    read_only_blocks: blocks of the bitmap invalid in both copies when the device was created;
+    single_blocks: blocks of the bitmap with one valid copy then, repaired by the next flush;
+    bad_superblocks: copies of the superblock of groups 2 and on that are invalid or differ;
+    bitmap_write_errors: copies of blocks of the bitmap that failed to write;
+    refused_writes: writes refused in the range of a block invalid in both copies.
     """
     fields = run("dmsetup", "status", name).stdout.split()
     assert fields[2] == "dcorr", fields

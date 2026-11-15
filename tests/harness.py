@@ -4,6 +4,7 @@ import functools
 import mmap
 import os
 import signal
+import struct
 import subprocess
 from dataclasses import dataclass
 
@@ -239,6 +240,61 @@ def crc64_be(crc, data):
     return crc
 
 
+BITMAP_LEAD = 0
+BITMAP_TRAIL = 1
+SALT_OFFSET = 48
+SALT_SIZE = 16
+
+
+def bitmap_block_crc(block, salt):
+    """The CRC of a block of the bitmap: over the salt of the device, then over the block with crc zeroed."""
+    return crc64_be(crc64_be(0, salt), bytes(8) + bytes(block[8:]))
+
+
+@dataclass
+class BitmapBlock:
+    """A block of the bitmap of written chunks, struct dcorr_bitmap_block of src/dcorr-format.h."""
+
+    crc: int
+    generation: int
+    group: int
+    index: int
+    role: int
+    bits: bytes
+
+    @classmethod
+    def parse(cls, data):
+        crc, generation, group, index, role = struct.unpack_from("<QQQII", data)
+        return cls(crc, generation, group, index, role, bytes(data[BITMAP_HEADER_SIZE:BITMAP_BLOCK_SIZE]))
+
+    def valid(self, salt):
+        return self.crc == bitmap_block_crc(self.pack(fix_crc=False), salt)
+
+    def pack(self, salt=None, fix_crc=True):
+        """The block as on the device, with the CRC computed from the salt if one is given."""
+        data = bytearray(struct.pack("<QQQII", self.crc, self.generation, self.group, self.index, self.role))
+        data += self.bits
+        if fix_crc and salt is not None:
+            struct.pack_into("<Q", data, 0, bitmap_block_crc(data, salt))
+        return bytes(data)
+
+    def bit(self, number):
+        return bool(self.bits[number // 8] >> (number % 8) & 1)
+
+
+def bitmap_place(layout, logical):
+    """The group of the chunk of a logical sector, its block of the bitmap and its bit in the block."""
+    group, in_group = divmod(logical, layout.group_capacity)
+    index, bit = divmod(in_group // DATA_SECTORS, BITMAP_BLOCK_BITS)
+    return group, index, bit
+
+
+def bitmap_block_sector(layout, group, index, role):
+    """Where a copy of a block of the bitmap of a group lies on the lower device."""
+    start = layout.lead_bitmap_start(group) if role == BITMAP_LEAD else layout.trail_bitmap_start(group)
+    return start + index * BITMAP_BLOCK_SECTORS
+
+
 def pattern(seed, sectors):
     """Reproducible data in which every sector differs from all the others."""
     data = bytearray()
@@ -313,9 +369,9 @@ class BlockDevice:
     device would write back a whole 4 KiB block, damaging the neighbouring sectors.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, readonly=False):
         self.path = path
-        self.fd = os.open(path, os.O_RDWR | os.O_DIRECT)
+        self.fd = os.open(path, (os.O_RDONLY if readonly else os.O_RDWR) | os.O_DIRECT)
 
     def close(self):
         if self.fd is not None:

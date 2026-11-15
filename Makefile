@@ -1,6 +1,6 @@
 obj-m := dm-dcorr.o
 
-dm-dcorr-objs := src/dm-dcorr.o src/superblock.o src/bio_helper.o src/trn_p_rq.o src/trn_mw_rq.o src/trn_mr_rq.o src/cache.o src/metadata.o
+dm-dcorr-objs := src/dm-dcorr.o src/superblock.o src/bio_helper.o src/trn_p_rq.o src/trn_mw_rq.o src/trn_mr_rq.o src/cache.o src/metadata.o src/written.o
 
 ifdef DM_DEBUG_ENABLED
     ccflags-y += -DDM_DEBUG_ENABLED

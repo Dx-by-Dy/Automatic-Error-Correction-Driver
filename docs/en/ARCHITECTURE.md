@@ -32,7 +32,7 @@ where the rest is done.
 | **A sector fails to read**: a latent sector error, an uncorrectable read | Common: 20 to 63% of SSDs within 4 years; about 19% of nearline HDDs within 2 | An error of the lower device | Only the bio over it fails; later rebuilt by ECC between chunks and written in place | Detected | Correction |
 | **Data damaged silently**: decay, firmware, transfer, bits flipped by a power fault | 0.86% of nearline and 0.065% of enterprise HDDs in 41 months, often in consecutive blocks | CRC per 512-byte sector | As above | Detected | Correction |
 | **A write cut short by a crash**, torn at 512 bytes on some SSDs | 3 of 15 SSDs under power faults | Two copies of the metadata, the leading one durable before the data | Each sector reads its old or its new data | Done, except a crash together with a lost sector of the other copy | |
-| **A range reads back as zeros**: discarded by mistake, the mapping of an FTL lost, never written | No field data, only the mechanisms | A nonzero seed; the bitmap of written chunks says the chunk holds data | A read error for a chunk that was written; zeros, without a read, for one that was not | Not detected: zeros with zero metadata pass | Format |
+| **A range reads back as zeros**: discarded by mistake, the mapping of an FTL lost, never written | No field data, only the mechanisms | A nonzero seed; the bitmap of written chunks says the chunk holds data | A read error for a chunk that was written; zeros, without a read, for one that was not | Zeros without a read for a chunk never written; a written chunk zeroed with its metadata passes, as zeros with zero metadata do, until the seed | Format |
 | **A lost write**: acknowledged, even flushed, but not on the medium | 0.04% of nearline and 0.007% of enterprise HDDs in 17 months; 8 of 15 SSDs and 1 of 2 HDDs lost or reordered completed writes at a power fault | Data and metadata are separate writes: once the flush after a write back has passed, both copies hold the new CRC | A read error | Detected after that flush. Not detected before it, nor when both copies of the metadata are lost with the data | Format: a test |
 | **A misdirected write**: the data lands on another sector | Counted with lost writes; not seen under power faults | The CRC of the sector hit; its own place as a lost write; the logical sector and a salt per device in the seed | A read error | Detected unless the data equals that of the sector hit, or the whole layout is shifted by whole regions | Format |
 | **A write fails** | Rare: the drive remaps a bad place first, so an error that reaches the host means its spare is gone or the region is in a bad way | An error of the lower device | The chunk stays in RAM and is retried, every flush fails meanwhile, new writes are refused when such chunks fill the cache, reads go on. No reserved area | Done | |
@@ -107,8 +107,10 @@ the chunk is written.
   reads the superblocks of groups 0 and 1 in the constructor, never writes them, takes the valid one with the
   larger generation, warns about a copy that is not valid, and refuses the device when neither is, when its
   size is not the one formatted for, or when the length of the table is not the capacity. With group 0 not
-  valid, the start of group 1 is probed for each size of a group. The other headers, the bitmap and the salt
-  are not used yet.
+  valid, the start of group 1 is probed for each size of a group. On the first resume the header of every group is read, one
+  request each: the superblocks of groups 2 and on are checked against the one taken, and a copy that is not
+  valid or differs is counted and named in the log, not refused; the bitmap is taken from them, see below.
+  The salt is used only in the CRC of the bitmap yet.
 - A chunk is 8 data sectors, 4 KiB. Its metadata is an entry of 64 bytes: 8 `__le64` values, `crc64_be` of
   each data sector with a zero seed, in order. A metadata sector holds the entries of 8 neighbouring chunks.
 - The slots of a group are a sequence of regions, as in `dm-integrity`. A region holds 1024 slots of a chunk,
@@ -128,8 +130,20 @@ the chunk is written.
   every chunk read or written with one copy. A sector failed in both copies fails the reads of its 8 chunks,
   and the writes to them, as a write needs the other entries of the sector. A trailing sector that fails to
   write is counted in `dmsetup status`; it does not fail a flush, as the data and the leading copy are there.
-- There is no "never written" state yet. A device has to be zeroed before it is formatted; a chunk of zeros
-  with zero metadata passes the check.
+- **The bitmap of written chunks** is in RAM whole, a page per block, 32 MiB per TiB. Each block is taken from
+  its valid copy with the larger generation; a copy is valid with its CRC, its group, its index and its role.
+  A block valid in one copy is written by the next flush, the invalid copy first, unless the table is read
+  only; a block invalid in both makes its range read only: its chunks are read as written, so the CRC decides,
+  and writes there fail in `dm_map`. A chunk whose bit is clear reads as zeros without a read of the lower
+  device or its metadata, so a device is only formatted, never zeroed.
+- The first write back of a chunk, with its bit clear, writes the whole chunk, the sectors not written from
+  above as zeros, without reading it to settle its copies, which hold whatever was there; its bit is set in RAM
+  once it succeeds. A flush of the cache then goes: flush the lower device, write the first copy of each block
+  with new bits, with the next generation, flush, complete the flushes from above, write the trailing metadata
+  and the other copies of the blocks, flush. A bit on the device thus means the data is durable, and a crash
+  before it leaves the chunk zeros. A first copy that fails to write fails the flush from above and stays
+  dirty; a second one is counted, and is written first with the next change of its block.
+- A chunk of zeros with zero metadata whose bit is set still passes the check, until the seed.
 - Only a lower device with 512-byte logical blocks works, as metadata is written as one 512-byte sector.
 - The tests have their own copy of the layout in `tests/harness.py`.
 
@@ -366,8 +380,8 @@ it counts.
   user: the groups stay aligned to 1 MiB, and the header keeps room for later versions. Whole regions only, the
   rest of a group unused, also the choice of the user, to be looked at in the optimization stage.
 - **A full copy of the superblock in every group**, with the number of the group, so that a header in the wrong
-  place is seen. The constructor reads only groups 0 and 1; the others are to be checked when the bitmap reads
-  every header.
+  place is seen. The constructor takes the superblock from groups 0 and 1, and checks the others when the
+  bitmap reads every header.
 - **The bitmap of written chunks of a group** leads in its header and trails in the header of the next group,
   as the metadata of the regions does.
 - **Parity in fixed columns at the end of each group, P+Q over 30 + 2**, RAID 4 inside a group without
@@ -375,6 +389,21 @@ it counts.
   across a column boundary, which two parity members cover. Data stays contiguous in the first 30/32 of a
   group, so runs and the mapping stay simple. How and when parity is updated is for the correction stage; the
   space is reserved now, so that the layout does not change when ECC comes.
+
+**Decided** on 2026-11-15 with the user, **the bitmap of written chunks**, step 2 of the format stage:
+
+- The header of every group is read on the first resume of the table, the simple way; lazy loading or reads in
+  flight are for the optimization stage. Not in the constructor: on `dmsetup reload` the constructor of the new
+  table runs while the old one still writes, so the bits it sets after that would be missed; by the first
+  resume the old table is suspended and has written its bitmap. Found by `test_table_reload_under_load`. A
+  superblock of group 2 and on that is wrong is counted and named, not refused.
+- The CRC of a block does not take its place: the group, the index and the role in the block, under a CRC that
+  starts from the salt, are enough.
+- The first copies of the changed blocks are written without FUA and then flushed once: libata turns FUA off by
+  default, and an emulated FUA costs a flush per block.
+- A block found with one valid copy is repaired by the next flush.
+- A chunk whose bit is not on the device yet keeps its barrier, and the metadata of a region with no bit set is
+  read: both for the optimization stage.
 
 ## Decision log
 
@@ -400,3 +429,4 @@ it counts.
 | 2026-11-15 | The threat model is settled: zeroed ranges and misdirected writes in scope, lost writes in scope where the layout detects them; the CRC stays per 512-byte sector; the seed is nonzero, with the logical sector and a salt per device; a bitmap of written chunks in the superblock and in RAM; no reserved area | [Drive failures](RESEARCH.md#drive-failures): a write error reaching the host means the spare of the drive is gone; shorn writes come in units of 512 bytes; the seed costs nothing; the bitmap lies apart from the data it describes, an idea of the user |
 | 2026-11-15 | The superblock in two copies, at the start and in the middle; all layout parameters in it, version 1 accepting only the current values; the bitmap part of it; formatting by a utility in C, control through `dmsetup message` | Two places far apart on an HDD; a format open to change without variables on the I/O path; formatting in userspace, as in `dm-integrity`, keeps the constructor simple |
 | 2026-11-15 | Groups of 16 MiB to 4 GiB, 1 GiB by default, each a header of 1 MiB with a full superblock and the bitmaps, and whole regions; parity reserved in 2 of 32 columns at the end of each group; the constructor reads groups 0 and 1 and probes group 1 for every size | A superblock in every group survives a lost range and allows growing; parity far from its data within a group, room for ECC now so the layout does not change; the user chose the fixed header and whole regions |
+| 2026-11-15 | The bitmap of written chunks read from every header on the first resume of the table, written by the flush sequence: the first copy of the changed blocks after the flush that made their data durable, then a flush, the other copy with the trailing metadata; a first write back of a chunk writes it whole with zeros; a block invalid in both copies makes its range read only | A bit on the device means durable data, so a fresh device needs no zeroing and a crash leaves a first write zeros or new; a range whose bits are lost is still checked by its CRC, never read as zeros |

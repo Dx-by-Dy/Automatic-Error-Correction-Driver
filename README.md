@@ -62,8 +62,11 @@ the leading copy of the bitmap of the group and the trailing copy of the one of 
 of 32512 bits each, and room for the dirty stripes of the parity. The driver reads the superblocks of groups 0
 and 1 when the target is created, takes the valid one with the larger generation, and refuses a device with
 neither, or of another size than it was formatted for; with group 0 damaged it looks for group 1 at each size
-of a group. The bitmap is written, but not read yet, and the parity columns are reserved, not written. The
-layout is computed by `src/dcorr-format.h`, which the driver and `dcorrsetup` share.
+of a group. Then it reads the header of every group, checks its superblock, counting and naming one that is not
+valid or differs, and takes each block of the bitmap from its valid copy with the larger generation; this on
+the first resume of the table, so that on a reload the old table has written its bitmap first. The parity
+columns are reserved, not written. The layout is computed by `src/dcorr-format.h`, which the driver and
+`dcorrsetup` share.
 
 The logical chunks of a group take the first 30/32 of its slots in order, so the leading copy of a region and its
 data stay one contiguous range, aligned to 128 KiB. About 930 MiB of a group of 1 GiB hold data: the header
@@ -72,6 +75,17 @@ data stay one contiguous range, aligned to 128 KiB. About 930 MiB of a group of 
 The leading copy is written with each write back of a chunk, the trailing one after the lower device has
 flushed that write back, so once everything is flushed both copies hold the same. A read takes the checksum of
 a sector from either copy, so a metadata sector lost in one copy costs nothing; it is lost only when both are.
+
+### Bitmap of Written Chunks
+
+One bit per slot, the whole bitmap in RAM, 32 MiB per TiB. A chunk whose bit is clear has never been written
+back since the format: it reads as zeros, without a read of the lower device or its metadata, so a device is
+formatted, never zeroed. The first write back of such a chunk writes it whole, the sectors not written from
+above as zeros, and sets its bit in RAM once it succeeds; the bit reaches the device with the next flush, see
+[Flushes](#flushes). A copy of a block is valid with its CRC, which starts from the salt, its group, its index
+and its role. A block valid in one copy is repaired by the next flush, unless the table is read only. A block
+invalid in both makes its range read only: its chunks are read as written, so their CRC decides, and writes
+there fail. The code is in `src/written.c`.
 
 ### Cache
 
@@ -95,7 +109,8 @@ new writes fail.
    the last flush of the lower device, the worker flushes first: its data could otherwise be any of three
    versions. If the two copies of its metadata differ in the sectors to be written, after a crash or a failed
    write back, the chunk is read, and a sector that matches the leading copy gets that checksum in the trailing
-   copy, written with FUA.
+   copy, written with FUA. A chunk never written is not read: it is written whole, with zeros around what was
+   written from above.
 4. One lower write per run of its dirty sectors, each of which calculates the checksums, puts them into the
    leading copy of the metadata of the region in RAM, writes the leading metadata sector of the chunk from
    there with FUA, and only then the data.
@@ -107,7 +122,8 @@ new writes fail.
 
 1. Splitting the request into chunks;
 2. Copying the sectors held in the cache, and completing them;
-3. For the others: registering the read in the cache, copying both entries of the chunk from the metadata of
+3. Completing with zeros the chunks never written, see the bitmap;
+4. For the others: registering the read in the cache, copying both entries of the chunk from the metadata of
    its region in RAM, reading the data, unregistering it, calculating the checksums and accepting a sector that
    matches either entry, completing the request.
 
@@ -134,9 +150,11 @@ is counted, and its chunks go on with the leading copy.
 ### Flushes
 
 The device reports a write cache with FUA. An empty flush and a FUA write go to the worker of the cache, which
-writes back everything dirty, waits for it, and flushes the lower device. The flush completes then, and fails
-while any entry has failed to write back, as it would promise data that is not on the device. After that the
-worker writes the trailing copies of the metadata and flushes the lower device again, so that both copies are
+writes back everything dirty, waits for it, and flushes the lower device. Then it writes the first copy of each
+block of the bitmap with new bits, and flushes again, so a bit on the device means its data is durable. The
+flush completes then, and fails while any entry has failed to write back, or when a block of the bitmap failed
+to write, as it would promise data that is not on the device. After that the worker writes the trailing copies
+of the metadata and the other copies of the blocks, and flushes the lower device again, so that both copies are
 durable before the chunks are written back again. A suspend writes back everything
 too, so a table reload or a removal loses nothing, except chunks that still fail to write: they are named
 in the kernel log. Any other operation, such as discard, is refused.
@@ -214,8 +232,8 @@ tools/dcorrsetup table <underlying_device> | dmsetup create dcorr
 
 `dcorrsetup format` refuses a device in use, one smaller than two groups, and one that already holds a valid
 superblock unless given `--force`. `--group-size SIZE` chooses the size of a group, a power of two from `16M`
-to `4G`, `1G` by default. `dcorrsetup dump <underlying_device>` prints the superblock and the layout. Until the bitmap is read,
-the underlying device has to be zeroed before it is formatted: chunks never written are read and checked.
+to `4G`, `1G` by default. `dcorrsetup dump <underlying_device>` prints the superblock and the layout. The
+underlying device need not be zeroed: chunks never written read as zeros.
 
 Verify device creation:
 
@@ -229,7 +247,7 @@ Show the counters:
 dmsetup status dcorr
 ```
 
-After the usual `<start> <length> dcorr`, it prints thirteen counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy, how many times it flushed before writing back a chunk written back since the last flush, how many chunks it read before a write back as their two copies of the metadata differed, and how many sectors so read matched neither copy or did not read.
+After the usual `<start> <length> dcorr`, it prints nineteen counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy, how many times it flushed before writing back a chunk written back since the last flush, how many chunks it read before a write back as their two copies of the metadata differed, how many sectors so read matched neither copy or did not read, how many chunks were read as zeros as never written, how many blocks of the bitmap were invalid in both copies and how many had one valid copy when the target was created, how many copies of the superblock of groups 2 and on are not valid or differ, how many copies of blocks of the bitmap failed to write, and how many writes were refused in a read only range.
 
 ## Usage
 

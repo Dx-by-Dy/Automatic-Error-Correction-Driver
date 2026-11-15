@@ -1,6 +1,6 @@
 # Driver tests
 
-302 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+326 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 302 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 261 tests
+deploy/vm.sh test                                     # all 326 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 285 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -62,7 +62,13 @@ changes metadata on the lower device calls `drop_metadata()` from `conftest.py` 
 resumes the device. udev reads the start and the end of a device when it is created and after each resume,
 which reads the metadata of the first and the last region again, and of the one before it when the end of the
 device is near the start of the last region; the tests that count reads of metadata, or need it out of RAM, use
-region 1, or a larger device.
+region 1, or a larger device. A chunk never written reads as zeros without its metadata, so they write the
+chunks they read first.
+
+**Bitmap.** A chunk never written since the format reads as zeros, whatever the lower device holds, and its
+bit reaches the lower device only with a flush. `test_bitmap.py` fills its lower devices with random data
+before formatting them, as a device that is only formatted would be, and builds blocks of the bitmap with
+`BitmapBlock` of `harness.py`.
 
 **Kernel log.** Each test reads the kernel log it caused. An unknown `BUG`, `WARNING`, `Oops`, KASAN,
 UBSAN, lockdep or hung task report fails the test. `KNOWN_KERNEL_REPORTS` in `conftest.py` lists the
@@ -94,7 +100,7 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 | ---- | ----- | ------ |
 | `test_capacity_excludes_metadata_and_parity` | 1 | The device size on 32 MiB: two groups of 3 regions, each region adding 30/32 of its chunks |
 | `test_layout_of_the_chunks_at_the_borders` | 1 | Positions written out by hand: the superblocks at 0 and 32768; the first chunks of regions 0 and 1, the last chunk of data of group 0 in region 2 and the first of group 1 in region 3 at their places, 256 sectors into their regions; the first slot of parity zero; the entry of each in its leading metadata sector, the rest of the sector zero, and the trailing copy equal to it at the start of the next region of the group, region 0 for region 2; the trailing area of region 5, at the start of region 3, zero |
-| `test_fresh_device_reads_zeros` | 1 | A zeroed lower device reads as zeros, without CRC errors |
+| `test_fresh_device_reads_zeros` | 1 | A formatted device reads as zeros, without CRC errors |
 | `test_roundtrip` | 50 | Write and read back, 10 sizes from 1 to 2048 sectors at 5 start positions |
 | `test_data_lands_at_the_layout_position` | 3 | Every sector of 4 chunks is at its expected place on the lower device, at the start of a region, across the boundary of two and across the boundary of two groups |
 | `test_the_last_chunk_of_the_device` | 1 | The last chunk of the device, before the parity of the last group, lands where it should and reads back |
@@ -176,11 +182,11 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
 | `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: the journal commit is seen, as a FUA write on the lower device alone and as a flush through the driver, whose cache turns FUA into a write back and a flush; and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
-### `test_crash.py`: the device after a crash (12 tests)
+### `test_crash.py`: the device after a crash (13 tests)
 
 `dm-log-writes` logs every write that reaches the disk below the driver, with its flushes and FUA, in
 the order the data reaches the disk itself. `logwrites.py` reads the log and replays a prefix of it to the
-zeroed lower device, then the driver is put on it again: that is the device after a crash at that point.
+zeroed lower device, or one filled with the same random data, then the driver is put on it again: that is the device after a crash at that point.
 The format is that of `replay-log` from xfstests, which is not needed. The log is in the order writes
 complete, so a disk that persists two writes in another order between flushes cannot be replayed: the order of
 the driver's own writes is checked in the log itself. A second crash is replayed on top of the first: the log
@@ -195,7 +201,26 @@ is started again from the state of a replay, and the entries of both run in a ro
 | `test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions` | 1 | A chunk written back by age twice without a flush from above: one barrier, and a crash at every entry leaves one of its three versions |
 | `test_a_second_crash_after_one_between_the_copies` | 2 | A crash after the leading copy (old data left) or after the data (new data left), then a write of the chunk, logged anew: one read before the write back, no mismatch, and a second crash at every entry leaves what the first crash left or the newest data |
 | `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
+| `test_first_writes_cut_anywhere_read_zeros_or_new` | 1 | On a lower device of random data, a whole chunk and one sector of another written for the first time and flushed: a crash at every entry leaves each of them zeros or the new data with zeros around it, never an error, and both states are seen |
 | `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush after `mkfs`, and at every fourth FUA write: each write back writes its leading metadata sector with FUA, about 270 points besides 60 flushes, too many to check all in 10 minutes. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA |
+
+### `test_bitmap.py`: the bitmap of written chunks (23 tests)
+
+Groups of 16 MiB, one block of the bitmap each, on 48 MiB of random data, three groups.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_a_device_of_random_data_reads_zeros_once_formatted` | 1 | The whole device reads as zeros, with no metadata area read and every chunk counted in `unwritten_reads`; before the bitmap it failed its CRC |
+| `test_a_first_write_reads_back_with_zeros_around_it` | 1 | One sector, a whole chunk, a run across chunks, the ends of groups 0 and 1, written for the first time: each chunk reads the data with zeros around it, before and after the target is created again, and nothing was read to settle its copies |
+| `test_a_bit_reaches_the_device_only_with_a_flush` | 1 | Written back by age, both copies of the block keep generation 1 and the bit clear; after a flush both are valid, of generation 2, with their group, index and role, and only that bit; a flush with no new bit writes nothing |
+| `test_a_reload_keeps_the_bits_the_old_table_sets` | 2 | A chunk written, still in the cache or written back by age, then `dmsetup reload` and `resume`: the chunk reads under the new table, and a sector written there keeps the rest of the chunk after the target is created again. It failed with the bitmap read in the constructor |
+| `test_one_damaged_copy_is_covered_and_repaired` | 4 | The leading or the trailing copy damaged: the chunk reads, `single_blocks` 1 and a warning; a flush rewrites the copy with the generation and the bits of the other; with a read only table it stays damaged |
+| `test_the_copy_with_the_larger_generation_is_taken` | 2 | One copy put back to an older valid version: the chunk of the newer reads |
+| `test_a_block_of_another_place_or_device_is_not_taken` | 5 | The leading copy with another group, index or role, or a CRC from another salt, all with generation 100 and no bits: not taken, the chunk reads from the trailing copy. The same copy with nothing wrong is taken, and the chunk then reads as zeros: the positive control |
+| `test_a_block_invalid_in_both_copies_makes_its_range_read_only` | 1 | Both copies damaged: a warning, `read_only_blocks` 1; a written chunk reads, one never written fails its CRC, a write there fails and is counted; group 1 is written and read; the damaged copies are never written |
+| `test_the_superblock_of_every_other_group_is_checked` | 4 | The superblock of group 2 zeroed, of another device or of another generation: the device is created, `bad_superblocks` 1 and the reason in the log; unchanged, 0 |
+| `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write` | 1 | Over `dm-dust` failing one write of the leading copy: the flush fails, the error is counted, no copy has the bit; the next flush writes both, and the chunk reads after the target is created again |
+| `test_a_second_copy_that_fails_to_write_is_counted` | 1 | Over `dm-dust` failing one write of the trailing copy: the flush succeeds, the error is counted, the leading copy has the bit, the chunk reads after the target is created again |
 
 ### `test_lower_errors.py`: the lower device fails (17 tests)
 
@@ -230,7 +255,7 @@ with both copies; and when the trailing copy is written.
 | ---- | ----- | ------ |
 | `test_a_write_back_reads_nothing_when_the_metadata_is_in_ram` | 1 | After a first write of the region, a one-sector write and a write of the neighbouring chunk, with their flushes, read nothing from the lower device; every sector reads with its CRC |
 | `test_a_read_takes_one_lower_read_when_the_metadata_is_in_ram` | 1 | A read of a chunk written before reads the lower device once, for its data |
-| `test_a_region_is_read_once` | 1 | Reads of 11 chunks of a region read its metadata once, a read in the next region once more |
+| `test_a_region_is_read_once` | 1 | Reads of 11 chunks of a region, written before, read its metadata once, a read in the next region once more |
 | `test_a_suspend_drops_the_metadata` | 1 | A second read of a region reads no metadata, a read after a suspend and resume does |
 | `test_the_least_recently_used_region_is_dropped` | 1 | 32 regions fill the areas, the first is used again, then a new region takes the place of the second, not the first |
 | `test_data_is_right_after_its_region_was_dropped` | 1 | A chunk and then one sector of it written in each of 34 regions, so areas are dropped and read again in between: after the metadata is dropped, every sector reads with its CRC |
@@ -331,7 +356,7 @@ pool of metadata pages were removed with the pool: the I/O path takes no page an
 | `test_io_takes_nothing_from_slab_in_the_driver` | 2 | `read`, `write` and flush of 64 chunks while every slab allocation through the driver fails, for a write in any task, as the write back runs in the worker of the cache: no error and correct data |
 | `test_write_goes_on_with_only_the_bio_reserve` | 1 | `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
 | `test_ordinary_load_does_not_wait` | 1 | `fio` `randrw` with `bs=128k`, `iodepth=16`, at most 512 parts: `dmsetup status` shows no wait for a place among the parts in flight |
-| `test_parts_in_flight_stay_under_the_limit` | 1 | `slow`: over `dm-delay` holding every lower read back 100 ms, with the metadata of the regions read first, `fio` asks for 32 reads of 1 MiB at a time, 8192 parts: the parts in flight, by `/sys/block/<device>/inflight` of the driver, come above half the limit of 4096 and not above it (with 64 for parts completing), and reads waited in `dm_map`. 4096 at most in a run. The statistics of `dm-delay` count a bio only once it is sent on after the delay, so they cannot be used |
+| `test_parts_in_flight_stay_under_the_limit` | 1 | `slow`: over `dm-delay` holding every lower read back 100 ms, with the chunks written and the metadata of the regions read first, `fio` asks for 32 reads of 1 MiB at a time, 8192 parts: the parts in flight, by `/sys/block/<device>/inflight` of the driver, come above half the limit of 4096 and not above it (with 64 for parts completing), and reads waited in `dm_map`. 4096 at most in a run. The statistics of `dm-delay` count a bio only once it is sent on after the delay, so they cannot be used |
 
 The memory a load takes through the driver against the lower device was measured here until 2026-11-14, and
 dropped: on the debug kernel the difference, 100 to 535 MiB, is freed DM clones, one per 4 KiB, that KASAN and
@@ -345,6 +370,11 @@ on its own: the fio tests that compete for chunks go through it, but nothing che
 A part lives in the per-bio data of its bio, so `bio_endio` frees it, and it must be the last thing
 `complete_work` does. KASAN does not report a read of the part right after `bio_endio`, for a reason not found
 yet, so nothing here guards this. `kmemleak` and `/sys/kernel/slab/<cache>/shrink` show that parts are freed.
+
+Three things of the bitmap are not tested: the flush between the first copies of its blocks and the second
+ones, the order of the bitmap write after the flush of the data, and which copy `trail_first` writes first. A
+crash test would need a cut between two writes that the log replays in the order they completed, and dm-log-writes
+logs nothing of a write until it completes, so a reorder inside one flush never shows in a replay.
 
 If the kernel log overruns during a run, the summary reports it as `Kernel log overran N times`; a report in
 that window would go unseen.
@@ -479,6 +509,31 @@ The superblock, with `test_superblock.py` and `test_data.py`:
 
 The groups, on 1b, ran with `test_superblock.py`, `test_data.py` and `test_target.py` only. The mutations of
 step 1 about copy 1 in the middle no longer apply, as there is no middle copy.
+
+The bitmap of written chunks, with `test_bitmap.py` and
+`test_crash.py::test_first_writes_cut_anywhere_read_zeros_or_new`; all 19 caught:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| A chunk never written is read from the lower device | Failed, 3 | `test_a_device_of_random_data_reads_zeros_once_formatted`, `test_a_block_of_another_place_or_device_is_not_taken[nothing]`, the crash test |
+| A first write is not filled with zeros around it | Failed, 2 | `test_a_first_write_reads_back_with_zeros_around_it`, the crash test |
+| A chunk never written is settled before its write back | Failed | `test_a_first_write_reads_back_with_zeros_around_it`: the settle reads the random data and counts mismatches |
+| The bit is never set | Failed, 16 | Every test that writes, the crash test among them |
+| The generation of the copies is ignored, the leading taken | Failed | `test_the_copy_with_the_larger_generation_is_taken[leading]`; the trailing case passes, as the leading copy is the newer there |
+| The CRC of a block is not checked | Failed, 6 | The four cases of `test_one_damaged_copy_is_covered_and_repaired`, `[salt]` of `test_a_block_of_another_place_or_device_is_not_taken`, `test_a_block_invalid_in_both_copies_makes_its_range_read_only` |
+| The group of a block is not checked | Failed | `test_a_block_of_another_place_or_device_is_not_taken[group]` |
+| The index of a block is not checked | Failed | `test_a_block_of_another_place_or_device_is_not_taken[index]` |
+| The role of a block is not checked | Failed | `test_a_block_of_another_place_or_device_is_not_taken[role]` |
+| A block with one valid copy is not repaired | Failed, 2 | The writable cases of `test_one_damaged_copy_is_covered_and_repaired` |
+| A block with one valid copy is repaired with a read only table too | Failed, 2 | The read only cases of `test_one_damaged_copy_is_covered_and_repaired` |
+| Writes to the range of a block invalid in both copies are not refused | Failed | `test_a_block_invalid_in_both_copies_makes_its_range_read_only` |
+| That range reads as zeros, not from the lower device | Failed | `test_a_block_invalid_in_both_copies_makes_its_range_read_only` |
+| A failed write of the first copy does not fail the flush | Failed | `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write` |
+| The second copy is never written | Failed, 11 | The tests that look at both copies on the lower device |
+| The superblocks of groups 2 and on are not checked | Failed, 3 | `test_the_superblock_of_every_other_group_is_checked`, all but `[nothing]` |
+| A superblock of another device is taken | Failed | `test_the_superblock_of_every_other_group_is_checked[another device]` |
+| The generation of those superblocks is not compared | Failed | `test_the_superblock_of_every_other_group_is_checked[another generation]` |
+| The bitmap read in the constructor, not on the first resume | Failed, 3 | Both cases of `test_a_reload_keeps_the_bits_the_old_table_sets`, `test_table_reload_under_load`; the first full run found it there |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 

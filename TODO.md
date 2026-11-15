@@ -25,19 +25,24 @@ in a run, **From reading** means it was only found in the code.
 
 - **A zeroed chunk passes the check.** Confirmed: with a chunk and its metadata sector zeroed
   on the lower device, the read succeeds and returns zeros. CRC64 of zeros with a zero seed is
-  0, the same as empty metadata. A lost or trimmed region is never noticed. Fix, decided on 2026-11-15: a
-  nonzero seed, and a bitmap of written chunks in the superblock and in RAM to tell unwritten chunks from
-  written ones (see the next item and `ARCHITECTURE.md`, "On-disk format").
-- **A fresh device has to be zeroed by hand before it is formatted.** From reading: there is no "never written"
-  state yet, so on a device with old contents every read fails, and `deploy/vm.sh reinit` zeroes only the first
-  1 GiB. Fix, decided: the bitmap of written chunks, read by the driver.
-- **A damaged copy of the superblock stays damaged.** By decision, for now: the driver never writes the header,
-  and warns about a copy that is not valid each time the device is created. Fix: write it from the other copy,
-  in the driver or with a command of `dcorrsetup`.
-- **Only the superblocks of groups 0 and 1 are read.** By decision on 2026-11-15: the constructor reads those
-  two, and the copies in the headers of the other groups are never checked, so damage to them is not seen
-  until they are needed, by recovery or by growing. Fix: check every header in step 2 of the format stage,
-  when the bitmap is read from every one, with a counter and a warning; or a `dcorrsetup check`.
+  0, the same as empty metadata. A lost or trimmed region is never noticed. The bitmap of written chunks
+  tells such a chunk from one never written since 2026-11-15, but its zeros still pass the CRC. Fix,
+  decided on 2026-11-15: a nonzero seed, step 3 of the format stage.
+- **A damaged copy of the superblock stays damaged.** By decision, for now: the driver never writes a
+  superblock; it warns about a copy that is not valid each time the device is created, and counts those of
+  groups 2 and on in `dmsetup status`. Fix: write it from another copy, with a command of `dcorrsetup`.
+- **A block of the bitmap invalid in both copies makes its range read only.** By decision on 2026-11-15: its
+  chunks are read as written, so the CRC decides, and writes there fail, for the life of the device: the driver
+  never writes such a block, as it does not know which chunks were written. Counted in `dmsetup status`. Fix:
+  rebuild the block from the CRCs of its chunks, with `dcorrsetup` or in the correction stage.
+- **A copy of a block of the bitmap that failed to write is put right only with the next change of the block.**
+  By decision, as for the trailing metadata: until then the block has one copy, and the next change writes the
+  failed copy first. Counted. A block found with one copy when the device is created is repaired by the next
+  flush, unless the table is read only.
+- **A reload after a failed write of the bitmap loses its new bits.** The new table reads the bitmap on its
+  first resume, after the old one has written its bitmap on suspend; when that write fails, the new table reads
+  the chunks first written since the last good flush as zeros, though their data is on the device. Fix: hand
+  the bitmap in RAM from the old table to the new one, or refuse the resume.
 - **A stale copy of group 1 in the data can win the probe.** From reading: with group 0 damaged the driver
   takes the first valid copy of group 1 for any size of a group, from the smallest. `dcorrsetup format` wipes
   the starts of group 1 of the smaller sizes, but data written later that holds the image of such a
@@ -65,8 +70,8 @@ in a run, **From reading** means it was only found in the code.
   copies of its metadata passes for ever. Not tested: dropped writes need a test with `dm-flakey` and
   `drop_writes`, detected after that flush and passing before it.
 - **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
-  operation other than read, write and an empty flush. Discard needs the "never written" state,
-  so that a discarded chunk does not fail its check.
+  operation other than read, write and an empty flush. A bit of the bitmap of written chunks is never
+  cleared yet; discard and write zeroes are to clear it, step 4 of the format stage.
 
 - **A metadata sector failed in both copies fails 8 chunks.** By design of the layout: a metadata sector holds
   the entries of 8 chunks, so when neither copy reads, the reads of all of them fail, and so do the write backs,
@@ -112,6 +117,17 @@ Carried over from the previous list.
 - **Move `first_sector` and `nr_sectors` into `struct trn_p_rq`.**
 - **Use preallocation where possible.**
 - **Use the Crypto API to speed up CRC64.**
+- **The first resume reads the header of every group, one after another.** By decision on 2026-11-15, the simple
+  way: a request per group, about 76 KiB for groups of 1 GiB, so a seek per group on an HDD. Measured in the
+  VM, on a disk in RAM and a debug kernel: 128 groups in 24 ms, 32 in 6 ms, so about 0.2 ms a group without a
+  seek, 0.2 s for a TiB in groups of 1 GiB; on an HDD the seeks add around 10 ms a group, so around 10 s for a
+  TiB, not measured. Fix: several reads in flight, or the bitmap of a group read when it is first needed.
+- **The whole bitmap of written chunks is in RAM.** By decision: 32 MiB per TiB, allocated in the constructor.
+- **A chunk whose bit is not on the device yet still takes a barrier.** By decision on 2026-11-15, for
+  simplicity: written back twice before a flush, such a chunk reads as zeros after a crash whatever its slot
+  holds, so no barrier is needed. Fix: a second bitmap, of the bits on the device.
+- **The metadata area of a region with no bit set is read from the device.** Its entries are never used. Fix:
+  fill such an area with zeros without a read.
 - **A read of a region whose metadata is not in RAM blocks `dm_map`.** By decision, for simplicity: the read of
   the metadata area is waited for in `dm_map`, so a submitter with many requests in flight stalls for one lower
   read each time a request comes to a new region. Fix: a list of the parts waiting for an area, started by the
@@ -171,9 +187,9 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Integrity and format.** The bitmap of written chunks for "never written", a nonzero seed with the logical
-   sector and a salt, discard and write zeroes, a test of lost writes. The threat model was settled, the
-   superblock written and the device laid out in groups with room for parity on 2026-11-15; no reserved area.
+2. **Integrity and format.** A nonzero seed with the logical sector and a salt, discard and write zeroes, a test
+   of lost writes. The threat model was settled, the superblock written, the device laid out in groups with room
+   for parity and the bitmap of written chunks read and written on 2026-11-15; no reserved area.
 3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
 4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits, the

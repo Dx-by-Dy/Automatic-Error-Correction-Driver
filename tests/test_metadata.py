@@ -8,7 +8,8 @@ and writes the trailing copies by itself.
 
 udev reads the start and the end of a device when it is created and after each resume, which reads
 the metadata of the first and the last region. So the tests that count reads of metadata use the
-regions between them.
+regions between them. A chunk never written reads as zeros without its metadata, so they write the
+chunks they read first.
 """
 
 import os
@@ -45,6 +46,14 @@ def loads(stack):
 def written_and_flushed(stack, start, data):
     stack.upper.write(start, data)
     stack.upper.flush()
+
+
+def written_then_dropped(stack, starts):
+    """Writes a chunk at each start and flushes, then makes the driver forget the metadata."""
+    for start in starts:
+        stack.upper.write(start, pattern(start, DATA_SECTORS))
+    stack.upper.flush_settled()
+    stack.drop_metadata()
 
 
 def test_the_trailing_copy_is_written_after_a_flush(stack):
@@ -94,16 +103,19 @@ def test_a_region_is_read_once(make_stack):
     from regions 1 and 2.
     """
     stack = make_stack(lower_mib_for_regions(5))
-    stack.drop_metadata()
+    chunks = [region_sector(1, stack.lower_sectors) + chunk * DATA_SECTORS
+              for chunk in range(0, REGION_DATA_SECTORS // DATA_SECTORS, 97)]
+    written_then_dropped(stack, [*chunks, region_sector(2, stack.lower_sectors)])
     first = loads(stack)
-    for chunk in range(0, REGION_DATA_SECTORS // DATA_SECTORS, 97):
-        stack.upper.read(region_sector(1, stack.lower_sectors) + chunk * DATA_SECTORS, DATA_SECTORS)
+    for start in chunks:
+        stack.upper.read(start, DATA_SECTORS)
     assert loads(stack) == first + 1
     stack.upper.read(region_sector(2, stack.lower_sectors), DATA_SECTORS)
     assert loads(stack) == first + 2
 
 
 def test_a_suspend_drops_the_metadata(stack):
+    written_then_dropped(stack, [FIRST])
     stack.upper.read(FIRST, DATA_SECTORS)
     first = loads(stack)
     stack.upper.read(FIRST, DATA_SECTORS)
@@ -122,7 +134,7 @@ def test_the_least_recently_used_region_is_dropped(make_stack):
     """
     last = METADATA_AREAS + 1
     stack = make_stack(lower_mib_for_regions(last + 2))
-    stack.drop_metadata()
+    written_then_dropped(stack, [region_sector(region, stack.lower_sectors) for region in range(1, last + 1)])
 
     def read_region(region):
         stack.upper.read(region_sector(region, stack.lower_sectors), DATA_SECTORS)
