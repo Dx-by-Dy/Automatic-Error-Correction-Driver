@@ -28,9 +28,15 @@ in a run, **From reading** means it was only found in the code.
   0, the same as empty metadata. A lost or trimmed region is never noticed. Fix, decided on 2026-11-15: a
   nonzero seed, and a bitmap of written chunks in the superblock and in RAM to tell unwritten chunks from
   written ones (see the next item and `ARCHITECTURE.md`, "On-disk format").
-- **A fresh device has to be zeroed by hand.** From reading: there is no superblock, format
-  version or "never written" state. On a device with old contents every read fails, and
-  `deploy/vm.sh reinit` zeroes only the first 1 GiB.
+- **A fresh device has to be zeroed by hand before it is formatted.** From reading: there is no "never written"
+  state yet, so on a device with old contents every read fails, and `deploy/vm.sh reinit` zeroes only the first
+  1 GiB. Fix, decided: the bitmap of written chunks, read by the driver.
+- **A damaged copy of the superblock stays damaged.** By decision, for now: the driver never writes the header,
+  and warns about a copy that is not valid each time the device is created. Fix: write it from the other copy,
+  in the driver or with a command of `dcorrsetup`.
+- **The device cannot grow.** By decision on 2026-11-15: the size of the lower device must be the one it was
+  formatted for, as copy 1 of the superblock and the regions after it lie where that size puts them. Fix: a
+  feature of its own, moving copy 1 and the regions after it.
 - **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
   another chunk reads back without an error, as the sector number is not part of the CRC. A
   misdirected write would pass the same way, and so would a table whose offset is wrong by a whole number of
@@ -64,9 +70,6 @@ in a run, **From reading** means it was only found in the code.
   arguments, as `.status` gives nothing for `STATUSTYPE_TABLE`, so the table cannot be saved and
   reloaded. `dmsetup status` has only the counters of waits and of dirty and failed entries of the
   cache; counters such as CRC mismatches do not exist yet.
-- **The table length is ignored.** Confirmed: `dm_ctr` overwrites `ti->len` (16777216 requested,
-  14913080 used). Fix: require a correct length, return an error otherwise, and print the
-  right value with a helper command.
 - **Queue limits are not inherited.** From reading: there is no `.iterate_devices` or `.io_hints`.
   A lower device with 4K logical blocks is not rejected, although metadata is written
   as single 512-byte sectors.
@@ -148,7 +151,6 @@ Carried over from the previous list.
 
 ## Documentation
 
-- **The README passes a length that is not used**, see "The table length is ignored".
 - **The README claims functional testing is done**, and does not mention the VM.
 - **`MODULE_DESCRIPTION` says "Linux Kernel 6.16"**, while the driver builds on 7.1 and 7.2.
 
@@ -157,13 +159,13 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Integrity and format.** Superblock and version, a nonzero seed with the logical sector and a salt, the
-   bitmap of written chunks for "never written", discard, a test of lost writes. The threat model was settled on
-   2026-11-15; no reserved area.
+2. **Integrity and format.** The bitmap of written chunks for "never written", a nonzero seed with the logical
+   sector and a salt, discard and write zeroes, a test of lost writes. The threat model was settled and the
+   superblock written on 2026-11-15; no reserved area.
 3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
-4. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,
-   queue limits, the README.
+4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits, the
+   README.
 5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
    the cache and for the cache, with the memory a load takes through the driver against the lower device:
    on the debug kernel KASAN and kmemleak hold freed bios back, 100 to 535 MiB under `fio` with 1 MiB

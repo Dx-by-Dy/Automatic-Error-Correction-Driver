@@ -22,29 +22,33 @@ ZERO_SECTOR = bytes(SECTOR_SIZE)
 
 
 def test_capacity_excludes_metadata(stack):
-    """16 MiB below: 3 whole regions of 8448 sectors, then 7424 sectors, of which 256 are metadata."""
+    """16 MiB below: two areas of the superblock of 2048 sectors, 3 whole regions of 8448 sectors,
+    then 3328 sectors, of which 256 are metadata."""
     assert stack.lower_sectors == 32768
     reported = int(run("blockdev", "--getsz", stack.upper_path).stdout)
-    assert reported == 3 * 8192 + 7168
+    assert reported == 3 * 8192 + 3072
 
 
 def test_layout_of_the_first_chunks_of_two_regions(stack):
-    """The positions spelled out, apart from harness.py: data after 256 sectors of metadata, the
-    leading copy after the 128 sectors of the trailing copy of the region before, regions of 8448
-    sectors. 16 MiB below make 4 regions, so the trailing copy of the last one is at the start."""
+    """The positions spelled out, apart from harness.py: the area of copy 0 of the superblock, 2048
+    sectors, then regions of 8448 sectors, with the data after 256 sectors of metadata and the leading
+    copy after the 128 sectors of the trailing copy of the region before. 16 MiB below make 4
+    regions: copy 1 of the superblock takes 2048 sectors after region 1, at 18944, so region 2 starts
+    at 20992, and the trailing copy of region 3 is at the start of region 0."""
     first, second = pattern("region 0", DATA_SECTORS), pattern("region 1", DATA_SECTORS)
     stack.upper.write(0, first)
     stack.upper.write(8192, second)
     stack.upper.flush_settled()
-    assert stack.lower.read(256, DATA_SECTORS) == first
-    assert stack.lower.read(8448 + 256, DATA_SECTORS) == second
-    for metadata in (128, 8448 + 128):
+    assert stack.lower.read(0)[:8] == stack.lower.read(18944)[:8] == b"dm-dcorr", "the copies of the superblock"
+    assert stack.lower.read(2048 + 256, DATA_SECTORS) == first
+    assert stack.lower.read(10496 + 256, DATA_SECTORS) == second
+    for metadata in (2048 + 128, 10496 + 128):
         sector = stack.lower.read(metadata)
         assert sector[:METADATA_ENTRY_SIZE] != bytes(METADATA_ENTRY_SIZE), f"sector {metadata}"
         assert sector[METADATA_ENTRY_SIZE:] == bytes(SECTOR_SIZE - METADATA_ENTRY_SIZE), f"sector {metadata}"
-    assert stack.lower.read(8448) == stack.lower.read(128), "trailing copy of region 0"
-    assert stack.lower.read(2 * 8448) == stack.lower.read(8448 + 128), "trailing copy of region 1"
-    assert stack.lower.read(0, 128) == bytes(128 * SECTOR_SIZE), "trailing copy of region 3, not written"
+    assert stack.lower.read(10496) == stack.lower.read(2048 + 128), "trailing copy of region 0"
+    assert stack.lower.read(20992) == stack.lower.read(10496 + 128), "trailing copy of region 1"
+    assert stack.lower.read(2048, 128) == bytes(128 * SECTOR_SIZE), "trailing copy of region 3, not written"
 
 
 def test_fresh_device_reads_zeros(stack):
@@ -69,7 +73,7 @@ def test_data_lands_at_the_layout_position(stack, start):
     stack.upper.flush()
     for logical in range(start, start + sectors):
         expected = data[(logical - start) * SECTOR_SIZE :][:SECTOR_SIZE]
-        assert stack.lower.read(physical_sector(logical)) == expected, f"sector {logical}"
+        assert stack.lower.read(physical_sector(logical, stack.lower_sectors)) == expected, f"sector {logical}"
     assert stack.upper.read(start, sectors) == data
 
 
@@ -78,7 +82,7 @@ def test_the_last_chunk_of_a_short_region(stack):
     data = pattern("last", DATA_SECTORS)
     stack.upper.write(last, data)
     stack.upper.flush()
-    assert stack.lower.read(physical_sector(last), DATA_SECTORS) == data
+    assert stack.lower.read(physical_sector(last, stack.lower_sectors), DATA_SECTORS) == data
     assert stack.upper.read(last, DATA_SECTORS) == data
 
 

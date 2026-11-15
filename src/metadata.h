@@ -193,8 +193,8 @@ struct metadata_cache
     /// @brief The device below
     struct block_device *bdev;
 
-    /// @brief Number of regions of the device
-    sector_t regions;
+    /// @brief Layout of the device, owned by the context of the target
+    const struct dcorr_layout *layout;
 
     /// @brief How many areas were read from the device below
     atomic64_t loads;
@@ -212,7 +212,7 @@ struct metadata_cache
     atomic64_t settle_mismatches;
 };
 
-struct metadata_cache *metadata_cache_create(struct block_device *bdev, sector_t regions);
+struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout);
 void metadata_cache_destroy(struct metadata_cache *cache);
 struct metadata_area *metadata_get(struct metadata_cache *cache, sector_t sector);
 void metadata_put(struct metadata_cache *cache, struct metadata_area *area);

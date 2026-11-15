@@ -84,11 +84,21 @@ the chunk is written.
 
 ## On-disk format
 
-**Current.** Not final: there is no superblock and no version, so a change of format needs no migration.
+**Current.** Version 1, not final: nothing has been released, so a change of format needs no migration yet.
 
+- The lower device is `[area of copy 0 | regions 0 .. M - 1 | area of copy 1 | regions M .. R - 1]`, with
+  `M = R / 2`, as `src/dcorr-format.h` computes it for the driver and `dcorrsetup` both. An area is a header
+  of 4 KiB and the blocks of the bitmap of written chunks, 4 KiB with a header of 32 bytes for 32512 chunks
+  each, rounded up to 1 MiB. The header holds magic, version, the number of the copy, a generation, flags, a
+  UUID, a salt, the size of the lower device, the capacity, all parameters of the layout and a CRC64 over it.
+- `dcorrsetup format` writes both areas, with empty bitmaps of generation 1, and nothing else. The driver
+  reads both headers in the constructor, never writes them, takes the valid one with the larger generation,
+  warns about a copy that is not valid, and refuses the device when neither is, when its size is not the one
+  formatted for, or when the length of the table is not the capacity. Two regions at least; the bitmap and
+  the salt are not used yet.
 - A chunk is 8 data sectors, 4 KiB. Its metadata is an entry of 64 bytes: 8 `__le64` values, `crc64_be` of
   each data sector with a zero seed, in order. A metadata sector holds the entries of 8 neighbouring chunks.
-- The lower device is a sequence of regions, as in `dm-integrity`. A region holds 1024 chunks, 4 MiB of data,
+- The data is a sequence of regions, as in `dm-integrity`. A region holds 1024 chunks, 4 MiB of data,
   and is laid out as `[trailing copy of the metadata of the region before | leading copy of this region |
   data]`: 128 sectors, 128 sectors, 8192 sectors, 8448 in all. The trailing copy of the last region goes into
   region 0. The leading copy and the data of a region are one contiguous range, and the data stays aligned to
@@ -107,8 +117,8 @@ the chunk is written.
   write is counted in `dmsetup status`; it does not fail a flush, as the data and the leading copy are there.
 - The last region may be shorter: it keeps its whole metadata area and as many whole chunks as fit. The
   capacity is 8192 sectors per whole region, plus the chunks of the last one.
-- There is no "never written" state. A device has to be zeroed before use; a chunk of zeros with zero metadata
-  passes the check.
+- There is no "never written" state yet. A device has to be zeroed before it is formatted; a chunk of zeros
+  with zero metadata passes the check.
 - Only a lower device with 512-byte logical blocks works, as metadata is written as one 512-byte sector.
 - The tests have their own copy of the layout in `tests/harness.py`.
 
@@ -151,8 +161,9 @@ writing its leading copy over a trailing one that does not match the data would 
   damaged bits; a stripe is not made of neighbours, as damage comes in consecutive blocks; on an HDD its
   redundancy lies far from the data; parity is updated only from data that passed its CRC, or one error spreads
   over the stripe.
-- **Superblock and version**: in the format stage. It holds the version, the layout parameters, the salt and the
-  bitmap below; where it lies, its copies and how a device is formatted are to be settled.
+- **Superblock and version**: laid out and checked, see Current above. Still open: when the driver writes the
+  header and raises its generation, putting a damaged copy right, and growing a device, which is a feature of
+  its own, decided on 2026-11-15.
 
 **Decided** on 2026-11-15, after the [reading on drive failures](RESEARCH.md#drive-failures):
 

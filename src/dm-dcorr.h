@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 
 #include "bio_helper.h"
+#include "superblock.h"
 #include "trn_p_rq.h"
 
 /// @brief Number of parts that may be in flight at once
@@ -40,6 +41,9 @@ struct dm_context
 
     /// @brief Lower-level device
     struct dm_dev *dev;
+
+    /// @brief The layout and the salt, from the superblock of the device below
+    struct superblock_info sb;
 
     /// @brief Work queue for asynchronous bio processing
     struct workqueue_struct *transform_wq;

@@ -7,8 +7,8 @@ cmd_sync() {
     rsync -a --delete -e "ssh -F $SSH_CONFIG" \
         --exclude='.*' --exclude='*.o' --exclude='*.ko' --exclude='*.mod' --exclude='*.mod.c' \
         --exclude='*.cmd' --exclude=modules.order --exclude=Module.symvers --exclude=__pycache__ \
-        --exclude=results --exclude=figures --exclude=vdb \
-        "$REPO_DIR/Makefile" "$REPO_DIR/src" "$REPO_DIR/tests" "$REPO_DIR/benchmarks" "$REPO_DIR/deploy" corrdm:corrdm/
+        --exclude=results --exclude=figures --exclude=vdb --exclude=dcorrsetup \
+        "$REPO_DIR/Makefile" "$REPO_DIR/src" "$REPO_DIR/tools" "$REPO_DIR/tests" "$REPO_DIR/benchmarks" "$REPO_DIR/deploy" corrdm:corrdm/
 }
 
 # reinit [--no-sync] [-d]: --no-sync keeps the copy in the VM, as when it was broken on purpose.

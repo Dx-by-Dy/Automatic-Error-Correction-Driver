@@ -14,7 +14,7 @@ regions between them.
 import os
 
 from conftest import wait_for_write_back
-from harness import DATA_SECTORS, REGION_DATA_SECTORS, REGION_SECTORS, SECTOR_SIZE, metadata_sectors, pattern
+from harness import DATA_SECTORS, REGION_DATA_SECTORS, SECTOR_SIZE, lower_mib_for_regions, metadata_sectors, pattern
 
 # METADATA_AREAS and METADATA_CROWDED in src/metadata.h.
 METADATA_AREAS = 32
@@ -79,8 +79,13 @@ def test_a_read_takes_one_lower_read_when_the_metadata_is_in_ram(stack):
     assert lower_reads(stack) == before + 1
 
 
-def test_a_region_is_read_once(stack):
-    """Reads of many chunks of a region read its metadata once, and another region reads its own."""
+def test_a_region_is_read_once(make_stack):
+    """Reads of many chunks of a region read its metadata once, and another region reads its own.
+
+    Five whole regions, so that udev, which reads the end of the device after the resume, keeps away
+    from regions 1 and 2.
+    """
+    stack = make_stack(lower_mib_for_regions(5))
     stack.drop_metadata()
     first = loads(stack)
     for chunk in range(0, REGION_DATA_SECTORS // DATA_SECTORS, 97):
@@ -108,7 +113,7 @@ def test_the_least_recently_used_region_is_dropped(make_stack):
     just before one more region comes, so region 2 has to go instead.
     """
     last = METADATA_AREAS + 1
-    stack = make_stack(((last + 2) * REGION_SECTORS * 512 >> 20) + 1)
+    stack = make_stack(lower_mib_for_regions(last + 2))
     stack.drop_metadata()
 
     def read_region(region):
@@ -130,7 +135,7 @@ def test_the_least_recently_used_region_is_dropped(make_stack):
 def test_data_is_right_after_its_region_was_dropped(make_stack):
     """Chunks written in more regions than there are areas read back right once they are read again."""
     regions = METADATA_AREAS + 2
-    stack = make_stack((regions * REGION_SECTORS * 512 >> 20) + 1)
+    stack = make_stack(lower_mib_for_regions(regions))
     for region in range(regions):
         written_and_flushed(stack, region * REGION_DATA_SECTORS + FIRST, pattern(region, DATA_SECTORS))
     for region in range(regions):
@@ -154,7 +159,7 @@ def test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned(make_stack)
     more regions than areas, so without the flush the write back would wait for an area for ever.
     """
     regions = METADATA_AREAS + 4
-    stack = make_stack(((regions + 2) * REGION_SECTORS * 512 >> 20) + 1)
+    stack = make_stack(lower_mib_for_regions(regions + 2))
 
     def start(region):
         return region * REGION_DATA_SECTORS + CHUNK * DATA_SECTORS

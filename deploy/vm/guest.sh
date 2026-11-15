@@ -4,7 +4,8 @@
 #
 # The whole script is read before main runs, so commands below cannot eat the rest of it from stdin.
 
-# Rebuilds and reloads the driver, then creates the dcorr device on /dev/vdb, zeroed at the start.
+# Rebuilds and reloads the driver and dcorrsetup, then creates the dcorr device on /dev/vdb, zeroed at
+# the start and formatted.
 # -d builds the debug version.
 guest_reinit() {
     local device
@@ -29,7 +30,8 @@ guest_reinit() {
     insmod dm-dcorr.ko
 
     dd if=/dev/zero of=/dev/vdb bs=1G count=1
-    echo "0 $(blockdev --getsz /dev/vdb) dcorr /dev/vdb" | dmsetup create dcorr
+    tools/dcorrsetup format --force /dev/vdb
+    tools/dcorrsetup table /dev/vdb | dmsetup create dcorr
 }
 
 # Runs the tests, passing the arguments to pytest. Exit code 3 means a hang: the kernel is

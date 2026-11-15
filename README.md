@@ -26,14 +26,21 @@ The project serves as a foundation for future implementation of Error Correcting
 The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
 [ARCHITECTURE.md](docs/en/ARCHITECTURE.md). This section describes the driver as it is.
 
-The virtual device is divided into chunks of 4 KiB, 8 sectors, and the chunks into regions of 1024 chunks,
-4 MiB of data, as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per
+The lower device starts with a superblock, written by `dcorrsetup format`, and holds a second copy of it in
+the middle. The virtual device is divided into chunks of 4 KiB, 8 sectors, and the chunks into regions of 1024
+chunks, 4 MiB of data, as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per
 sector, 64 bytes; a metadata sector holds the entries of 8 neighbouring chunks. The metadata of a region is
 kept in two copies: the leading one next to its data, the trailing one in the next region.
 
 ### Layout
 
 ```text
++-----------+-----------------+-----------+-------------------+
+| area of   | regions         | area of   | regions           |
+| copy 0    | 0 .. M - 1      | copy 1    | M .. R - 1        |
++-----------+-----------------+-----------+-------------------+
+                                              M = R / 2
+
 region 0                                  region 1
 +-----------+-----------+-------------+   +-----------+-----------+-------------+
 | trailing  | leading   | data        |   | trailing  | leading   | data        |
@@ -41,6 +48,14 @@ region 0                                  region 1
 | 128 sect. | 128 sect. | 8192 sect.  |   | 128 sect. | 128 sect. | 8192 sect.  |
 +-----------+-----------+-------------+   +-----------+-----------+-------------+
 ```
+
+An area of the superblock is a header of 4 KiB and the blocks of a bitmap of written chunks, 4 KiB each for
+32512 chunks, rounded up to 1 MiB: 1 MiB up to about 32 GiB of data. The header holds the version of the format,
+the number of the copy, a generation, a UUID, a random salt, the size of the lower device, all parameters of the
+layout and a CRC64. The driver reads both copies when the target is created, takes the valid one with the
+larger generation, and refuses a device with neither, or of another size than it was formatted for. The
+bitmap is written, but not read yet. The layout is computed by `src/dcorr-format.h`, which the driver and
+`dcorrsetup` share.
 
 The leading copy of a region and its data are one contiguous range, and the data stays aligned to 4 KiB. The
 trailing copy of the last region is at the start of region 0. The last region may be shorter: it keeps both of
@@ -152,16 +167,17 @@ At most 4096 parts, reads and write back jobs, are in flight per device. A bio-b
 * GNU Make
 * GCC or Clang
 
-### Build module
+### Build
 
 ```bash
 make
 ```
 
-The resulting module:
+This builds the module and the utility:
 
 ```text
 dm-dcorr.ko
+tools/dcorrsetup
 ```
 
 ## Installation
@@ -180,11 +196,17 @@ lsmod | grep dm_dcorr
 
 ## Device Mapper Setup
 
-Example target creation:
+Format the underlying device, then create the target with the line `dcorrsetup table` prints, as its length
+must be the capacity recorded in the superblock:
 
 ```bash
-echo "0 <sectors> dcorr <underlying_device>" | dmsetup create dcorr
+tools/dcorrsetup format <underlying_device>
+tools/dcorrsetup table <underlying_device> | dmsetup create dcorr
 ```
+
+`dcorrsetup format` refuses a device in use, and one that already holds a valid superblock unless given
+`--force`. `dcorrsetup dump <underlying_device>` prints the superblock and the layout. Until the bitmap is read,
+the underlying device has to be zeroed before it is formatted: chunks never written are read and checked.
 
 Verify device creation:
 

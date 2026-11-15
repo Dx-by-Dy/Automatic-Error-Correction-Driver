@@ -9,7 +9,7 @@ ROOT_SIZE=${CORRDM_ROOT_SIZE:-40G}
 # spares the SSD. It holds nothing worth keeping, and start creates it again when it is gone.
 TEST_DISK_DIR=${CORRDM_TEST_DISK_DIR:-/dev/shm/corrdm}
 TEST_DISK_SIZE=${CORRDM_TEST_DISK_SIZE:-2G}
-TEST_TIMEOUT=${CORRDM_TEST_TIMEOUT:-1800}
+TEST_TIMEOUT=${CORRDM_TEST_TIMEOUT:-3600}
 REINIT_TIMEOUT=300
 
 TEST_DISK=$TEST_DISK_DIR/vdb.img

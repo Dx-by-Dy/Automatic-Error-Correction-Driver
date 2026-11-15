@@ -1,9 +1,11 @@
 """Helpers shared by the tests: the on-disk layout and direct I/O on block devices."""
 
+import functools
 import mmap
 import os
 import signal
 import subprocess
+from dataclasses import dataclass
 
 HANG_FILE = "/run/dcorr-tests.hung"
 HANG_EXIT_CODE = 3
@@ -24,32 +26,117 @@ REGION_METADATA_SECTORS = REGION_CHUNKS // CHUNKS_PER_METADATA_SECTOR
 REGION_DATA_SECTORS = REGION_CHUNKS * DATA_SECTORS
 REGION_DATA_OFFSET = 2 * REGION_METADATA_SECTORS
 REGION_SECTORS = REGION_DATA_OFFSET + REGION_DATA_SECTORS
+# The lower device: [area, copy 0 | regions 0 .. M - 1 | area, copy 1 | regions M .. R - 1], M = R // 2.
+# An area is the header of the superblock and the blocks of the bitmap, rounded up to 1 MiB.
+# A copy of src/dcorr-format.h of its own, so that the tests check the layout of the driver.
+HEADER_SECTORS = 8
+HEADER_SIZE = HEADER_SECTORS * SECTOR_SIZE
+BITMAP_BLOCK_SECTORS = 8
+BITMAP_BLOCK_BITS = (BITMAP_BLOCK_SECTORS * SECTOR_SIZE - 32) * 8
+AREA_ALIGN_SECTORS = 2048
+MIN_REGIONS = 2
+
+TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "dcorrsetup")
 
 
-def physical_sector(logical):
+def regions_capacity(sectors):
+    """Logical sectors that regions laid out over this many sectors hold: whole regions, and the whole
+    chunks that fit into a last short one after its metadata areas."""
+    regions, rest = divmod(sectors, REGION_SECTORS)
+    last = max(rest - REGION_DATA_OFFSET, 0) // DATA_SECTORS * DATA_SECTORS
+    return regions * REGION_DATA_SECTORS + last
+
+
+def bitmap_blocks(capacity):
+    return -(-(capacity // DATA_SECTORS) // BITMAP_BLOCK_BITS)
+
+
+def area_sectors(capacity):
+    sectors = HEADER_SECTORS + bitmap_blocks(capacity) * BITMAP_BLOCK_SECTORS
+    return -(-sectors // AREA_ALIGN_SECTORS) * AREA_ALIGN_SECTORS
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Where everything lies on a lower device of a given size."""
+
+    lower_sectors: int
+    area_sectors: int
+    capacity: int
+    regions: int
+    middle_region: int
+    bitmap_blocks: int
+
+    def copy_start(self, copy):
+        """First sector of an area of the superblock."""
+        return 0 if copy == 0 else self.area_sectors + self.middle_region * REGION_SECTORS
+
+    def region_start(self, region):
+        return (
+            self.area_sectors
+            + region * REGION_SECTORS
+            + (self.area_sectors if region >= self.middle_region else 0)
+        )
+
+
+@functools.cache
+def layout(lower_sectors):
+    """The layout of a lower device, None if it is too small."""
+    area = area_sectors(0)
+    while True:
+        if lower_sectors <= 2 * area:
+            return None
+        capacity = regions_capacity(lower_sectors - 2 * area)
+        if area_sectors(capacity) <= area:
+            break
+        area = area_sectors(capacity)
+    regions = -(-capacity // REGION_DATA_SECTORS)
+    if regions < MIN_REGIONS:
+        return None
+    return Layout(lower_sectors, area, capacity, regions, regions // 2, bitmap_blocks(capacity))
+
+
+def capacity(lower_sectors):
+    """Logical size in sectors of a device on top of a lower device of this size."""
+    return layout(lower_sectors).capacity
+
+
+def lower_mib_for_regions(regions):
+    """The smallest lower device in MiB with at least this many whole regions of data."""
+    mib = 1
+    while not layout(mib * 2048) or capacity(mib * 2048) < regions * REGION_DATA_SECTORS:
+        mib += 1
+    return mib
+
+
+def physical_sector(logical, lower_sectors):
     """Sector on the lower device that holds a logical data sector."""
     region, in_region = divmod(logical, REGION_DATA_SECTORS)
-    return region * REGION_SECTORS + REGION_DATA_OFFSET + in_region
+    return layout(lower_sectors).region_start(region) + REGION_DATA_OFFSET + in_region
 
 
-def metadata_sector(logical):
+def metadata_sector(logical, lower_sectors):
     """Sector on the lower device that holds the leading copy of the CRCs for a logical data sector,
     among other chunks."""
     region, in_region = divmod(logical, REGION_DATA_SECTORS)
-    return region * REGION_SECTORS + REGION_METADATA_SECTORS + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+    return (
+        layout(lower_sectors).region_start(region)
+        + REGION_METADATA_SECTORS
+        + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+    )
 
 
 def trail_sector(logical, lower_sectors):
     """Sector on the lower device that holds the trailing copy of the CRCs for a logical data sector."""
     region, in_region = divmod(logical, REGION_DATA_SECTORS)
-    regions = -(-capacity(lower_sectors) // REGION_DATA_SECTORS)
-    holder = 0 if region + 1 == regions else region + 1
-    return holder * REGION_SECTORS + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
+    device = layout(lower_sectors)
+    holder = 0 if region + 1 == device.regions else region + 1
+    return device.region_start(holder) + in_region // DATA_SECTORS // CHUNKS_PER_METADATA_SECTOR
 
 
 def metadata_sectors(logical, lower_sectors):
     """Both copies of the metadata sector of a logical data sector: the leading one, then the trailing one."""
-    return metadata_sector(logical), trail_sector(logical, lower_sectors)
+    return metadata_sector(logical, lower_sectors), trail_sector(logical, lower_sectors)
 
 
 def metadata_offset(logical):
@@ -57,11 +144,30 @@ def metadata_offset(logical):
     return logical // DATA_SECTORS % CHUNKS_PER_METADATA_SECTOR * METADATA_ENTRY_SIZE
 
 
-def capacity(lower_sectors):
-    """Logical size in sectors of a device on top of a lower device of this size."""
-    regions, rest = divmod(lower_sectors, REGION_SECTORS)
-    last = max(rest - REGION_DATA_OFFSET, 0) // DATA_SECTORS * DATA_SECTORS
-    return regions * REGION_DATA_SECTORS + last
+def format_device(path, force=False):
+    """Writes a fresh superblock to a device with dcorrsetup."""
+    run(TOOL, "format", *(["--force"] if force else []), path)
+
+
+def table_line(path):
+    """The table line of dmsetup for a formatted device, from dcorrsetup."""
+    return run(TOOL, "table", path).stdout
+
+
+CRC64_POLY = 0x42F0E1EBA9EA3693
+CRC64_TABLE = []
+for _byte in range(256):
+    _crc = _byte << 56
+    for _ in range(8):
+        _crc = (_crc << 1 ^ CRC64_POLY if _crc & 1 << 63 else _crc << 1) & (1 << 64) - 1
+    CRC64_TABLE.append(_crc)
+
+
+def crc64_be(crc, data):
+    """crc64_be of the kernel: CRC-64/ECMA-182, no reflection, no final xor, continuing crc."""
+    for byte in data:
+        crc = CRC64_TABLE[(crc >> 56 ^ byte) & 0xFF] ^ crc << 8 & (1 << 64) - 1
+    return crc
 
 
 def pattern(seed, sectors):

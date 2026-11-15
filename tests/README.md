@@ -1,6 +1,6 @@
 # Driver tests
 
-222 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+256 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 222 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 181 tests, about 5 minutes
+deploy/vm.sh test                                     # all 256 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 215 tests, about 6 minutes
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -22,13 +22,16 @@ pytest through `deploy/vm/guest.sh`. Logs go to `~/vms/corrdm/logs/`: the test o
 | 0 | All tests passed or failed as expected |
 | 1 | A test failed |
 | 3 | A hang: the VM stays stuck for inspection, recover with `deploy/vm.sh reset` |
-| 124 | Nothing finished in `CORRDM_TEST_TIMEOUT` (30 minutes), which should not happen |
+| 124 | Nothing finished in `CORRDM_TEST_TIMEOUT` (60 minutes; a full run takes over 30), which should not happen |
 
 ## How a test runs
 
 **Device.** The `stack` fixture gives each test a new device, `make_stack(lower_mib)` one of a chosen
 size. The stack is `dcorr-test` (the driver) on `dcorr-test-lower` (`dm-linear` over the start of
-`/dev/vdb`). The lower device is zeroed first, 16 MiB by default. Two files build stacks of their own, with a
+`/dev/vdb`). The lower device is zeroed first, 16 MiB by default, then formatted with `tools/dcorrsetup`, and
+the table gets the capacity `harness.py` computes, which the driver checks against the superblock. Every stack
+formats through its top layer, so `test_crash.py` formats through `dm-log-writes` and every replay has the
+superblock with its salt. Two files build stacks of their own, with a
 third layer between the two: `test_crash.py` puts `dm-log-writes` there (`dcorr-test-log`, its log on
 `dcorr-test-logdev` at 256 MiB of `/dev/vdb`), `test_lower_errors.py` puts `dm-dust` or `dm-flakey` there
 (`dcorr-test-faulty`).
@@ -39,16 +42,22 @@ back, damaging its neighbours. Tests damage data through `stack.lower` and use i
 A write through the driver is sure to be on the lower device only after `flush()`, so a test that looks at the
 lower device, or damages it, flushes first. A failed write may be reported by the write or by the flush.
 
-**Layout.** `harness.py` has its own copy of the on-disk layout: regions of 1024 chunks, each with 128
-sectors for the copy of the metadata of the region before, 128 sectors of its own metadata and 8192 sectors
-of data; an entry of 8 CRCs of 8 bytes per chunk, 8 entries to a metadata sector. A change of layout has to be
-made there as well. `test_layout_of_the_first_chunks_of_two_regions` spells the positions out apart from it.
+**Layout.** `harness.py` has its own copy of the on-disk layout, `layout(lower_sectors)`, apart from
+`src/dcorr-format.h`, which the driver and `dcorrsetup` share: two areas of the superblock of at least 1 MiB,
+one at the start and one before region `R // 2`; regions of 1024 chunks, each with 128 sectors for the copy of
+the metadata of the region before, 128 sectors of its own metadata and 8192 sectors of data; an entry of 8 CRCs
+of 8 bytes per chunk, 8 entries to a metadata sector. The positions depend on the size of the lower device, so
+`physical_sector` and `metadata_sector` take it. A change of layout has to be made there as well.
+`test_layout_of_the_first_chunks_of_two_regions` spells the positions out apart from both, and
+`test_dcorrsetup_gives_the_layout_of_the_tests` compares `dcorrsetup dump` with `harness.py`. `crc64_be` there is
+the CRC of the kernel, so that the tests can build a header by hand.
 
 **Metadata in RAM.** The driver keeps the metadata of the regions it used in RAM until a suspend, so a test that
 changes metadata on the lower device calls `drop_metadata()` from `conftest.py` afterwards, which suspends and
 resumes the device. udev reads the start and the end of a device when it is created and after each resume,
-which reads the metadata of the first and the last region again; the tests that count reads of metadata, or
-need it out of RAM, use region 1.
+which reads the metadata of the first and the last region again, and of the one before the last when that is
+short, as on 16 MiB, where regions 0, 2 and 3 come back; the tests that count reads of metadata, or need it out
+of RAM, use region 1, or a larger device.
 
 **Kernel log.** Each test reads the kernel log it caused. An unknown `BUG`, `WARNING`, `Oops`, KASAN,
 UBSAN, lockdep or hung task report fails the test. `KNOWN_KERNEL_REPORTS` in `conftest.py` lists the
@@ -78,8 +87,8 @@ cannot be `xfail`, as it would end the run, so it gets `known_hang`.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_capacity_excludes_metadata` | 1 | The device size on 16 MiB: 3 whole regions and a short one, without metadata |
-| `test_layout_of_the_first_chunks_of_two_regions` | 1 | The first chunks of regions 0 and 1 at the positions written out by hand: data after 256 sectors, the entry first in the leading metadata sector at 128, the rest of the sector zero; the trailing copy of each at the start of the next region, equal to the leading one; the trailing area of the last region, at sector 0, zero |
+| `test_capacity_excludes_metadata` | 1 | The device size on 16 MiB: two areas of the superblock, 3 whole regions and a short one, without metadata |
+| `test_layout_of_the_first_chunks_of_two_regions` | 1 | The first chunks of regions 0 and 1 at the positions written out by hand: both copies of the superblock, at 0 and 18944; region 0 at 2048, data after 256 sectors of it, the entry first in the leading metadata sector at 128 of it, the rest of the sector zero; the trailing copy of each at the start of the next region, region 2 after copy 1, equal to the leading one; the trailing area of the last region, at the start of region 0, zero |
 | `test_fresh_device_reads_zeros` | 1 | A zeroed lower device reads as zeros, without CRC errors |
 | `test_roundtrip` | 50 | Write and read back, 10 sizes from 1 to 2048 sectors at 5 start positions |
 | `test_data_lands_at_the_layout_position` | 2 | Every sector of 4 chunks is at its expected place on the lower device, at the start of a region and across the boundary of two |
@@ -244,15 +253,42 @@ are not checked. The
 tables of the device are small enough for `kmalloc`, so `/proc/vmallocinfo` does not show them; it showed the
 lock table, which is gone.
 
-### `test_target.py`: arguments and table of the target (7 tests)
+### `test_target.py`: arguments and table of the target (8 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_bad_arguments_are_rejected` | 3 | No arguments, too many, a missing device |
 | `test_device_takes_the_usable_length` | 1 | A table with the correct length gives a device of that size |
-| `test_too_long_a_device_is_rejected` | 1 | **xfail**: The table length is ignored |
+| `test_a_length_other_than_the_capacity_is_rejected` | 2 | A chunk longer or shorter than the capacity in the superblock is refused |
 | `test_table_shows_the_lower_device` | 1 | **xfail**: `dmsetup table` does not show the device |
 | `test_target_may_start_after_sector_0` | 1 | With a table that puts the target after sector 0, its first sector lands on sector 0 of the lower device |
+
+### `test_superblock.py`: the superblock and `dcorrsetup` (33 tests)
+
+The header is also built by hand, with the layout and `crc64_be` of `harness.py`, so that the driver is seen to
+take a header made apart from `dcorrsetup` and to refuse each field that is wrong. The reasons are read from the
+kernel log.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_the_header_built_by_the_tests_is_taken` | 1 | The control of the tests below: `crc64_be` of the tests gives the check value of CRC-64/ECMA-182 and the CRC `dcorrsetup` wrote, and a header rewritten with it is taken |
+| `test_a_device_without_a_superblock_is_refused` | 1 | A zeroed device: no magic in either copy |
+| `test_a_wrong_field_in_both_copies_is_refused` | 10 | Version, flags, the size of a chunk, of a region and of a block of the bitmap, the size of the device, the capacity, the number of regions, the middle region, the size of an area: each with its reason |
+| `test_a_copy_with_the_number_of_the_other_is_refused` | 1 | The two copies with each other's number, as after misdirected writes |
+| `test_a_damaged_crc_is_refused` | 1 | A bit flipped in the reserved bytes, which only the CRC covers |
+| `test_one_damaged_copy_is_covered_by_the_other` | 2 | Copy 0 or copy 1 zeroed: the device comes up from the other with a warning, and the data written before reads |
+| `test_both_damaged_copies_are_refused` | 1 | Both copies zeroed |
+| `test_the_copy_with_the_larger_generation_is_taken` | 2 | Generation 2 in copy 0 or in copy 1 |
+| `test_copies_that_differ_in_the_same_generation_warn` | 1 | Another salt in copy 1: a warning, copy 0 taken |
+| `test_copies_that_agree_do_not_warn` | 1 | The control of the test above |
+| `test_a_device_of_another_size_is_refused` | 1 | Formatted on 16 MiB, the device below grown by 1 MiB |
+| `test_the_smallest_device` | 2 | Two regions, the second with one chunk, is taken by both; one chunk less, `dcorrsetup` and the driver refuse it as too small |
+| `test_dcorrsetup_gives_the_layout_of_the_tests` | 4 | `dump` and `table` against `harness.py` on 9, 16 and 100 MiB and on 16 MiB and 300 sectors, and the driver takes the device |
+| `test_every_region_lies_where_the_layout_says` | 1 | The first and the last chunk of every region on 16 MiB land where `harness.py` puts them, on both sides of copy 1 |
+| `test_a_large_device_with_a_larger_area` | 1 | A sparse file of 40 GiB on a loop device: 256 blocks of the bitmap make the area 2 MiB; `dump` agrees with `harness.py`, and the first chunk, the first of the middle region and the last land where it says |
+| `test_format_keeps_a_valid_superblock_without_force` | 1 | `format` again fails and keeps the UUID; with `--force` the UUID changes |
+| `test_format_refuses_a_device_in_use` | 1 | With the driver on top, `format --force` fails: the device is opened with `O_EXCL` |
+| `test_dump_of_a_device_without_a_superblock_fails` | 1 | `dump` of a zeroed device fails and names both copies |
 
 ### `test_filesystem.py`: files survive on a filesystem (2 tests, `slow`)
 
@@ -411,6 +447,15 @@ Waits, with the two tests that replaced the unstable test of memory:
 | The limit on parts in flight is 16384 instead of 4096 | Failed | `test_parts_in_flight_stay_under_the_limit` |
 | A wait for a free entry is not counted | Failed | `test_writes_larger_than_the_cache_wait_for_free_entries` |
 | No write back under pressure, only by age and for a flush | Passed, as it should | `test_writes_larger_than_the_cache_wait_for_free_entries`: writes still wait and all arrive; the test checks the waits, not why the cache drains |
+
+The superblock, with `test_superblock.py` and `test_data.py`:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The driver does not check the CRC of the header | Failed | `test_a_damaged_crc_is_refused` |
+| The copy with the smaller generation is taken | Failed, 2 | Both cases of `test_the_copy_with_the_larger_generation_is_taken` |
+| The driver reads copy 1 8 sectors off its place | Failed | `test_one_damaged_copy_is_covered_by_the_other[0]`; with copy 0 valid nothing else notices |
+| No shift after copy 1 in `dcorr_region_start`, for the driver and `dcorrsetup` both | Failed, 4 | `test_every_region_lies_where_the_layout_says`, `test_a_large_device_with_a_larger_area`, `test_layout_of_the_first_chunks_of_two_regions`, `test_the_last_chunk_of_a_short_region`; `dump` agrees with `harness.py`, as the fields stay the same |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
 

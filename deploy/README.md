@@ -7,9 +7,9 @@ debug kernel (KASAN, lockdep, UBSAN, kmemleak) and is reachable over SSH on loca
 ```bash
 deploy/vm.sh create       # once: download the image, create and provision the VM
 deploy/vm.sh start        # start the VM and wait for SSH
-deploy/vm.sh reinit       # sync the working tree, rebuild, reload, recreate the device
+deploy/vm.sh reinit       # sync the working tree, rebuild the driver and dcorrsetup, reload, recreate the device
 deploy/vm.sh test [ARGS]  # reinit, run the tests, ARGS go to pytest: -m "not slow", -k corruption
-deploy/vm.sh check        # compiler warnings at W=1, sparse, checkpatch
+deploy/vm.sh check        # compiler warnings at W=1, sparse, checkpatch; dcorrsetup with -Werror
 deploy/vm.sh ssh [CMD]    # shell in the VM or run CMD there
 deploy/vm.sh status       # the VM, the test disk and the driver
 deploy/vm.sh reset        # power off and start again, for a stuck kernel
@@ -54,7 +54,7 @@ reaches the file. It uses Linux AIO on a real disk and its own threads on tmpfs,
 | `image.sh` | `create`, `provision`, `destroy` |
 | `power.sh` | `start`, `stop`, `reset`, `status`, the test disk |
 | `driver.sh` | `sync`, `reinit`, `test`, `check` |
-| `guest.sh` | Runs as root inside the VM: rebuilds and reloads the driver, runs pytest |
+| `guest.sh` | Runs as root inside the VM: rebuilds and reloads the driver and `dcorrsetup`, formats `/dev/vdb` and creates `dcorr` on it, runs pytest |
 
 `guest_run` sends `guest.sh` over SSH to `bash` in the VM, so the guest needs only the synced tree.
 `guest.sh` refuses to run outside a VM.

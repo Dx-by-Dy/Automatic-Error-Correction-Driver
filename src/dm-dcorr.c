@@ -84,10 +84,12 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
 
 /// @brief Initializes the DM target on creation
 /// @details
-/// Expects a single argument argv[0] — path to the lower-level device.
+/// Expects a single argument argv[0] — path to the lower-level device, formatted
+/// by dcorrsetup. The superblock gives the layout, and the length of the target
+/// must be the capacity it records, as dcorrsetup table prints it.
 ///
-/// Sequentially allocates and initializes all resources:
-/// work queue, lower-level device, the metadata cache and the data cache.
+/// Sequentially allocates and initializes all resources: work queue,
+/// lower-level device, the superblock, the metadata cache and the data cache.
 ///
 /// On error at any stage, frees all previously allocated resources
 /// in reverse order of allocation.
@@ -147,9 +149,20 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_dm_get_device;
     }
 
-    ti->len = device_new_capacity(get_capacity(dm_ctx->dev->bdev->bd_disk));
+    r = superblock_read(dm_ctx->dev->bdev, &dm_ctx->sb, &ti->error);
+    if (r)
+        goto error_metadata;
 
-    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, DIV_ROUND_UP_SECTOR_T(ti->len, REGION_DATA_SECTORS));
+    if (ti->len != dm_ctx->sb.layout.capacity)
+    {
+        ti->error = "The length must be the capacity in the superblock, see dcorrsetup table";
+        DM_ERR("length %llu, the superblock gives %llu\n", (unsigned long long)ti->len,
+               (unsigned long long)dm_ctx->sb.layout.capacity);
+        r = -EINVAL;
+        goto error_metadata;
+    }
+
+    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, &dm_ctx->sb.layout);
     if (IS_ERR(dm_ctx->metadata))
     {
         ti->error = "metadata cache alloc failed";

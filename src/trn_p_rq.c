@@ -107,8 +107,8 @@ void trn_p_rq_init(struct trn_p_rq *part,
     DM_DEBUG("part=%p, bio=%p, type=%d\n", part, bio, type);
 
     part->sector = bio->bi_iter.bi_sector;
-    part->index = start_data_sector(bio->bi_iter.bi_sector);
-    part->metadata_sector = metadata_sector(bio->bi_iter.bi_sector);
+    part->index = start_data_sector(&dm_ctx->sb.layout, bio->bi_iter.bi_sector);
+    part->metadata_sector = metadata_sector(&dm_ctx->sb.layout, bio->bi_iter.bi_sector);
     part->dm_ctx = dm_ctx;
     part->bio = bio;
     part->type = type;
@@ -131,7 +131,7 @@ void trn_p_rq_init(struct trn_p_rq *part,
     part->orig_end_io = bio->bi_end_io;
     bio->bi_end_io = trn_p_rq_end_io;
     bio->bi_private = part;
-    bio->bi_iter.bi_sector = align_data_sector(bio->bi_iter.bi_sector);
+    bio->bi_iter.bi_sector = align_data_sector(&dm_ctx->sb.layout, bio->bi_iter.bi_sector);
     bio_set_dev(bio, dm_ctx->dev->bdev);
 
     DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);

@@ -7,7 +7,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from conftest import FAULTY_NAME, LOWER_NAME, UPPER_NAME, device_status, dmsetup_remove, drop_metadata, make_lower
+from conftest import (
+    FAULTY_NAME,
+    LOWER_NAME,
+    UPPER_NAME,
+    create_dcorr,
+    device_status,
+    dmsetup_remove,
+    drop_metadata,
+    make_lower,
+)
 from harness import (
     DATA_SECTORS,
     REGION_DATA_SECTORS,
@@ -32,11 +41,13 @@ READ_DELAY_MS = 1000
 SETTLE_SECONDS = 0.3
 # Every write to the lower device waits this long on the stack with slow writes.
 WRITE_DELAY_MS = 5
+# The size of the lower device of DelayedStack.
+DELAYED_LOWER_MIB = 12
 
 
 def on_lower(stack, logical=FIRST, count=DATA_SECTORS):
     """What the lower device holds for logical sectors of one chunk."""
-    return stack.lower.read(physical_sector(logical), count)
+    return stack.lower.read(physical_sector(logical, stack.lower_sectors), count)
 
 
 def with_sectors(data, changes):
@@ -127,7 +138,7 @@ def test_a_read_of_a_partly_dirty_chunk(stack, original):
 
 
 def test_a_dirty_sector_reads_while_a_clean_one_is_damaged(stack, original):
-    stack.lower.flip_bit(physical_sector(FIRST + 6))
+    stack.lower.flip_bit(physical_sector(FIRST + 6, stack.lower_sectors))
     update = pattern("update", 1)
     stack.upper.write(FIRST + 3, update)
     assert stack.upper.read(FIRST + 3) == update
@@ -162,7 +173,7 @@ def slow_writes():
     sectors = 2 * CACHE_MIB * 2048
     lower = make_lower(sectors)
     run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} delay {lower} 0 0 {lower} 0 {WRITE_DELAY_MS}\n")
-    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
+    create_dcorr(f"/dev/mapper/{FAULTY_NAME}", sectors)
     upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
     yield upper
     upper.close()
@@ -200,7 +211,7 @@ class DelayedStack:
     second later, so a write back that does not wait for the read lands in between.
     """
 
-    def __init__(self, slow, count, lower_mib=12):
+    def __init__(self, slow, count, lower_mib=DELAYED_LOWER_MIB):
         sectors = lower_mib * 2048
         lower = make_lower(sectors)
         end = slow + count
@@ -210,7 +221,7 @@ class DelayedStack:
             f"{end} {sectors - end} linear {lower} {end}\n"
         )
         run("dmsetup", "create", FAULTY_NAME, stdin=table)
-        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
+        create_dcorr(f"/dev/mapper/{FAULTY_NAME}", sectors)
         self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
         self.threads = ThreadPoolExecutor(max_workers=1)
         self.original = pattern("original", DATA_SECTORS)
@@ -235,7 +246,7 @@ class DelayedStack:
 @pytest.fixture
 def delayed():
     """Reads of the metadata sector of CHUNK are delayed."""
-    stack = DelayedStack(metadata_sector(FIRST), 1)
+    stack = DelayedStack(metadata_sector(FIRST, DELAYED_LOWER_MIB * 2048), 1)
     yield stack
     stack.remove()
 
@@ -243,7 +254,7 @@ def delayed():
 @pytest.fixture
 def delayed_data():
     """Reads of the data of CHUNK are delayed."""
-    stack = DelayedStack(physical_sector(FIRST), DATA_SECTORS)
+    stack = DelayedStack(physical_sector(FIRST, DELAYED_LOWER_MIB * 2048), DATA_SECTORS)
     yield stack
     stack.remove()
 

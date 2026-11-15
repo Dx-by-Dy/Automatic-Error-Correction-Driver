@@ -67,3 +67,4 @@ benchmarks/results/
 
 # Python
 __pycache__/
+/tools/dcorrsetup

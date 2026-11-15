@@ -45,7 +45,7 @@ Usage: deploy/vm.sh COMMAND
 
 Environment (defaults in brackets):
   CORRDM_VM_DIR [$HOME/vms/corrdm]  CORRDM_SSH_PORT [2225]  CORRDM_CPUS [6]
-  CORRDM_MEMORY [8G]  CORRDM_ROOT_SIZE [40G]  CORRDM_TEST_TIMEOUT [1800]
+  CORRDM_MEMORY [8G]  CORRDM_ROOT_SIZE [40G]  CORRDM_TEST_TIMEOUT [3600]
   CORRDM_TEST_DISK_DIR [/dev/shm/corrdm]: in RAM; a directory on a real disk to test on it
   CORRDM_TEST_DISK_SIZE [2G]: used when the test disk is created
 USAGE

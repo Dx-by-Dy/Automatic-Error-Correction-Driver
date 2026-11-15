@@ -9,8 +9,8 @@
 static sector_t metadata_copy_start(const struct metadata_area *area, enum metadata_copy copy)
 {
     if (copy == METADATA_LEAD)
-        return lead_area_start(area->region);
-    return trail_area_start(area->region, area->cache->regions);
+        return lead_area_start(area->cache->layout, area->region);
+    return trail_area_start(area->cache->layout, area->region);
 }
 
 /// @brief Finds the area of a region in the tree; the lock must be held
@@ -579,7 +579,7 @@ static int metadata_read_chunk(struct metadata_cache *cache, sector_t sector)
     int r;
 
     bio_init(&bio, cache->bdev, &bvec, 1, REQ_OP_READ);
-    bio.bi_iter.bi_sector = start_data_sector(sector);
+    bio.bi_iter.bi_sector = start_data_sector(cache->layout, sector);
     __bio_add_page(&bio, cache->chunk_page, DATA_SIZE_SECTORS * SECTOR_SIZE, 0);
     r = submit_bio_wait(&bio);
     bio_uninit(&bio);
@@ -764,9 +764,9 @@ static void metadata_cache_free(struct metadata_cache *cache)
 /// @details
 /// Expected execution context - dm_ctr, may sleep.
 /// @param bdev    The device below
-/// @param regions Number of regions of the device
+/// @param layout  Layout of the device, which must outlive the cache
 /// @return The cache, or ERR_PTR(-ENOMEM)
-struct metadata_cache *metadata_cache_create(struct block_device *bdev, sector_t regions)
+struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout)
 {
     struct metadata_cache *cache = kzalloc_obj(*cache, GFP_KERNEL);
 
@@ -780,7 +780,7 @@ struct metadata_cache *metadata_cache_create(struct block_device *bdev, sector_t
     INIT_LIST_HEAD(&cache->pinned);
     init_waitqueue_head(&cache->wait);
     cache->bdev = bdev;
-    cache->regions = regions;
+    cache->layout = layout;
     atomic64_set(&cache->loads, 0);
     atomic64_set(&cache->waits, 0);
     atomic64_set(&cache->trail_errors, 0);

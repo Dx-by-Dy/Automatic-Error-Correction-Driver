@@ -18,6 +18,7 @@ from conftest import (
     FAULTY_NAME,
     LOWER_NAME,
     UPPER_NAME,
+    create_dcorr,
     device_status,
     dmsetup_remove,
     drop_metadata,
@@ -28,9 +29,9 @@ from harness import (
     CHUNKS_PER_METADATA_SECTOR,
     DATA_SECTORS,
     REGION_DATA_SECTORS,
-    REGION_SECTORS,
     BlockDevice,
     capacity,
+    lower_mib_for_regions,
     metadata_sector,
     metadata_sectors,
     pattern,
@@ -38,9 +39,9 @@ from harness import (
     run,
 )
 
-# Two whole regions and a short third one, so that the trailing copy of region 0 is in region 1:
-# dm-dust takes an empty flush, whose sector is 0, for a write to block 0, which clears a bad block 0
-# or fails the flush.
+# A whole region and a short one, with copy 1 of the superblock between them; the trailing copy of
+# region 0 is in region 1. dm-dust takes an empty flush, whose sector is 0, for a write to block 0,
+# which clears a bad block 0 or fails the flush: block 0 is the superblock, which is never made bad.
 LOWER_MIB = 9
 CACHE_MIB = 64
 # Two metadata sectors of chunks: BAD_CHUNK and its neighbours share the first.
@@ -59,7 +60,7 @@ class FaultyStack:
         self.lower = make_lower(sectors)
         self.lower_sectors = sectors
         run("dmsetup", "create", FAULTY_NAME, stdin=f"0 {sectors} dust {self.lower} 0 512\n")
-        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {sectors} dcorr /dev/mapper/{FAULTY_NAME}\n")
+        create_dcorr(f"/dev/mapper/{FAULTY_NAME}", sectors)
         self.sectors = capacity(sectors)
         self.upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
 
@@ -150,7 +151,7 @@ def metadata_sector_chunks(chunk):
 @pytest.mark.parametrize("index", [0, DATA_SECTORS - 1], ids=["first sector", "last sector"])
 def test_failed_data_sector_fails_only_its_reads(faulty, index):
     bad = BAD_CHUNK * DATA_SECTORS + index
-    faulty.fail(physical_sector(bad))
+    faulty.fail(physical_sector(bad, LOWER_MIB * 2048))
 
     assert unreadable_sectors(faulty.upper) == [bad]
     assert fails_with_eio(lambda: faulty.upper.read(0, AREA))
@@ -196,7 +197,7 @@ def test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy():
     come out equal to the trailing one.
     """
     regions = METADATA_AREAS + 2
-    faulty = FaultyStack((regions * REGION_SECTORS * 512 >> 20) + 1)
+    faulty = FaultyStack(lower_mib_for_regions(regions))
     try:
         flushed_write(faulty.upper, 0, pattern("before", AREA))
         lead, trail = metadata_sectors(BAD_CHUNK * DATA_SECTORS, faulty.lower_sectors)
@@ -244,7 +245,7 @@ def test_failed_trailing_write_is_counted_and_warned(faulty):
 
 
 def test_device_works_again_once_the_sector_reads(faulty):
-    faulty.fail(physical_sector(BAD_CHUNK * DATA_SECTORS))
+    faulty.fail(physical_sector(BAD_CHUNK * DATA_SECTORS, LOWER_MIB * 2048))
     for sector in copies(BAD_CHUNK + 1):
         faulty.fail(sector)
     drop_metadata()
@@ -278,10 +279,10 @@ def test_write_fails_when_its_metadata_sector_does_not_read(faulty, chunk, start
 @pytest.mark.parametrize(
     "lower_sector, start, sectors",
     [
-        (physical_sector(BAD_CHUNK * DATA_SECTORS + 3), BAD_CHUNK * DATA_SECTORS, DATA_SECTORS),
-        (physical_sector(BAD_CHUNK * DATA_SECTORS + 3), BAD_CHUNK * DATA_SECTORS + 3, 1),
-        (metadata_sector(BAD_CHUNK * DATA_SECTORS), BAD_CHUNK * DATA_SECTORS, DATA_SECTORS),
-        (metadata_sector(BAD_CHUNK * DATA_SECTORS), BAD_CHUNK * DATA_SECTORS + 3, 1),
+        (physical_sector(BAD_CHUNK * DATA_SECTORS + 3, LOWER_MIB * 2048), BAD_CHUNK * DATA_SECTORS, DATA_SECTORS),
+        (physical_sector(BAD_CHUNK * DATA_SECTORS + 3, LOWER_MIB * 2048), BAD_CHUNK * DATA_SECTORS + 3, 1),
+        (metadata_sector(BAD_CHUNK * DATA_SECTORS, LOWER_MIB * 2048), BAD_CHUNK * DATA_SECTORS, DATA_SECTORS),
+        (metadata_sector(BAD_CHUNK * DATA_SECTORS, LOWER_MIB * 2048), BAD_CHUNK * DATA_SECTORS + 3, 1),
     ],
     ids=["data of a whole chunk", "data of one sector", "metadata of a whole chunk", "metadata of one sector"],
 )

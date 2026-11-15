@@ -54,7 +54,7 @@ def sector_of(data, logical):
 @pytest.mark.parametrize("in_chunk", range(DATA_SECTORS))
 def test_data_corruption_fails_only_that_sector(stack, written, in_chunk):
     bad = FIRST + in_chunk
-    stack.lower.flip_bit(physical_sector(bad), byte=100, bit=3)
+    stack.lower.flip_bit(physical_sector(bad, stack.lower_sectors), byte=100, bit=3)
 
     assert_read_fails(stack.upper, bad)
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
@@ -66,7 +66,7 @@ def test_data_corruption_fails_only_that_sector(stack, written, in_chunk):
 @pytest.mark.parametrize("position", [(0, 0), (0, 7), (100, 0), (511, 7)], ids=str)
 def test_any_bit_of_a_sector_is_covered(stack, written, position):
     byte, bit = position
-    stack.lower.flip_bit(physical_sector(FIRST), byte=byte, bit=bit)
+    stack.lower.flip_bit(physical_sector(FIRST, stack.lower_sectors), byte=byte, bit=bit)
     assert_read_fails(stack.upper, FIRST)
 
 
@@ -125,7 +125,7 @@ def test_the_entry_of_a_neighbour_does_not_cover_this_chunk(stack, written):
 
 
 def test_restoring_the_data_clears_the_error(stack, written):
-    target = physical_sector(FIRST)
+    target = physical_sector(FIRST, stack.lower_sectors)
     stack.lower.flip_bit(target)
     assert_read_fails(stack.upper, FIRST)
     stack.lower.flip_bit(target)
@@ -133,7 +133,7 @@ def test_restoring_the_data_clears_the_error(stack, written):
 
 
 def test_rewriting_a_corrupted_sector_clears_the_error(stack, written):
-    stack.lower.flip_bit(physical_sector(FIRST))
+    stack.lower.flip_bit(physical_sector(FIRST, stack.lower_sectors))
     update = pattern("rewritten", 1)
     stack.upper.write(FIRST, update)
     stack.upper.flush()
@@ -186,7 +186,7 @@ def test_only_the_sectors_written_are_read_first(stack, written):
 def test_a_sector_matching_neither_copy_is_counted_before_it_is_written(stack, written):
     """Damaged data with copies that differ: the read before the write counts it, and the write goes on."""
     stack.lower.flip_bit(copies(stack, FIRST)[0], byte=metadata_offset(FIRST), bit=0)
-    stack.lower.flip_bit(physical_sector(FIRST), byte=100, bit=3)
+    stack.lower.flip_bit(physical_sector(FIRST, stack.lower_sectors), byte=100, bit=3)
     stack.drop_metadata()
     before = settle_counts(stack)
     update = pattern("update", 1)
@@ -197,7 +197,7 @@ def test_a_sector_matching_neither_copy_is_counted_before_it_is_written(stack, w
 
 
 def test_write_to_a_neighbour_does_not_hide_corruption(stack, written):
-    stack.lower.flip_bit(physical_sector(FIRST))
+    stack.lower.flip_bit(physical_sector(FIRST, stack.lower_sectors))
     update = pattern("neighbour", 1)
     stack.upper.write(FIRST + 1, update)
     stack.upper.flush()
@@ -206,14 +206,14 @@ def test_write_to_a_neighbour_does_not_hide_corruption(stack, written):
 
 
 def test_corruption_is_detected_after_recreating_the_device(stack, written):
-    stack.lower.flip_bit(physical_sector(FIRST))
+    stack.lower.flip_bit(physical_sector(FIRST, stack.lower_sectors))
     stack.recreate_upper()
     assert_read_fails(stack.upper, FIRST)
 
 
 @pytest.mark.xfail(strict=True, reason="TODO.md: A zeroed chunk passes the check")
 def test_zeroed_chunk_is_detected(stack, written):
-    stack.lower.write(physical_sector(FIRST), bytes(DATA_SECTORS * SECTOR_SIZE))
+    stack.lower.write(physical_sector(FIRST, stack.lower_sectors), bytes(DATA_SECTORS * SECTOR_SIZE))
     for sector in copies(stack, FIRST):
         stack.lower.patch(sector, metadata_offset(FIRST), bytes(METADATA_ENTRY_SIZE))
     stack.drop_metadata()
@@ -223,9 +223,9 @@ def test_zeroed_chunk_is_detected(stack, written):
 @pytest.mark.xfail(strict=True, reason="TODO.md: The CRC does not depend on the position")
 def test_chunk_copied_elsewhere_is_detected(stack, written):
     target = FIRST + DATA_SECTORS
-    stack.lower.write(physical_sector(target), stack.lower.read(physical_sector(FIRST), DATA_SECTORS))
+    stack.lower.write(physical_sector(target, stack.lower_sectors), stack.lower.read(physical_sector(FIRST, stack.lower_sectors), DATA_SECTORS))
     offset = metadata_offset(FIRST)
-    entry = stack.lower.read(metadata_sector(FIRST))[offset : offset + METADATA_ENTRY_SIZE]
+    entry = stack.lower.read(metadata_sector(FIRST, stack.lower_sectors))[offset : offset + METADATA_ENTRY_SIZE]
     for sector in copies(stack, target):
         stack.lower.patch(sector, metadata_offset(target), entry)
     stack.drop_metadata()

@@ -3,13 +3,14 @@
 import pytest
 
 from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
-from harness import DATA_SECTORS, BlockDevice, capacity, pattern, physical_sector, run
+from harness import DATA_SECTORS, BlockDevice, capacity, format_device, pattern, physical_sector, run
 
 
 @pytest.fixture
 def lower():
-    sectors = 2048
+    sectors = 16 * 2048
     path = make_lower(sectors)
+    format_device(path)
     yield path, sectors
     dmsetup_remove(UPPER_NAME)
     dmsetup_remove(LOWER_NAME)
@@ -35,10 +36,10 @@ def test_device_takes_the_usable_length(lower):
     assert int(run("blockdev", "--getsz", f"/dev/mapper/{UPPER_NAME}").stdout) == capacity(sectors)
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: The table length is ignored")
-def test_too_long_a_device_is_rejected(lower):
+@pytest.mark.parametrize("change", [DATA_SECTORS, -DATA_SECTORS], ids=["longer", "shorter"])
+def test_a_length_other_than_the_capacity_is_rejected(lower, change):
     path, sectors = lower
-    assert create(f"0 {capacity(sectors) + 8} dcorr {path}").returncode != 0
+    assert create(f"0 {capacity(sectors) + change} dcorr {path}").returncode != 0
 
 
 @pytest.mark.xfail(strict=True, reason="TODO.md: dmsetup table does not show the device")
@@ -60,7 +61,7 @@ def test_target_may_start_after_sector_0(lower):
     try:
         upper.write(start, data)
         upper.flush()
-        assert below.read(physical_sector(0), DATA_SECTORS) == data
+        assert below.read(physical_sector(0, sectors), DATA_SECTORS) == data
     finally:
         upper.close()
         below.close()

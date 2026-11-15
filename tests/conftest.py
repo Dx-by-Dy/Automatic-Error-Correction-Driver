@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from harness import BlockDevice, capacity, declare_hang, run
+from harness import BlockDevice, capacity, declare_hang, format_device, run
 
 TEST_DISK = "/dev/vdb"
 REINIT_DEVICE = "dcorr"
@@ -108,7 +108,8 @@ def drop_metadata(name=UPPER_NAME):
 
     A test that changes metadata on the lower device needs it, or the driver goes on with the copy.
     After the resume udev reads the start and the end of the device, which reads the metadata of
-    the first and the last region again; the other regions stay out of RAM.
+    the first region and of the last one again, and of the one before it when the last is short, as on
+    16 MiB; the other regions stay out of RAM.
     """
     run("dmsetup", "suspend", name)
     run("dmsetup", "resume", name)
@@ -204,7 +205,7 @@ def read_kmsg(fd):
 
 @dataclass
 class Stack:
-    """A dcorr device on top of a fresh, zeroed lower device."""
+    """A dcorr device on top of a fresh, zeroed and formatted lower device."""
 
     lower_sectors: int
     lower_path: str
@@ -244,6 +245,13 @@ class Stack:
         self.upper = BlockDevice(self.upper_path)
 
 
+def create_dcorr(path, lower_sectors, format=True):
+    """Puts the driver on a device as UPPER_NAME, formatting the device first unless told otherwise."""
+    if format:
+        format_device(path)
+    run("dmsetup", "create", UPPER_NAME, stdin=f"0 {capacity(lower_sectors)} dcorr {path}\n")
+
+
 def make_lower(sectors, name=LOWER_NAME, offset_mib=0):
     """A zeroed dm-linear region of the test disk, at the start unless told otherwise."""
     run("dmsetup", "create", name, stdin=f"0 {sectors} linear {TEST_DISK} {offset_mib * 2048}\n")
@@ -261,7 +269,8 @@ def make_stack():
     def create(lower_mib=DEFAULT_LOWER_MIB):
         sectors = lower_mib * 2048
         lower_path = make_lower(sectors)
-        table = f"0 {sectors} dcorr {lower_path}\n"
+        format_device(lower_path)
+        table = f"0 {capacity(sectors)} dcorr {lower_path}\n"
         run("dmsetup", "create", UPPER_NAME, stdin=table)
         stack = Stack(sectors, lower_path, f"/dev/mapper/{UPPER_NAME}", table)
         stack.open()

@@ -24,6 +24,7 @@ from harness import (
     DATA_SECTORS,
     BlockDevice,
     capacity,
+    format_device,
     metadata_sector,
     metadata_sectors,
     pattern,
@@ -42,20 +43,26 @@ FUA_STRIDE = 4
 
 
 class LoggedStack:
-    """The driver on dm-log-writes on a zeroed lower device."""
+    """The driver on dm-log-writes on a zeroed lower device.
+
+    The device is formatted through dm-log-writes, so the superblock is in the log and every replay,
+    which starts from a zeroed device, has it.
+    """
 
     def __init__(self):
         self.lower_sectors = LOWER_MIB * 2048
         self.lower_path = make_lower(self.lower_sectors)
         self.log_device_path = make_lower(LOG_MIB * 2048, LOG_DEVICE_NAME, LOG_OFFSET_MIB)
-        self.start_log()
+        self.start_log(format=True)
 
-    def start_log(self):
+    def start_log(self, format=False):
         """Puts dm-log-writes on the lower device as it is, with a fresh log, and the driver on it."""
         run(
             "dmsetup", "create", LOG_NAME,
             stdin=f"0 {self.lower_sectors} log-writes {self.lower_path} {self.log_device_path}\n",
         )
+        if format:
+            format_device(f"/dev/mapper/{LOG_NAME}")
         self.create_upper(f"/dev/mapper/{LOG_NAME}")
 
     def log_again(self):
@@ -69,7 +76,7 @@ class LoggedStack:
         return capacity(self.lower_sectors)
 
     def create_upper(self, lower):
-        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {self.lower_sectors} dcorr {lower}\n")
+        run("dmsetup", "create", UPPER_NAME, stdin=f"0 {capacity(self.lower_sectors)} dcorr {lower}\n")
         self.upper_path = f"/dev/mapper/{UPPER_NAME}"
 
     def mark(self, name):
@@ -154,13 +161,14 @@ def test_flushed_writes_survive_a_crash(logged):
 
 def chunk_entries(entries, first, last, chunk):
     """The indexes of the entries between two marks that wrote the data and the metadata of a chunk."""
-    data_sectors = set(range(physical_sector(chunk * DATA_SECTORS), physical_sector(chunk * DATA_SECTORS) + DATA_SECTORS))
+    first_sector = physical_sector(chunk * DATA_SECTORS, LOWER_MIB * 2048)
+    data_sectors = set(range(first_sector, first_sector + DATA_SECTORS))
     data, metadata = [], []
     for entry in entries[first + 1 : last]:
         written = set(range(entry.sector, entry.sector + len(entry.data) // 512))
         if written & data_sectors:
             data.append(entry.index)
-        if metadata_sector(chunk * DATA_SECTORS) in written:
+        if metadata_sector(chunk * DATA_SECTORS, LOWER_MIB * 2048) in written:
             metadata.append(entry.index)
     return data, metadata
 
