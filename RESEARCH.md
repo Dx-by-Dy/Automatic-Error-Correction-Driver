@@ -102,6 +102,10 @@ first a range of the metadata area.
 
 ## A failed write back: a reserved area
 
+**Rejected on 2026-11-15**, agreed with the user, after the [reading on drive failures](#drive-failures): by the
+time a write error reaches the host the spare of the drive is gone, and an LBA says nothing about the place on
+flash. Kept for the reasoning.
+
 Discussed on 2026-11-11, an idea of the user, not decided. A small area is set aside in advance. A write back that
 failed goes to a slot there, and a table redirects later reads and writes of that chunk. The device keeps working
 when partly damaged, with warnings, and past some point only writes that matter for the filesystem are accepted.
@@ -148,6 +152,124 @@ What counts as a priority write:
   flushes, FUA and `REQ_META`, and refuse plain data.
 - **Only a failed write consumes a slot**, so writes to healthy places need not be refused until the slots run out.
 - **Not checked:** what refused plain data does to ext4 in ordered mode. This needs a test in the VM.
+
+## Drive failures
+
+Read on 2026-11-15, to settle the open threats of the [threat model](ARCHITECTURE.md#threat-model) and the
+reserved area. The user collected the material; the numbers below were checked against the papers themselves,
+with the section given, except where said otherwise.
+
+Sources: [Pinheiro et al., FAST'07][pinheiro] (Google, over 100 000 consumer HDDs), [Backblaze][bb-smart]
+(SMART of 67 814 HDDs), [Schroeder et al., FAST'16][schroeder] (Google, SSDs of ten models over 6 years),
+[Maneas et al., FAST'20][maneas] (NetApp, 1.4 million enterprise SSDs), [Bairavasundaram et al., FAST'08][bairava]
+(NetApp, silent corruption on 1.53 million disks over 41 months), [Krioukov et al., FAST'08][krioukov] (what
+each protection technique detects), [Zheng et al., FAST'13][zheng] (15 SSDs under power faults).
+
+### Hard disks
+
+- **The first error is a strong signal.** After the first scan error a drive is 39 times more likely to fail
+  within 60 days than one without, 14 times after the first reallocation, 21 after the first offline
+  reallocation, 16 after the first probational (pending) sector (Pinheiro, 3.5). At Backblaze at least one of
+  SMART 5, 187, 188, 197 and 198 is above zero on 76.7% of failed drives and 4.2% of working ones.
+- **Many drives die without a warning.** Over 56% of failed drives had none of the four strong signals above,
+  and over 36% no SMART signal at all (Pinheiro, 3.5.6). Temperature and utilization correlate weakly with
+  failures; only very high temperatures show an effect (Pinheiro, 3.4).
+- **Latent sector errors** hit about 19% of nearline and 2% of enterprise disks within 2 years
+  (Bairavasundaram et al., SIGMETRICS'07, as quoted by Krioukov, 2.2; not read ourselves).
+
+### SSDs
+
+- **Uncorrectable errors are common:** 20 to 63% of drives have at least one within four years, on 2 to 6 of
+  1000 drive days. SSDs are replaced less often than HDDs, but have significantly more uncorrectable errors
+  (Schroeder, summary and 8).
+- **Errors cluster.** In the month after an uncorrectable error the chance of another is nearly 30%, against 2%
+  in a random month; prior errors raise it by more than an order of magnitude (Schroeder, 5.6).
+- **Bad blocks and chips.** 30 to 80% of drives develop bad blocks within four years, a median of 2 to 4. After
+  the second, the median total for MLC jumps to about 200, likely a failing chip. 2 to 7% develop a bad chip. A
+  block is declared bad after a final read error, a write error or an erase error, and remapped (Schroeder, 6).
+- **Age matters apart from wear.** Errors grow with P/E cycles, but linearly rather than exponentially, and the
+  age of a drive affects reliability independently of use (Schroeder, summary).
+- **No rise at the end of life, a long infant mortality.** At NetApp failure rates rise for 12 to 15 months and
+  are 2 to 3 times higher than later; there is no rise at the end of life, but few drives get there: 99% of
+  systems use at most 15% of the rated life of their drives (Maneas, 5.1 and 8).
+- **Not checked:** that drives at the end of their endurance go read only or disappear, as in the material of the
+  user, from the endurance experiment of The Tech Report (2015). The original article is gone, and secondary
+  reports do not agree on the details.
+
+### Silent corruption
+
+- **NetApp** saw about 400 000 checksum mismatches over 41 months, on 0.86% of nearline and 0.065% of
+  enterprise disks. On a disk with several of them, the blocks are often consecutive (Bairavasundaram, 4).
+- **Lost and misdirected writes** showed as identity discrepancies on 365 disks, more than an order of magnitude
+  fewer than checksum mismatches (Bairavasundaram, 5.1); Krioukov gives 0.04% of nearline and 0.007% of
+  enterprise disks within 17 months (2.2). NetApp knows of disk firmware that reported writes never written.
+- **What detects what** (Krioukov, 4): a checksum kept with its block detects neither a lost write (the old data
+  and the old checksum agree) nor a misdirected one. An identity in the block, physical (disk and sector) or
+  logical (inode and offset), detects misdirected writes; a checksum kept in a parent block detects lost ones.
+  **Parity pollution:** parity recomputed from data that was not verified spreads one error over the stripe.
+
+### Power faults
+
+Zheng et al. cut the power of 15 SSDs of five vendors, and 13 of them failed (5):
+
+- **Bit corruption** on 3 devices.
+- **Shorn writes** on 3, two of them sold as enterprise: a 4 KiB block partly new and partly old, always in
+  multiples of 512 bytes; 72 in 441 iterations.
+- **Unserializable writes** on 8 SSDs and on 1 of the 2 HDDs: completed writes lost or reordered, so the drive
+  likely ignores flushes.
+- **Metadata corruption** on 1: after 8 faults 30.5% of the device could not be read, and access there hung.
+- **A dead device**, 1, after 136 faults.
+- **No misdirected writes**, and no range that reads back as zeros.
+
+### What the drive does by itself
+
+- **ECC per sector or page.** An error that reaches the host means its ECC gave up, and the host gets an error,
+  not damaged bits to correct.
+- **Relocation.** An HDD remaps a pending sector when it is written; an SSD writes to a new page anyway and
+  remaps bad blocks itself. A write error that reaches the host means the spare is exhausted, or the region is in
+  a bad way.
+
+### Other systems
+
+- **btrfs** checks all data, with crc32c by default, and [keeps metadata in two copies on a single device by
+  default since btrfs-progs 5.15][btrfs-mkfs]. Data can be kept in two copies too, at twice the space; there is
+  no parity on one device.
+- **ZFS** has `copies=2` per dataset, out of the tree of the kernel.
+- **bcachefs** has erasure coding only across devices, and was [removed from the mainline in 6.18][bcachefs].
+- **`dm-integrity`** [mixes the logical sector into every checksum][int-seed], and with `fix_hmac` also [a
+  random salt from its superblock][int-salt]. It has no correction.
+
+So redundancy on one device cheaper than a full copy, below any filesystem, is not offered by any of them.
+
+### What follows for this driver
+
+1. **ECC between blocks, not inside a sector.** It corrects erasures: chunks that failed to read or did not
+   match their CRC, whose place is known. Mismatches come in consecutive blocks and SSD errors cluster, so a
+   stripe must not be made of neighbours. On an HDD its redundancy lies far from the data; on an SSD distance in
+   LBA means nothing, and only more redundancy per stripe helps. Parity is updated only from verified data. For
+   the correction stage.
+2. **The CRC stays per 512-byte sector.** Shorn writes come in units of 512 bytes, so a CRC over 4 KiB would
+   turn a crash into a read error, against point 3 of the contract.
+3. **No reserved area.** Data rebuilt by ECC is written in place: an HDD remaps the sector, an SSD writes to a
+   new page.
+4. **Errors as a signal to move the data off.** The first error is a strong predictor for both kinds of drive,
+   so it has to reach the user: counters in `dmsetup status` and a device mapper event, not only the kernel log.
+   Half the drives die without a warning, so integrity cannot wait for one.
+5. **Reads go on when writes fail**, as for a drive gone read only. This holds already.
+6. **A nonzero seed with the logical sector and a salt per device.** It costs nothing. A zero chunk with zero
+   metadata no longer passes. The position catches a misdirected write whose data equals that of its victim, a
+   table offset wrong by a whole number of regions (every check passes today), and a chunk copied with its
+   metadata. The salt catches data from another device of ours.
+7. **Lost writes are partly detected by the layout.** Data and metadata are separate writes, and once the flush
+   after a write back has passed both copies hold the new CRC, so data that was not written no longer matches.
+   Not covered: the window before that flush, and a write lost together with both copies of its metadata, as by a
+   drive that ignores flushes. A generation kept far away, as a checksum in a parent, would close it.
+8. **Ranges that read back as zeros** have no field data behind them, only mechanisms: a discard by mistake, a
+   discarded range read back, the mapping of an FTL lost. They are handled because "never written" is needed
+   anyway, for fresh devices and for discard. Decided by the user: a bitmap of written chunks in the superblock
+   and in RAM, apart from the data it describes.
+9. **An SSD that deduplicates** could keep the two equal copies of the metadata once. Rare today; mixing the
+   number of the copy into its contents would answer it.
 
 [wc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-writecache.c?h=v7.2
 [wc-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/writecache.rst?h=v7.2
@@ -201,3 +323,14 @@ What counts as a priority write:
 [jbd2-flags]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/jbd2.h?h=v7.2#n1399
 [jbd2-commit]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/jbd2/commit.c?h=v7.2#n153
 [jbd2-abort]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/jbd2/commit.c?h=v7.2#n892
+[pinheiro]: https://www.usenix.org/legacy/events/fast07/tech/full_papers/pinheiro/pinheiro.pdf
+[bb-smart]: https://www.backblaze.com/blog/what-smart-stats-indicate-hard-drive-failures/
+[schroeder]: https://www.usenix.org/conference/fast16/technical-sessions/presentation/schroeder
+[maneas]: https://www.usenix.org/conference/fast20/presentation/maneas
+[bairava]: https://www.usenix.org/legacy/event/fast08/tech/full_papers/bairavasundaram/bairavasundaram.pdf
+[krioukov]: https://www.usenix.org/legacy/event/fast08/tech/full_papers/krioukov/krioukov.pdf
+[zheng]: https://www.usenix.org/conference/fast13/technical-sessions/presentation/zheng
+[btrfs-mkfs]: https://btrfs.readthedocs.io/en/stable/mkfs.btrfs.html
+[bcachefs]: https://lwn.net/Articles/1040120/
+[int-seed]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-integrity.c?h=v7.2#n1668
+[int-salt]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-integrity.c?h=v7.2#n4170

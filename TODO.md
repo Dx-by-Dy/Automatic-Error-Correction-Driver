@@ -25,14 +25,16 @@ in a run, **From reading** means it was only found in the code.
 
 - **A zeroed chunk passes the check.** Confirmed: with a chunk and its metadata sector zeroed
   on the lower device, the read succeeds and returns zeros. CRC64 of zeros with a zero seed is
-  0, the same as empty metadata. A lost or trimmed region is never noticed. Fix: a non-zero
-  seed, plus a way to tell unwritten chunks from written ones (see the next item).
+  0, the same as empty metadata. A lost or trimmed region is never noticed. Fix, decided on 2026-11-15: a
+  nonzero seed, and a bitmap of written chunks in the superblock and in RAM to tell unwritten chunks from
+  written ones (see the next item and `ARCHITECTURE.md`, "On-disk format").
 - **A fresh device has to be zeroed by hand.** From reading: there is no superblock, format
   version or "never written" state. On a device with old contents every read fails, and
   `deploy/vm.sh reinit` zeroes only the first 1 GiB.
 - **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
   another chunk reads back without an error, as the sector number is not part of the CRC. A
-  misdirected write would pass the same way. Fix: mix the sector number into the seed.
+  misdirected write would pass the same way, and so would a table whose offset is wrong by a whole number of
+  regions. Fix, decided on 2026-11-15: mix the logical sector and a random salt per device into the seed.
 - **A crash together with a lost sector of the other copy fails the chunks that were in flight.** By
   decision: between the write back of a chunk and the flush after it, only the trailing copy has the CRC of the
   old data and only the leading one that of the new. Fix, if the threat model asks for it: a third copy, or ECC.
@@ -40,6 +42,10 @@ in a run, **From reading** means it was only found in the code.
   back before it are forgotten without their trailing copy, so their copies differ, and the read before their
   next write back may see data that is not durable. A device that fails flushes gives no durability anyway.
   Fix, if it matters: keep them pinned and retry, with a way out when the areas run out.
+- **A lost write passes as the old contents until the flush after its write back.** By decision of the threat
+  model: until then the trailing copy holds the old CRC, and the read accepts it; a write lost together with both
+  copies of its metadata passes for ever. Not tested: dropped writes need a test with `dm-flakey` and
+  `drop_writes`, detected after that flush and passing before it.
 - **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
   operation other than read, write and an empty flush. Discard needs the "never written" state,
   so that a discarded chunk does not fail its check.
@@ -64,6 +70,10 @@ in a run, **From reading** means it was only found in the code.
 - **Queue limits are not inherited.** From reading: there is no `.iterate_devices` or `.io_hints`.
   A lower device with 4K logical blocks is not rejected, although metadata is written
   as single 512-byte sectors.
+- **Nothing warns the user of a failing drive.** By decision of the threat model: the first error is a strong sign
+  that a drive is failing, but today it is only a line in the kernel log. Fix: counters of errors and
+  mismatches in `dmsetup status` and a device mapper event at the first one. An idea of the user, to think over:
+  a daemon that reads SMART and the counters of the driver and warns.
 - **Mismatch logging has no rate limit.** From reading: each failed read prints a line with
   `pr_err`, so a reader in a loop can flood the log. The line also gives the physical sector,
   and nothing identifies the device.
@@ -136,9 +146,9 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Integrity and format.** Superblock and version, seed and
-   position in the CRC after the threat research, discard, whether to add a reserved area for failed
-   write backs, and the place in the cache where it plugs in.
+2. **Integrity and format.** Superblock and version, a nonzero seed with the logical sector and a salt, the
+   bitmap of written chunks for "never written", discard, a test of lost writes. The threat model was settled on
+   2026-11-15; no reserved area.
 3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
 4. **Device Mapper integration and docs.** `.status` with the table and more counters, table length,

@@ -23,31 +23,28 @@ sequential I/O much slower than the lower device is not acceptable.
 
 ## Threat model
 
-In scope, **Decided** for the first two, **Proposed** for the third:
+**Decided** on 2026-11-15, after the [reading on drive failures](RESEARCH.md#drive-failures), unless marked
+otherwise. The frequencies are from the field studies quoted there; "Now" is what the code does, "Stage" is
+where the rest is done.
 
-- **A sector fails to read.** The lower device returns an error for a sector or a range (a latent sector error,
-  an unrecoverable read). Only the data that depends on that sector may fail; the rest of the device stays
-  readable. With ECC the data is rebuilt from redundancy. Redundancy next to the data may fail along with it,
-  which matters when choosing where it lives.
-- **Data is damaged silently.** The lower device returns data without an error, but it differs from what was
-  written: decay of the medium, a firmware or a transfer fault. The CRC detects it, ECC will repair it.
-- **A write fails.** A degrading drive returns errors on writes. The error reaches the layer above, see
-  [Contract](#contract-with-the-layer-above).
+| Threat | How common | Detected by | Handled by | Now | Stage |
+| --- | --- | --- | --- | --- | --- |
+| **A sector fails to read**: a latent sector error, an uncorrectable read | Common: 20 to 63% of SSDs within 4 years; about 19% of nearline HDDs within 2 | An error of the lower device | Only the bio over it fails; later rebuilt by ECC between chunks and written in place | Detected | Correction |
+| **Data damaged silently**: decay, firmware, transfer, bits flipped by a power fault | 0.86% of nearline and 0.065% of enterprise HDDs in 41 months, often in consecutive blocks | CRC per 512-byte sector | As above | Detected | Correction |
+| **A write cut short by a crash**, torn at 512 bytes on some SSDs | 3 of 15 SSDs under power faults | Two copies of the metadata, the leading one durable before the data | Each sector reads its old or its new data | Done, except a crash together with a lost sector of the other copy | |
+| **A range reads back as zeros**: discarded by mistake, the mapping of an FTL lost, never written | No field data, only the mechanisms | A nonzero seed; the bitmap of written chunks says the chunk holds data | A read error for a chunk that was written; zeros, without a read, for one that was not | Not detected: zeros with zero metadata pass | Format |
+| **A lost write**: acknowledged, even flushed, but not on the medium | 0.04% of nearline and 0.007% of enterprise HDDs in 17 months; 8 of 15 SSDs and 1 of 2 HDDs lost or reordered completed writes at a power fault | Data and metadata are separate writes: once the flush after a write back has passed, both copies hold the new CRC | A read error | Detected after that flush. Not detected before it, nor when both copies of the metadata are lost with the data | Format: a test |
+| **A misdirected write**: the data lands on another sector | Counted with lost writes; not seen under power faults | The CRC of the sector hit; its own place as a lost write; the logical sector and a salt per device in the seed | A read error | Detected unless the data equals that of the sector hit, or the whole layout is shifted by whole regions | Format |
+| **A write fails** | Rare: the drive remaps a bad place first, so an error that reaches the host means its spare is gone or the region is in a bad way | An error of the lower device | The chunk stays in RAM and is retried, every flush fails meanwhile, new writes are refused when such chunks fill the cache, reads go on. No reserved area | Done | |
+| **The drive is near its end** | After the first error 14 to 39 times more likely to fail within 60 days; but over half of failed HDDs gave no warning | Every error and mismatch | Counters in `dmsetup status` and a device mapper event, so that the user moves the data off; **Proposed** | Only a line in the kernel log | Device Mapper integration |
 
-Not a threat to the data, but a requirement, **Proposed**:
+The "never written" state comes from a bitmap of written chunks, kept in the superblock and in RAM, apart from the
+data it describes; a discard clears its bits. A chunk whose bit is clear reads as zeros without a read of the lower
+device, as a discarded range of the lower device need not read back as zeros.
 
-- **A crash or a power loss.** By itself it damages nothing: which writes survive is the business of the
-  filesystem journal, which relies on flushes and FUA. The driver must not turn a write cut short by the crash
-  into a read error, see the contract.
-
-**Open**, until the published work on drive failures is read (postponed on 2026-11-10):
-
-- A region that reads back as zeros: lost by the drive, trimmed, or never written.
-- A lost write: the drive acknowledges it, but the old contents stay.
-- A misdirected write: the data lands on another sector. The sector number is not part of the CRC today.
-
-The answers decide the seed of the CRC, whether the position is mixed into it, and whether the driver needs a
-"never written" state.
+**A crash or a power loss** is not a threat to the data by itself, but a requirement, **Proposed**: which writes
+survive is the business of the filesystem journal, which relies on flushes and FUA. The driver must not turn a
+write cut short by the crash into a read error, see the contract.
 
 Out of scope, **Proposed**:
 
@@ -55,6 +52,12 @@ Out of scope, **Proposed**:
   `dm-integrity` with an HMAC.
 - **Loss of the whole device.** That takes redundancy across devices, as in RAID.
 - **Memory errors** in the host.
+- **A drive that ignores flushes.** No layer above it can make data durable. The driver detects what it can as
+  lost writes.
+- **A drive that hangs** on access to a range, as one SSD did after power faults. Timeouts are the business of the
+  block layer.
+- **A drive that deduplicates** could keep the two equal copies of the metadata once. Rare today; mixing the
+  number of the copy into its contents would answer it.
 
 ## Contract with the layer above
 
@@ -143,13 +146,38 @@ writing its leading copy over a trailing one that does not match the data would 
   the unit of the cache and of ECC. To be measured after the cache, against the baseline. It also has to fit a
   lower device with 4 KiB logical blocks: then the metadata is written in blocks of 4 KiB, 64 chunks to a
   block.
-- **CRC unit.** Per 512-byte sector, as now, tells which sector is bad, which helps correction. Per 4 KiB takes
-  less space. With two CRCs it cannot be larger than what the drive writes atomically.
-- **ECC.** The code, the unit it corrects (bits, a sector, a run), how much space it takes, where the redundancy
-  lives (next to the data it may fail along with it), and how it combines with the CRC.
-- **Seed and position** in the CRC: after the threat research, see above.
-- **Superblock and version**: once the format settles. It will hold the version, the layout parameters and the
-  state needed for the points above.
+- **ECC.** The code, how much space it takes, where the redundancy lives, and how it combines with the CRC. What
+  the reading on drive failures settled: it corrects erasures between chunks, as a drive returns an error and not
+  damaged bits; a stripe is not made of neighbours, as damage comes in consecutive blocks; on an HDD its
+  redundancy lies far from the data; parity is updated only from data that passed its CRC, or one error spreads
+  over the stripe.
+- **Superblock and version**: in the format stage. It holds the version, the layout parameters, the salt and the
+  bitmap below; where it lies, its copies and how a device is formatted are to be settled.
+
+**Decided** on 2026-11-15, after the [reading on drive failures](RESEARCH.md#drive-failures):
+
+- **The CRC stays per 512-byte sector.** SSDs were seen to tear a 4 KiB write at a power fault in units of 512
+  bytes, so a CRC over 4 KiB would turn a crash into a read error. Per 4 KiB only for a drive known to write it
+  atomically.
+- **The seed is nonzero and holds the logical sector of the data sector and a random salt per device**, kept in
+  the superblock, as `dm-integrity` does. A zero chunk with zero metadata no longer passes, nor a chunk in the
+  wrong place, nor data from another device. How they are mixed in is settled with the superblock.
+- **A bitmap of written chunks, one bit per chunk, in the superblock and in RAM**, decided by the user: apart from
+  the data it describes, so that a range lost together with its metadata is still known to have held data. It
+  gives the "never written" state and discard. It takes 32 MiB per TiB of data, on the device and in RAM. It is
+  part of the area of the superblock and is kept in both its copies; when a bit reaches the device against the
+  flushes is settled in the plan of the stage.
+- **The superblock in two copies**, an idea of the user: at the start of the lower device and at a region
+  boundary in its middle, so that a lost range rarely takes both. The number and the places of the copies are to
+  become a choice at format time. Each copy names itself: magic, version, number of the copy, generation, CRC.
+- **All layout parameters live in the superblock**: the chunk, the region, the places of the copies, the size of
+  the bitmap. Version 1 accepts only the current values, so the I/O path keeps its constants for now.
+- **A device is formatted by a utility in userspace, in C**, which writes the superblock to the lower device, as
+  `integritysetup format` does; the constructor refuses a device without a valid one. At run time the utility
+  talks to the driver through the channels of device mapper (`dmsetup message`, `status`, events): targets have
+  no sysfs of their own.
+- **No reserved area** for failed write backs: by the time a write error reaches the host the spare of the drive
+  is gone, and on an SSD an LBA says nothing about the place on flash. Data rebuilt by ECC is written in place.
 
 ## I/O path
 
@@ -206,8 +234,8 @@ Written in the cache stage, closed on 2026-11-14; runs have a stage of their own
   CRCs are the two copies of the metadata, see [On-disk format](#on-disk-format).
 - **The layout:** metadata in an area per region, see [On-disk format](#on-disk-format), decided on 2026-11-11.
   Its proportions are revisited only after measuring the cache and two CRCs on it.
-- **A failed write back:** the error is per chunk, not for the device. The data stays in RAM, and the cache has one
-  place where a reserved area can be plugged in later. When such chunks fill the cache, new writes are refused.
+- **A failed write back:** the error is per chunk, not for the device. The data stays in RAM; there is no reserved area,
+  rejected on 2026-11-15. When such chunks fill the cache, new writes are refused.
   Every flush fails while such chunks remain, as a flush that succeeds promises the data is on the device.
 - **A partial chunk** keeps a mask of its dirty sectors. Write back writes only those and reads the old metadata;
   the rest of the chunk is not read.
@@ -219,7 +247,7 @@ Written in the cache stage, closed on 2026-11-14; runs have a stage of their own
 - **A failed chunk is retried** only on a flush, on a suspend, or when it is written again; there is no timer of
   its own.
 - **A suspend cannot fail**, so a chunk that still fails to write when the device is suspended for a removal or
-  a reload is lost, with its number in the kernel log. The reserved area will give it somewhere to go.
+  a reload is lost, with its number in the kernel log.
 - **Runs**, decided on 2026-11-14 and left until after the format: a run is a contiguous range of dirty
   sectors inside one region, written as one FUA write of its range of leading metadata sectors, then one data
   bio. A clean hole in a chunk breaks the run, with no read to fill it; dirty neighbours join it before they
@@ -275,11 +303,8 @@ Written in the cache stage, closed on 2026-11-14; runs have a stage of their own
 
   ECC may still change the choice. The write back of the cache has to leave room for a step before and after
   writing a batch.
-- **A reserved area for failed write backs.** Proposed, not decided: such a chunk moves to a slot on the lower
-  device, with a table that redirects later access. As slots run out the device warns, then accepts only writes
-  that matter for the filesystem, then becomes read only. A write back that found a slot does not fail the next
-  flush. It needs a superblock, so it waits for the format. See
-  [RESEARCH.md](RESEARCH.md#a-failed-write-back-a-reserved-area).
+- **A reserved area for failed write backs** was rejected on 2026-11-15, see [On-disk format](#on-disk-format);
+  the reasoning is kept in [RESEARCH.md](RESEARCH.md#a-failed-write-back-a-reserved-area).
 
 ## Errors
 
@@ -287,7 +312,8 @@ Written in the cache stage, closed on 2026-11-14; runs have a stage of their own
 line with `pr_err`, with no rate limit and without the name of the device.
 
 **Proposed**, as the goal is to move data off a failing drive: an error must not make healthy data unreadable,
-and errors must be visible to the user as counters in `dmsetup status`.
+and errors must be visible to the user as counters in `dmsetup status`, with a device mapper event at the first
+one: it is a strong sign that the drive is failing, see the [threat model](#threat-model).
 
 **Open.** What correction does once ECC exists: rebuild the data, write it back in place or elsewhere, and what
 it counts.
@@ -306,8 +332,9 @@ it counts.
   leading copy; that order is checked in the log itself: the leading write is FUA and comes first. A second
   crash is replayed on top of the state of the first, with a log started from it.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
-  chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes that are dropped
-  silently wait for the threat model, as lost writes are an open threat.
+  chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes dropped silently
+  (`dm-flakey` with `drop_writes`) are to be tested in the format stage: a lost write is detected once the flush
+  after its write back has passed, and passes as the old contents before it.
 
 ## Decision log
 
@@ -330,3 +357,5 @@ it counts.
 | 2026-11-14 | The leading copy is a FUA write before the data; a chunk written back since the last flush waits for a flush (a barrier); a chunk whose copies differ is read before its write back, and the matching CRC goes into the trailing copy with FUA | A completed write is not durable, so two write backs between flushes leave three versions for two slots; the read settles a crash left over without a superblock or an epoch |
 | 2026-11-14 | Runs move after the format stage, before the baseline; their shape is decided now. The place to plug in the reserved area moves into the format stage | Runs change no logic or guarantee, and the format may change what a write back writes; the baseline should measure the cache with them. The reserved area needs a superblock, and whether to have it is decided there |
 | 2026-11-11 | Every flush fails while unwritten chunks remain; partial chunks keep a dirty mask; a write to a chunk under write back waits, a second copy is left for optimization | A flush must not promise what is not on the device; a bad neighbouring sector must not stop a write; simplest first |
+| 2026-11-15 | The threat model is settled: zeroed ranges and misdirected writes in scope, lost writes in scope where the layout detects them; the CRC stays per 512-byte sector; the seed is nonzero, with the logical sector and a salt per device; a bitmap of written chunks in the superblock and in RAM; no reserved area | [Drive failures](RESEARCH.md#drive-failures): a write error reaching the host means the spare of the drive is gone; shorn writes come in units of 512 bytes; the seed costs nothing; the bitmap lies apart from the data it describes, an idea of the user |
+| 2026-11-15 | The superblock in two copies, at the start and in the middle; all layout parameters in it, version 1 accepting only the current values; the bitmap part of it; formatting by a utility in C, control through `dmsetup message` | Two places far apart on an HDD; a format open to change without variables on the I/O path; formatting in userspace, as in `dm-integrity`, keeps the constructor simple |
