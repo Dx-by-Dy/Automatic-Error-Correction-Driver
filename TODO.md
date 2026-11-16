@@ -186,10 +186,10 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
+2. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits with
+   `iterate_devices` and write zeroes, the README. Before runs, by decision on 2026-11-16.
+3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
-3. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits with `iterate_devices` and write zeroes, the
-   README.
 4. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
    the cache and for the cache, with the memory a load takes through the driver against the lower device:
    on the debug kernel KASAN and kmemleak hold freed bios back, 100 to 535 MiB under `fio` with 1 MiB
