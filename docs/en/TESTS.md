@@ -135,7 +135,7 @@ metadata, happen every time.
 | ---- | ----- | ------ |
 | `test_a_write_reaches_the_lower_device_on_a_flush` | 1 | A write is not on the lower device and counts as dirty, and is there after a flush |
 | `test_dirty_data_is_written_back_by_age` | 1 | Without a flush, the data reaches the lower device within 10 seconds |
-| `test_a_fua_write_reaches_the_lower_device` | 1 | A write with `RWF_DSYNC`, so FUA, is on the lower device when it returns |
+| `test_a_dsync_write_reaches_the_lower_device` | 1 | A write with `RWF_DSYNC` is on the lower device when it returns, and nothing is dirty. On a block device `RWF_DSYNC` gives a FUA write and then an fsync, so this cannot tell whether the FUA write itself waited; `test_fsync_on_ext4_leaves_nothing_in_the_cache` does |
 | `test_a_suspend_writes_back` | 1 | `dmsetup suspend` writes back what is dirty; after `resume` it reads back |
 | `test_a_partial_chunk_writes_only_its_sectors` | 1 | Sectors 1 and 5 of a chunk written: the lower device changes only there, and each sector reads with its CRC |
 | `test_a_read_of_a_partly_dirty_chunk` | 1 | One dirty sector comes from the cache, the other seven from the lower device |
@@ -434,7 +434,8 @@ that window would go unseen.
 ## Do the tests catch bugs?
 
 Checked by breaking the driver on purpose, in the copy inside the VM, and running the fast tests with
-`deploy/vm.sh test --no-sync`, see [DEPLOY.md](DEPLOY.md):
+`deploy/vm.sh test --no-sync`, see [DEPLOY.md](DEPLOY.md). The tables are a record of runs at their time: a test
+named in italics has been removed or replaced since.
 
 | Change | Failed | Where |
 | ------ | ------ | ----- |
@@ -451,10 +452,10 @@ in flight in the cache, is checked on the tests of `test_cache.py` on `dm-delay`
 | Change | Result | Where |
 | ------ | ------ | ----- |
 | The write back does not wait for the reads in flight on its chunk | Failed, `Input/output error` | `test_a_write_back_waits_for_a_read_in_flight`. `test_reads_and_writes_competing` passed, all 3 cases: with the cache a read rarely meets a write back there |
-| The lower writes of one entry go at once | Failed, `Input/output error`, 2 | `test_the_write_backs_of_a_chunk_go_one_at_a_time`, and `test_a_partial_chunk_writes_only_its_sectors` without any delay |
+| The lower writes of one entry go at once | Failed, `Input/output error`, 2 | *test_the_write_backs_of_a_chunk_go_one_at_a_time*, since replaced by `test_the_write_backs_of_a_chunk_wait_for_its_metadata`, and `test_a_partial_chunk_writes_only_its_sectors` without any delay |
 | A read of a clean sector does not wait for the write back of its chunk | Failed | `test_a_read_of_a_clean_sector_waits_for_the_write_back` |
 | The end of a read does not wake the worker | Exit code 3, a hang | `test_a_write_back_waits_for_a_read_in_flight` |
-| The end of a lower write of an entry does not start the next one | Exit code 3, a hang | `test_the_write_backs_of_a_chunk_go_one_at_a_time` |
+| The end of a lower write of an entry does not start the next one | Exit code 3, a hang | *test_the_write_backs_of_a_chunk_go_one_at_a_time*, since replaced by `test_the_write_backs_of_a_chunk_wait_for_its_metadata` |
 
 DM splitting requests at chunk boundaries:
 
@@ -469,7 +470,7 @@ it:
 | Change | Result | Where |
 | ------ | ------ | ----- |
 | The driver before the page pool and the lock table (`4a73a2f`) | Failed, `Input/output error` | All 13 tests above `test_write_goes_on_with_only_the_bio_reserve` |
-| A page reserve of 1 instead of 128 | Passed, as it should: parts go on one at a time | `test_write_goes_on_with_only_the_page_reserve`, `test_failed_page_allocation_does_not_fail_the_io` |
+| A page reserve of 1 instead of 128 | Passed, as it should: parts go on one at a time | *test_write_goes_on_with_only_the_page_reserve*, *test_failed_page_allocation_does_not_fail_the_io*, removed with the pool |
 
 Flushes and FUA, with `test_durability.py`:
 
@@ -521,7 +522,7 @@ Both copies of the metadata, the trailing one written after a flush:
 | ------ | ------ | ----- |
 | A read checks the leading entry twice, ignoring the trailing one | Failed, 3 | The leading cases of `test_crc_corruption_in_one_copy_is_covered_by_the_other` and `test_a_zeroed_metadata_sector_in_one_copy_fails_nothing` |
 | A leading sector that failed to read is not filled from the trailing copy | Failed | `test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy`; `test_metadata_sector_failed_in_one_copy_fails_nothing_and_warns` passed, as the area came back into pages that held the same region |
-| The trailing copy is never written | Failed, 6 | `test_layout_of_the_first_chunks_of_two_regions`, `test_metadata_is_written_outside_the_data`, `test_the_trailing_copy_is_written_after_a_flush`, `test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned`; in a run of its own, both cases of `test_a_write_cut_between_data_and_metadata_reads_old_or_new` |
+| The trailing copy is never written | Failed, 6 | *test_layout_of_the_first_chunks_of_two_regions*, since replaced by `test_layout_of_the_chunks_at_the_borders`, `test_metadata_is_written_outside_the_data`, `test_the_trailing_copy_is_written_after_a_flush`, `test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned`; in a run of its own, both cases of `test_a_write_cut_between_data_and_metadata_reads_old_or_new` |
 | A failed trailing write counts as written | Failed | `test_failed_trailing_write_is_counted_and_warned` |
 | The worker never flushes by itself when the areas are busy | Hang, exit code 3 | `test_the_driver_flushes_by_itself_when_half_the_areas_are_pinned`: the write back waits for an area for ever |
 
@@ -633,9 +634,9 @@ Metadata in an area per region, with the tests changed for it:
 
 | Change | Result | Where |
 | ------ | ------ | ----- |
-| The write backs go one at a time per chunk, not per metadata sector | Failed, `Input/output error` | `test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time`; `test_the_write_backs_of_a_chunk_go_one_at_a_time` passed, as it should |
+| The write backs go one at a time per chunk, not per metadata sector | Failed, `Input/output error` | *test_the_write_backs_of_chunks_sharing_a_metadata_sector_go_one_at_a_time*; *test_the_write_backs_of_a_chunk_go_one_at_a_time* passed, as it should. Both since replaced by the tests over `dm-delay` that `wait_for_its_metadata` |
 | `update_crc_local` keeps only the entry of its own chunk, the neighbours lose theirs | Failed, 39 | `test_corruption.py`, `test_cache.py`, `test_lower_errors.py` |
-| The data ignores the regions, at `256 + s`, the metadata does not | Failed, 3 | `test_layout_of_the_first_chunks_of_two_regions`, `test_data_lands_at_the_layout_position[across regions]`, `test_the_last_chunk_of_a_short_region` |
+| The data ignores the regions, at `256 + s`, the metadata does not | Failed, 3 | *test_layout_of_the_first_chunks_of_two_regions*, `test_data_lands_at_the_layout_position[across regions]`, *test_the_last_chunk_of_a_short_region*, both since replaced with the groups |
 | The write back does not wait for the reads in flight on its chunk, with the data delayed now | Failed, `Input/output error` | `test_a_write_back_waits_for_a_read_in_flight` |
 
 A read cut to 0 sectors by `dm_accept_partial_bio` makes device mapper send it again and again, until the

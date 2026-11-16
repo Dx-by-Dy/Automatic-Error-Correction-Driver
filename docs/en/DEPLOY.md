@@ -102,7 +102,7 @@ The results so far are in the last section of [TESTS.md](TESTS.md#do-the-tests-c
 The documents live in `docs/en/`, and in Russian in `docs/ru/`. Before a commit, run on the host:
 
 ```bash
-tools/check-docs.py              # links and anchors, the pairs of languages, the mermaid diagrams
+tools/check-docs.py              # links and anchors, tests named, pairs of languages, mermaid diagrams
 tools/check-docs.py --no-mermaid # without the mermaid CLI, which npx fetches on its first run
 ```
 

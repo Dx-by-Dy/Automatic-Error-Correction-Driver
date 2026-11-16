@@ -4,6 +4,7 @@
 - every relative link of a Markdown file points to a file that exists, and its anchor to a heading there;
 - every document has its pair in the other language: docs/en/X.md and docs/ru/X.md, README.md and
   docs/ru/README.md (once docs/ru holds any Markdown file);
+- every test named in the documents, as `test_...`, is defined in tests/;
 - every mermaid block parses, with the mermaid CLI through npx (skipped with --no-mermaid).
 
 The rest, that the documents say the same as the code and as each other, is checked by hand before a commit.
@@ -129,6 +130,23 @@ def check_pairs(files):
     return errors, None
 
 
+def check_test_names(root, files):
+    """Every `test_...` named in a document is a test function in tests/."""
+    defined = set()
+    for name in os.listdir(os.path.join(root, "tests")):
+        if name.endswith(".py"):
+            with open(os.path.join(root, "tests", name), encoding="utf-8") as file:
+                defined |= set(re.findall(r"^def (test_\w+)", file.read(), re.M))
+    errors = []
+    for path in files:
+        with open(os.path.join(root, path), encoding="utf-8") as file:
+            for number, line in enumerate(file, 1):
+                for name in re.findall(r"`(?:\w+\.py::)?(test_\w+)(?:\[[^\]]*\])?`", line):
+                    if name not in defined:
+                        errors.append(f"{path}:{number}: no test named {name}")
+    return errors
+
+
 def check_mermaid(blocks):
     errors = []
     if not blocks:
@@ -162,6 +180,7 @@ def main():
         errors += check_links(root, path, prose)
         blocks += [(path, start, text) for start, text in mermaid]
 
+    errors += check_test_names(root, files)
     pair_errors, note = check_pairs(files)
     errors += pair_errors
     if note:

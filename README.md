@@ -23,7 +23,8 @@ The project serves as a foundation for future implementation of Error Correcting
 
 ## Architecture
 
-How the driver works, with a glossary of its terms, is in [ARCHITECTURE.md](docs/en/ARCHITECTURE.md); why it is
+How the driver works, with a glossary of its terms, is in [ARCHITECTURE.md](docs/en/ARCHITECTURE.md), and as
+pictures in [DIAGRAMS.md](docs/en/DIAGRAMS.md); why it is
 built this way in [DECISIONS.md](docs/en/DECISIONS.md), with the reading behind it in
 [RESEARCH.md](docs/en/RESEARCH.md). What is not done yet is in [TODO.md](docs/en/TODO.md) and
 [TODO_OPTIMIZATION.md](docs/en/TODO_OPTIMIZATION.md).

@@ -1,7 +1,8 @@
 # Architecture
 
 How dm-dcorr works today: what it protects against, what it promises to the layer above, the on-disk format and
-the I/O path. Why it is built this way is in [DECISIONS.md](DECISIONS.md), with the reading behind it in
+the I/O path; [DIAGRAMS.md](DIAGRAMS.md) shows its situations as pictures, with the tests that cover them. Why it
+is built this way is in [DECISIONS.md](DECISIONS.md), with the reading behind it in
 [RESEARCH.md](RESEARCH.md). What is not done yet is in [TODO.md](TODO.md), what was left for the optimization
 stage in [TODO_OPTIMIZATION.md](TODO_OPTIMIZATION.md), how it is tested in [TESTS.md](TESTS.md), and how to
 build and run it in [DEPLOY.md](DEPLOY.md).
