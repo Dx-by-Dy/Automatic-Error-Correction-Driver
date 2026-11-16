@@ -1,0 +1,1187 @@
+#include <linux/blkdev.h>
+#include <linux/bvec.h>
+#include <linux/highmem.h>
+#include <linux/slab.h>
+
+#include "dm-dcorr.h"
+#include "cache.h"
+#include "metadata.h"
+#include "written.h"
+#include "trn_p_rq.h"
+#include "macros.h"
+
+/// @brief Lower write of one run of dirty sectors of an entry
+/// @details
+/// The bio goes through the same path as a write did before the cache: a part
+/// in trn_p_rq writes the data and the metadata sector of the chunk, from the
+/// metadata area of its region in RAM, which the job holds until it ends. Jobs
+/// come from a table allocated in cache_create.
+struct cache_job
+{
+    /// @brief Part that writes the bio, as the per-bio data of device mapper would hold it
+    struct trn_p_rq part;
+
+    /// @brief Bio over the page of the entry
+    struct bio bio;
+
+    /// @brief The only segment of bio
+    struct bio_vec bvec;
+
+    /// @brief Entry written back
+    struct cache_entry *entry;
+
+    /// @brief Cache of the entry
+    struct cache *cache;
+
+    /// @brief Metadata area of the region of the chunk, held by the job
+    struct metadata_area *area;
+
+    /// @brief Node in the list of free jobs, or in the queued list of the job in flight on its sector
+    struct list_head list;
+
+    /// @brief Node in the tree of jobs in flight of the cache, while in flight
+    struct rb_node node;
+
+    /// @brief Number of the metadata sector of the chunk: the chunk divided by CHUNKS_PER_METADATA_SECTOR
+    sector_t sector;
+
+    /// @brief While in flight, jobs of the same metadata sector waiting for it, see cache_submit_job
+    struct list_head queued;
+};
+
+/// @brief Free entries below which the worker writes back under pressure
+#define CACHE_START_FREE (CACHE_ENTRIES * (100 - CACHE_START_PERCENT) / 100)
+
+/// @brief Free entries, counting those under write back, that end the pressure
+#define CACHE_STOP_FREE (CACHE_ENTRIES * (100 - CACHE_STOP_PERCENT) / 100)
+
+/// @brief Mask of a run of sectors of a chunk
+static inline u8 sector_mask(unsigned int first, unsigned int sectors)
+{
+    return (u8)(((1U << sectors) - 1) << first);
+}
+
+/// @brief Length of the run of sectors from first that are all in mask, or all not in it
+/// @param mask    Mask of the entry
+/// @param first   First sector of the run, within the chunk
+/// @param sectors Most sectors the run may have
+/// @param set     Whether the run is of sectors in mask
+static unsigned int run_length(u8 mask, unsigned int first, unsigned int sectors, bool set)
+{
+    unsigned int n = 0;
+
+    while (n < sectors && !!(mask & BIT(first + n)) == set)
+        n++;
+
+    return n;
+}
+
+/// @brief Finds the entry of a chunk in the tree; the lock must be held
+static struct cache_entry *cache_find(struct cache *cache, sector_t chunk)
+{
+    struct rb_node *node = cache->tree.rb_node;
+
+    while (node)
+    {
+        struct cache_entry *entry = rb_entry(node, struct cache_entry, node);
+
+        if (chunk < entry->chunk)
+            node = node->rb_left;
+        else if (chunk > entry->chunk)
+            node = node->rb_right;
+        else
+            return entry;
+    }
+
+    return NULL;
+}
+
+/// @brief Puts an entry into the tree; the lock must be held and the chunk must not be there
+static void cache_insert(struct cache *cache, struct cache_entry *entry)
+{
+    struct rb_node **link = &cache->tree.rb_node;
+    struct rb_node *parent = NULL;
+
+    while (*link)
+    {
+        struct cache_entry *other = rb_entry(*link, struct cache_entry, node);
+
+        parent = *link;
+        link = entry->chunk < other->chunk ? &(*link)->rb_left : &(*link)->rb_right;
+    }
+
+    rb_link_node(&entry->node, parent, link);
+    rb_insert_color(&entry->node, &cache->tree);
+}
+
+/// @brief Puts a read of a chunk into the tree of reads in flight; the lock must be held
+static void cache_insert_read(struct cache *cache, struct cache_range *range, sector_t chunk)
+{
+    struct rb_node **link = &cache->reads.rb_node;
+    struct rb_node *parent = NULL;
+
+    range->chunk = chunk;
+
+    while (*link)
+    {
+        struct cache_range *other = rb_entry(*link, struct cache_range, node);
+
+        parent = *link;
+        link = range->chunk < other->chunk ? &(*link)->rb_left : &(*link)->rb_right;
+    }
+
+    rb_link_node(&range->node, parent, link);
+    rb_insert_color(&range->node, &cache->reads);
+}
+
+/// @brief Whether a read of a chunk is in flight; the lock must be held
+static bool cache_reads_on(struct cache *cache, sector_t chunk)
+{
+    struct rb_node *node = cache->reads.rb_node;
+
+    while (node)
+    {
+        struct cache_range *range = rb_entry(node, struct cache_range, node);
+
+        if (chunk < range->chunk)
+            node = node->rb_left;
+        else if (chunk > range->chunk)
+            node = node->rb_right;
+        else
+            return true;
+    }
+
+    return false;
+}
+
+/// @brief Finds the job in flight on a metadata sector; the lock must be held
+static struct cache_job *cache_find_sector(struct cache *cache, sector_t sector)
+{
+    struct rb_node *node = cache->sectors.rb_node;
+
+    while (node)
+    {
+        struct cache_job *job = rb_entry(node, struct cache_job, node);
+
+        if (sector < job->sector)
+            node = node->rb_left;
+        else if (sector > job->sector)
+            node = node->rb_right;
+        else
+            return job;
+    }
+
+    return NULL;
+}
+
+/// @brief Puts a job into the tree of jobs in flight; the lock must be held and its sector must not be there
+static void cache_insert_sector(struct cache *cache, struct cache_job *job)
+{
+    struct rb_node **link = &cache->sectors.rb_node;
+    struct rb_node *parent = NULL;
+
+    while (*link)
+    {
+        struct cache_job *other = rb_entry(*link, struct cache_job, node);
+
+        parent = *link;
+        link = job->sector < other->sector ? &(*link)->rb_left : &(*link)->rb_right;
+    }
+
+    rb_link_node(&job->node, parent, link);
+    rb_insert_color(&job->node, &cache->sectors);
+}
+
+/// @brief Hands the place of a job in the tree of jobs in flight to the first job queued on it
+/// @details The lock must be held. The other queued jobs go on waiting for next.
+static void cache_pass_sector(struct cache *cache, struct cache_job *job, struct cache_job *next)
+{
+    list_del_init(&next->list);
+    list_splice_init(&job->queued, &next->queued);
+    rb_replace_node(&job->node, &next->node, &cache->sectors);
+}
+
+/// @brief Records that waiters may go on; the lock must be held, wake them after dropping it
+static void cache_event(struct cache *cache)
+{
+    cache->events++;
+}
+
+/// @brief Waits for the events of the cache to change; called with the lock held, returns with it held
+static void cache_wait(struct cache *cache)
+{
+    u64 seen = cache->events;
+
+    spin_unlock(&cache->lock);
+    wait_event(cache->wait, READ_ONCE(cache->events) != seen);
+    spin_lock(&cache->lock);
+}
+
+/// @brief Runs the worker now
+static void cache_kick(struct cache *cache)
+{
+    mod_delayed_work(cache->wq, &cache->write_back, 0);
+}
+
+/// @brief Runs the worker once the oldest dirty entry is old enough, unless it is due sooner
+static void cache_schedule(struct cache *cache)
+{
+    queue_delayed_work(cache->wq, &cache->write_back, msecs_to_jiffies(CACHE_AGE_MS));
+}
+
+/// @brief Copies the data of a write into an entry, at the place of its first sector in the chunk
+static void copy_to_entry(struct cache_entry *entry, struct bio *bio, unsigned int first)
+{
+    char *base = kmap_local_page(entry->page);
+    unsigned int offset = first << SECTOR_SHIFT;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    bio_for_each_segment(bvec, bio, iter)
+    {
+        memcpy_from_bvec(base + offset, &bvec);
+        offset += bvec.bv_len;
+    }
+
+    kunmap_local(base);
+}
+
+/// @brief Copies sectors of an entry into the start of a read
+static void copy_from_entry(struct cache_entry *entry, struct bio *bio,
+                            unsigned int first, unsigned int sectors)
+{
+    char *base = kmap_local_page(entry->page);
+    unsigned int offset = first << SECTOR_SHIFT;
+    struct bvec_iter start = bio->bi_iter;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    start.bi_size = sectors << SECTOR_SHIFT;
+    __bio_for_each_segment(bvec, bio, iter, start)
+    {
+        memcpy_to_bvec(&bvec, base + offset);
+        offset += bvec.bv_len;
+    }
+
+    kunmap_local(base);
+}
+
+/// @brief Moves the failed entries back to the dirty ones, so the worker tries them again
+static void cache_retry_failed(struct cache *cache)
+{
+    struct cache_entry *entry;
+
+    list_for_each_entry(entry, &cache->failed, list)
+        entry->state = CACHE_DIRTY;
+    list_splice_tail_init(&cache->failed, &cache->dirty);
+    cache->nr_dirty += cache->nr_failed;
+    cache->nr_failed = 0;
+}
+
+/// @brief Writes a bio into the cache
+/// @details
+/// Device mapper splits requests at chunk boundaries, so the bio is within one
+/// chunk. Waits while the entry of the chunk is under write back, or while no
+/// entry is free; then copies the data and completes the bio at once. A FUA
+/// write completes once the worker has written back everything and flushed
+/// the device below. With no free entry and nothing that could free one, as
+/// all entries failed to write back, the write fails.
+///
+/// Expected execution context - dm_map, may sleep.
+/// @param cache The cache of the device
+/// @param bio   Write with bi_sector relative to the start of the target
+void cache_write(struct cache *cache, struct bio *bio)
+{
+    sector_t chunk = bio->bi_iter.bi_sector / DATA_SIZE_SECTORS;
+    unsigned int first = bio->bi_iter.bi_sector % DATA_SIZE_SECTORS;
+    bool fua = bio->bi_opf & REQ_FUA;
+    struct cache_entry *entry;
+    bool kick;
+
+    spin_lock(&cache->lock);
+    for (;;)
+    {
+        entry = cache_find(cache, chunk);
+        if (entry && entry->state != CACHE_WRITING)
+            break;
+
+        if (entry)
+        {
+            atomic64_inc(&cache->busy_waits);
+            cache_wait(cache);
+            continue;
+        }
+
+        if (!list_empty(&cache->free))
+        {
+            entry = list_first_entry(&cache->free, struct cache_entry, list);
+            list_del_init(&entry->list);
+            cache->nr_free--;
+            entry->chunk = chunk;
+            entry->mask = 0;
+            cache_insert(cache, entry);
+            break;
+        }
+
+        if (!cache->nr_dirty && !cache->nr_writing)
+        {
+            spin_unlock(&cache->lock);
+            DM_ERR_LIMIT("no entry for chunk %llu: the cache is full of chunks that failed to write back\n",
+                         (unsigned long long)chunk);
+            bio_io_error(bio);
+            return;
+        }
+
+        atomic64_inc(&cache->free_waits);
+        spin_unlock(&cache->lock);
+        cache_kick(cache);
+        spin_lock(&cache->lock);
+        if (list_empty(&cache->free) && (cache->nr_dirty || cache->nr_writing))
+            cache_wait(cache);
+    }
+
+    copy_to_entry(entry, bio, first);
+    entry->mask |= sector_mask(first, bio_sectors(bio));
+
+    if (entry->state != CACHE_DIRTY)
+    {
+        if (entry->state == CACHE_FAILED)
+        {
+            list_del_init(&entry->list);
+            cache->nr_failed--;
+        }
+        entry->state = CACHE_DIRTY;
+        entry->dirtied = jiffies;
+        list_add_tail(&entry->list, &cache->dirty);
+        cache->nr_dirty++;
+    }
+
+    kick = fua || cache->nr_free < CACHE_START_FREE;
+    if (fua)
+        bio_list_add(&cache->flushes, bio);
+    spin_unlock(&cache->lock);
+
+    if (kick)
+        cache_kick(cache);
+    else
+        cache_schedule(cache);
+
+    if (!fua)
+        bio_endio(bio);
+}
+
+/// @brief Serves the start of a read from the cache, or tells the caller to read it from below
+/// @details
+/// Cuts the bio, with dm_accept_partial_bio, to the run of sectors from its
+/// start that are all in the cache or all not in it; device mapper sends the
+/// rest as another bio. A run in the cache is copied and completed here.
+///
+/// A run not in the cache of a chunk never written back, whose bit in the
+/// bitmap of written chunks is clear, is zeros, completed here without a read.
+/// The bit is set under the lock when the first write back of the chunk ends,
+/// so it is tested under the same hold.
+///
+/// Any other run not in the cache goes to the device below by the caller. It is put
+/// into the tree of reads first, under the same hold of the lock, and stays
+/// there until cache_read_done, so a write back of the chunk waits for it. If
+/// the chunk is under write back already, the read waits for it to end
+/// instead: the sectors are not written back, but a stream of such reads would
+/// otherwise keep the write back waiting for ever. A write of those sectors
+/// that comes meanwhile is concurrent with the read, so the read may return the
+/// data from before it.
+///
+/// Expected execution context - dm_map, may sleep.
+/// @param cache The cache of the device
+/// @param bio   Read with bi_sector relative to the start of the target
+/// @param range Free node in the per-bio data of the bio, used if it is read from below
+/// @return true if the bio was completed, false if it has to be read from below
+bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range)
+{
+    struct written_map *written = cache->dm_ctx->written;
+    sector_t chunk = bio->bi_iter.bi_sector / DATA_SIZE_SECTORS;
+    unsigned int first = bio->bi_iter.bi_sector % DATA_SIZE_SECTORS;
+    unsigned int sectors = bio_sectors(bio);
+    struct cache_entry *entry;
+    unsigned int run = sectors;
+    bool cached = false;
+    bool waited = false;
+    bool unwritten = false;
+
+    spin_lock(&cache->lock);
+    for (;;)
+    {
+        entry = cache_find(cache, chunk);
+        if (!entry)
+            break;
+
+        cached = entry->mask & BIT(first);
+        if (cached || entry->state != CACHE_WRITING)
+        {
+            run = run_length(entry->mask, first, sectors, cached);
+            break;
+        }
+
+        if (!waited)
+            atomic64_inc(&cache->read_waits);
+        waited = true;
+        cache_wait(cache);
+    }
+
+    if (cached)
+        copy_from_entry(entry, bio, first, run);
+    else if (!written_test(written, bio->bi_iter.bi_sector))
+        unwritten = true;
+    else
+        cache_insert_read(cache, range, chunk);
+    spin_unlock(&cache->lock);
+
+    if (run < sectors)
+        dm_accept_partial_bio(bio, run);
+    if (unwritten)
+    {
+        atomic64_inc(&written->unwritten_reads);
+        zero_fill_bio(bio);
+    }
+    if (cached || unwritten)
+        bio_endio(bio);
+
+    return cached || unwritten;
+}
+
+/// @brief Takes a read of the device below out of the tree of reads in flight
+/// @details
+/// Wakes the worker only if the chunk is under write back, as only then it may
+/// wait for the read.
+///
+/// Expected execution context - process, complete_work of the read.
+/// @param cache The cache of the device
+/// @param range The node cache_read put into the tree
+void cache_read_done(struct cache *cache, struct cache_range *range)
+{
+    struct cache_entry *entry;
+    bool wake;
+
+    spin_lock(&cache->lock);
+    rb_erase(&range->node, &cache->reads);
+    entry = cache_find(cache, range->chunk);
+    wake = entry && entry->state == CACHE_WRITING;
+    if (wake)
+        cache_event(cache);
+    spin_unlock(&cache->lock);
+
+    if (wake)
+        wake_up_all(&cache->wait);
+}
+
+/// @brief Hands an empty flush to the worker, which completes it
+/// @details
+/// Expected execution context - dm_map.
+void cache_flush(struct cache *cache, struct bio *bio)
+{
+    spin_lock(&cache->lock);
+    bio_list_add(&cache->flushes, bio);
+    spin_unlock(&cache->lock);
+    cache_kick(cache);
+}
+
+/// @brief Hands a discard to the worker, which completes it
+/// @details
+/// The bio covers at least one whole chunk, and no block of the bitmap
+/// invalid in both copies; dm_map has checked that. The bits are cleared by the
+/// worker, see cache_discard_bios, as a sync writes the blocks of the bitmap
+/// from RAM, and only the worker runs syncs while the device is live.
+///
+/// Expected execution context - dm_map.
+void cache_discard(struct cache *cache, struct bio *bio)
+{
+    spin_lock(&cache->lock);
+    bio_list_add(&cache->discards, bio);
+    spin_unlock(&cache->lock);
+    cache_kick(cache);
+}
+
+/// @brief Finds the entry of the first chunk from this one on in the tree; the lock must be held
+static struct cache_entry *cache_find_from(struct cache *cache, sector_t chunk)
+{
+    struct rb_node *node = cache->tree.rb_node;
+    struct cache_entry *found = NULL;
+
+    while (node)
+    {
+        struct cache_entry *entry = rb_entry(node, struct cache_entry, node);
+
+        if (chunk > entry->chunk)
+        {
+            node = node->rb_right;
+            continue;
+        }
+        found = entry;
+        node = node->rb_left;
+    }
+
+    return found;
+}
+
+/// @brief Drops the entries of the chunks of a range, their data not yet written back; the lock must be held
+/// @details No entry may be under write back. A failed entry is dropped too: its data is discarded.
+static void cache_drop_range(struct cache *cache, sector_t first, sector_t end)
+{
+    struct cache_entry *entry = cache_find_from(cache, first);
+
+    while (entry && entry->chunk < end)
+    {
+        struct rb_node *next = rb_next(&entry->node);
+
+        WARN_ON_ONCE(entry->state == CACHE_WRITING);
+        if (entry->state == CACHE_FAILED)
+            cache->nr_failed--;
+        else
+            cache->nr_dirty--;
+        list_del(&entry->list);
+        rb_erase(&entry->node, &cache->tree);
+        entry->state = CACHE_FREE;
+        entry->mask = 0;
+        list_add(&entry->list, &cache->free);
+        cache->nr_free++;
+
+        entry = next ? rb_entry(next, struct cache_entry, node) : NULL;
+    }
+}
+
+/// @brief Carries out the discards handed to the worker, and completes them
+/// @details
+/// Waits for the write backs in flight first, so that no entry is under write
+/// back and no bit is set meanwhile. For the whole chunks of each discard, the
+/// entries are dropped and the bits cleared, a block of the bitmap at a time
+/// under the lock, so that a read sees a chunk either as it was or as zeros. A
+/// cleared bit reaches the device with the next sync, so a discard is durable
+/// once a flush from above that follows it completes; until then the chunk may
+/// hold its old data after a crash. The first write back of such a chunk syncs
+/// first, see cache_prepare_metadata.
+///
+/// Expected execution context - the worker, may sleep.
+static void cache_discard_bios(struct cache *cache, struct bio_list *discards)
+{
+    struct written_map *written = cache->dm_ctx->written;
+    struct bio *bio;
+
+    wait_event(cache->wait, !READ_ONCE(cache->nr_writing));
+
+    while ((bio = bio_list_pop(discards)))
+    {
+        sector_t first = DIV_ROUND_UP(bio->bi_iter.bi_sector, DATA_SIZE_SECTORS);
+        sector_t end = bio_end_sector(bio) / DATA_SIZE_SECTORS;
+        sector_t chunk = first;
+        bool wake;
+
+        spin_lock(&cache->lock);
+        cache_drop_range(cache, first, end);
+        wake = !list_empty(&cache->free);
+        cache_event(cache);
+        spin_unlock(&cache->lock);
+        if (wake)
+            wake_up_all(&cache->wait);
+
+        while (chunk < end)
+        {
+            u64 done;
+
+            spin_lock(&cache->lock);
+            if (written_clear(written, chunk * DATA_SIZE_SECTORS, end - chunk, &done))
+                cache->clears++;
+            spin_unlock(&cache->lock);
+            chunk += done;
+            cond_resched();
+        }
+
+        atomic64_add(end - first, &cache->discarded_chunks);
+        bio_endio(bio);
+    }
+}
+
+/// @brief Ends the write back of an entry once its last job is done; the lock must be held
+/// @details
+/// A written entry is freed, and the bit of its chunk set in the bitmap of
+/// written chunks, before a read can miss the entry and go below. A failed one
+/// keeps its data and waits for a retry, its bit as it was.
+static void cache_finish_entry(struct cache *cache, struct cache_entry *entry)
+{
+    cache->nr_writing--;
+
+    if (entry->status)
+    {
+        entry->state = CACHE_FAILED;
+        list_add_tail(&entry->list, &cache->failed);
+        cache->nr_failed++;
+        return;
+    }
+
+    written_set(cache->dm_ctx->written, entry->chunk * DATA_SIZE_SECTORS);
+    rb_erase(&entry->node, &cache->tree);
+    entry->state = CACHE_FREE;
+    entry->mask = 0;
+    list_add(&entry->list, &cache->free);
+    cache->nr_free++;
+}
+
+/// @brief Completion of a write back job
+/// @details
+/// complete_work of the part calls it through bio_endio, as the last thing it
+/// does. It records the outcome for the metadata, which pins the area until
+/// the next flush; the sectors of a job that succeeded go into the trailing
+/// copy then. Lets the metadata area go first, so that it can be dropped once
+/// the write backs are over and it is not pinned. Starts the next job of the metadata sector, if one is
+/// queued, which takes its place in the tree of jobs in flight. The last job of
+/// an entry frees it, or marks it failed.
+///
+/// Expected execution context - process, a worker of transform_wq.
+static void cache_job_end_io(struct bio *bio)
+{
+    struct cache_job *job = container_of(bio, struct cache_job, bio);
+    struct cache_entry *entry = job->entry;
+    struct cache *cache = job->cache;
+    blk_status_t status = bio->bi_status;
+    sector_t chunk = entry->chunk;
+    struct cache_job *next;
+
+    bio_uninit(bio);
+    metadata_written(cache->dm_ctx->metadata, job->area, chunk * DATA_SIZE_SECTORS,
+                     sector_mask(job->part.meta.write.first_sector, job->part.meta.write.nr_sectors), !status);
+    metadata_put(cache->dm_ctx->metadata, job->area);
+
+    spin_lock(&cache->lock);
+    if (status && !entry->status)
+        entry->status = status;
+    list_add(&job->list, &cache->jobs);
+    cache->nr_jobs--;
+
+    next = list_first_entry_or_null(&job->queued, struct cache_job, list);
+    if (next)
+        cache_pass_sector(cache, job, next);
+    else
+        rb_erase(&job->node, &cache->sectors);
+
+    if (!--entry->jobs)
+        cache_finish_entry(cache, entry);
+
+    cache_event(cache);
+    spin_unlock(&cache->lock);
+    wake_up_all(&cache->wait);
+
+    if (next)
+        queue_work(cache->dm_ctx->transform_wq, &next->part.submit_work);
+
+    if (status)
+        DM_ERR_LIMIT("write back of chunk %llu failed, status=%d\n", (unsigned long long)chunk, status);
+}
+
+/// @brief Takes a free job, waiting for one if needed
+/// @details Expected execution context - the worker, may sleep.
+static struct cache_job *cache_get_job(struct cache *cache)
+{
+    struct cache_job *job;
+
+    spin_lock(&cache->lock);
+    while (list_empty(&cache->jobs))
+        cache_wait(cache);
+    job = list_first_entry(&cache->jobs, struct cache_job, list);
+    list_del_init(&job->list);
+    cache->nr_jobs++;
+    spin_unlock(&cache->lock);
+
+    return job;
+}
+
+/// @brief Writes back one run of sectors of an entry
+/// @details
+/// Gets the metadata area of the region of the chunk first, which may wait
+/// while it is read.
+///
+/// The jobs of one metadata sector go one after another: a job puts its CRCs
+/// into the area in RAM and writes the sector from there, so a second job at
+/// once would change the memory under the write of the first, and the device
+/// below could get the CRCs of data not yet written. This holds for the jobs
+/// of one entry and for those of the neighbouring chunks that share the sector.
+/// The job starts at once if no job of its sector is in flight, and is queued
+/// on the job in flight otherwise; the end of the job before it starts it.
+static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
+                             unsigned int first, unsigned int sectors)
+{
+    struct dm_context *dm_ctx = cache->dm_ctx;
+    struct cache_job *job = cache_get_job(cache);
+    struct bio *bio = &job->bio;
+    struct cache_job *head;
+    bool start;
+
+    job->entry = entry;
+    job->cache = cache;
+    job->area = metadata_get(dm_ctx->metadata, entry->chunk * DATA_SIZE_SECTORS);
+    job->sector = entry->chunk / CHUNKS_PER_METADATA_SECTOR;
+    INIT_LIST_HEAD(&job->queued);
+
+    bio_init(bio, dm_ctx->dev->bdev, &job->bvec, 1, REQ_OP_WRITE);
+    bio->bi_iter.bi_sector = entry->chunk * DATA_SIZE_SECTORS + first;
+    bio->bi_end_io = cache_job_end_io;
+    __bio_add_page(bio, entry->page, sectors << SECTOR_SHIFT, first << SECTOR_SHIFT);
+
+    // The worker may wait here: the completions that give places back run in transform_wq.
+    down(&dm_ctx->parts_in_flight);
+    trn_p_rq_init(&job->part, bio, dm_ctx, TRANSFORM_WRITE, job->area);
+
+    spin_lock(&cache->lock);
+    head = cache_find_sector(cache, job->sector);
+    start = !head;
+    if (start)
+        cache_insert_sector(cache, job);
+    else
+        list_add_tail(&job->list, &head->queued);
+    spin_unlock(&cache->lock);
+
+    if (start)
+        queue_work(dm_ctx->transform_wq, &job->part.submit_work);
+}
+
+static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed);
+
+/// @brief Makes the metadata of a chunk ready for a write back that writes the leading copy first
+/// @details
+/// A chunk written back since the last flush of the device below may hold its
+/// old or its new data, and the trailing copy has the CRC of the old one; one
+/// more write back would leave three versions for two copies. So the worker
+/// first waits for the jobs in flight and runs cache_sync, which makes the data
+/// durable and puts its CRC into the trailing copy; this is counted as a
+/// barrier. Then metadata_settle reads the chunk if its copies still differ in
+/// the sectors to be written. A chunk never written back is not read: its old
+/// contents are zeros whatever its copies hold.
+///
+/// That holds only while its bit is clear on the device too. A discard clears
+/// a bit in RAM, and the device keeps it set until the next sync; a crash after
+/// a write back that skipped the settle could then leave sectors matching
+/// neither copy. So a chunk with its bit clear, while a clear is not yet
+/// durable, waits for a sync too, counted as a barrier; if that sync fails,
+/// the chunk is settled as one written before.
+/// @param unwritten Whether the bit of the chunk in the bitmap of written chunks is clear
+static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entry, bool unwritten)
+{
+    struct metadata_cache *metadata = cache->dm_ctx->metadata;
+    sector_t sector = entry->chunk * DATA_SIZE_SECTORS;
+    struct metadata_area *area = metadata_get(metadata, sector);
+
+    if (metadata_written_since_flush(metadata, area, sector) ||
+        (unwritten && cache->clears != cache->synced_clears))
+    {
+        wait_event(cache->wait, !READ_ONCE(cache->nr_jobs));
+        atomic64_inc(&cache->barriers);
+        cache_sync(cache, NULL, false);
+    }
+
+    if (!unwritten || cache->clears != cache->synced_clears)
+        metadata_settle(metadata, area, sector, entry->mask);
+    metadata_put(metadata, area);
+}
+
+/// @brief Writes back an entry in CACHE_WRITING, one job per run of its sectors
+/// @details
+/// Writes to the entry wait until it leaves CACHE_WRITING, so its mask and its
+/// page do not change while the jobs are in flight. So do new reads of its
+/// clean sectors, so the reads of the chunk already in flight are waited for
+/// before the first job: a read that met a job could see the data of one
+/// version of a sector and the CRC of another. Then the metadata of the chunk
+/// is made ready, see cache_prepare_metadata.
+///
+/// The first write back of a chunk, whose bit in the bitmap of written chunks is
+/// clear, writes it whole, the sectors not written from above as zeros: once
+/// the bit is set they are read from the device below, where they hold
+/// whatever was there before the format.
+static void cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
+{
+    bool unwritten;
+    unsigned int first;
+    unsigned int run;
+    unsigned int jobs = 0;
+    u8 mask;
+
+    spin_lock(&cache->lock);
+    unwritten = !written_test(cache->dm_ctx->written, entry->chunk * DATA_SIZE_SECTORS);
+    if (unwritten && entry->mask != 0xff)
+    {
+        char *base = kmap_local_page(entry->page);
+
+        for (first = 0; first < DATA_SIZE_SECTORS; first++)
+        {
+            if (!(entry->mask & BIT(first)))
+                memset(base + (first << SECTOR_SHIFT), 0, SECTOR_SIZE);
+        }
+        kunmap_local(base);
+        entry->mask = 0xff;
+    }
+    mask = entry->mask;
+    spin_unlock(&cache->lock);
+
+    for (first = 0; first < DATA_SIZE_SECTORS; first += run)
+    {
+        run = run_length(mask, first, DATA_SIZE_SECTORS - first, mask & BIT(first));
+        if (mask & BIT(first))
+            jobs++;
+    }
+
+    spin_lock(&cache->lock);
+    entry->jobs = jobs;
+    entry->status = BLK_STS_OK;
+    while (cache_reads_on(cache, entry->chunk))
+        cache_wait(cache);
+    spin_unlock(&cache->lock);
+
+    cache_prepare_metadata(cache, entry, unwritten);
+
+    for (first = 0; first < DATA_SIZE_SECTORS; first += run)
+    {
+        run = run_length(mask, first, DATA_SIZE_SECTORS - first, mask & BIT(first));
+        if (mask & BIT(first))
+            cache_submit_job(cache, entry, first, run);
+    }
+}
+
+/// @brief Whether the worker has to write back more to keep entries free
+static bool cache_under_pressure(struct cache *cache)
+{
+    return cache->nr_free + cache->nr_writing < CACHE_STOP_FREE;
+}
+
+/// @brief Flushes the device below, writes the bitmap, completes the flushes from above, then writes the
+/// trailing copies
+/// @details
+/// No write back job may be in flight, and none may start until it returns.
+/// Once the device below has flushed, the data written back is durable, and
+/// the first copy of each block of the bitmap with new bits is written, then
+/// the device below is flushed again, see written_write_first: a bit on the
+/// device means durable data, and the bits cleared before the sync are clear on
+/// the device, as synced_clears records. The flushes from above complete then: with
+/// BLK_STS_IOERR if failed is set, as a flush promises that nothing is left
+/// only in RAM, or if a flush or a block of the bitmap failed. Then the
+/// trailing copies of the metadata of the chunks written back before get the
+/// CRCs of that durable data, the other copies of the blocks of the bitmap are
+/// written, and the device below is flushed once more, so that both copies are
+/// durable before a chunk is written back again. If a flush before fails, no
+/// trailing copy is written: the data may not be on the device.
+///
+/// Expected execution context - the worker, or postsuspend once the worker is
+/// cancelled; may sleep.
+/// @param cache   The cache of the device
+/// @param flushes Flush and FUA bios from above to complete, or NULL
+/// @param failed  Whether chunks are left that failed to write back
+/// @return 0, or the error of a flush of the device below
+static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed)
+{
+    struct metadata_cache *metadata = cache->dm_ctx->metadata;
+    struct written_map *written = cache->dm_ctx->written;
+    struct block_device *bdev = cache->dm_ctx->dev->bdev;
+    u64 clears = cache->clears;
+    blk_status_t status;
+    struct bio *bio;
+    int r;
+
+    r = blkdev_issue_flush(bdev);
+    if (!r)
+    {
+        r = written_write_first(written);
+        if (r > 0)
+            r = blkdev_issue_flush(bdev);
+        else if (r < 0)
+            DM_ERR_LIMIT("the bitmap of written chunks failed to write, err=%d\n", r);
+    }
+    if (!r)
+        cache->synced_clears = clears;
+    status = failed ? BLK_STS_IOERR : errno_to_blk_status(r);
+    while (flushes && (bio = bio_list_pop(flushes)))
+    {
+        bio->bi_status = status;
+        bio_endio(bio);
+    }
+
+    if (r)
+    {
+        DM_ERR_LIMIT("lower flush or bitmap failed, err=%d, trailing metadata not written\n", r);
+        written_abort(written);
+        metadata_unpin_all(metadata);
+        return r;
+    }
+
+    metadata_write_trails(metadata);
+    written_write_second(written);
+
+    r = blkdev_issue_flush(bdev);
+    if (r)
+        DM_ERR_LIMIT("lower flush after the trailing metadata failed, err=%d\n", r);
+
+    return r;
+}
+
+/// @brief Waits for all write backs, then completes the flushes and FUA writes
+/// @details
+/// A flush succeeds only if no entry is left that failed to write back, and the
+/// device below flushed: it promises that the data is on the device.
+static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes)
+{
+    unsigned long failed;
+
+    wait_event(cache->wait, !READ_ONCE(cache->nr_writing));
+
+    spin_lock(&cache->lock);
+    failed = cache->nr_failed;
+    spin_unlock(&cache->lock);
+
+    cache_sync(cache, flushes, failed);
+}
+
+/// @brief Takes the pins off the metadata areas when too many are busy, before the next write back
+/// @details
+/// A write back holds the area of its chunk, and pins it when it completes,
+/// until the trailing copy is written. So once half the areas are busy, the
+/// worker waits for the jobs in flight and runs cache_sync, which unpins them
+/// all; otherwise the areas could run out with the worker waiting for one.
+static void cache_relieve_metadata(struct cache *cache)
+{
+    if (!metadata_crowded(cache->dm_ctx->metadata))
+        return;
+
+    wait_event(cache->wait, !READ_ONCE(cache->nr_jobs));
+    atomic64_inc(&cache->crowded_flushes);
+    cache_sync(cache, NULL, false);
+}
+
+/// @brief The worker
+/// @details
+/// Carries out the discards first, see cache_discard_bios. Then writes back
+/// the dirty entries, the oldest first: all of them for a flush,
+/// a FUA write or a suspend, and otherwise those older than CACHE_AGE_MS and
+/// as many as keep CACHE_STOP_FREE entries free or on their way to it. A flush
+/// tries the failed entries again, and writes the trailing copies of the
+/// metadata after the device below has flushed, see cache_sync; so does the
+/// worker when too many metadata areas are pinned. Then it schedules itself
+/// for the next entry to come of age.
+///
+/// It runs on an ordered workqueue of its own, never in transform_wq, so it may
+/// wait for jobs, for places among the parts in flight and for reads in flight:
+/// their completions run there.
+static void cache_write_back(struct work_struct *work)
+{
+    struct cache *cache = container_of(to_delayed_work(work), struct cache, write_back);
+    struct cache_entry *entry;
+    struct cache_entry *next;
+    struct bio_list flushes;
+    struct bio_list discards;
+    LIST_HEAD(picked);
+    bool all;
+
+    spin_lock(&cache->lock);
+    discards = cache->discards;
+    bio_list_init(&cache->discards);
+    spin_unlock(&cache->lock);
+
+    if (!bio_list_empty(&discards))
+        cache_discard_bios(cache, &discards);
+
+    spin_lock(&cache->lock);
+    flushes = cache->flushes;
+    bio_list_init(&cache->flushes);
+    all = cache->write_all || !bio_list_empty(&flushes);
+    if (!bio_list_empty(&flushes))
+        cache_retry_failed(cache);
+
+    while (!list_empty(&cache->dirty))
+    {
+        entry = list_first_entry(&cache->dirty, struct cache_entry, list);
+        if (!all && !cache_under_pressure(cache) &&
+            time_before(jiffies, entry->dirtied + msecs_to_jiffies(CACHE_AGE_MS)))
+            break;
+
+        list_move_tail(&entry->list, &picked);
+        entry->state = CACHE_WRITING;
+        cache->nr_dirty--;
+        cache->nr_writing++;
+    }
+    spin_unlock(&cache->lock);
+
+    list_for_each_entry_safe(entry, next, &picked, list)
+    {
+        list_del_init(&entry->list);
+        cache_relieve_metadata(cache);
+        cache_write_back_entry(cache, entry);
+    }
+
+    if (!bio_list_empty(&flushes))
+        cache_complete_flushes(cache, &flushes);
+
+    spin_lock(&cache->lock);
+    if (!cache->suspended && !list_empty(&cache->dirty))
+    {
+        unsigned long due;
+
+        entry = list_first_entry(&cache->dirty, struct cache_entry, list);
+        due = entry->dirtied + msecs_to_jiffies(CACHE_AGE_MS);
+        queue_delayed_work(cache->wq, &cache->write_back,
+                           time_after(due, jiffies) ? due - jiffies : 0);
+    }
+    spin_unlock(&cache->lock);
+}
+
+/// @brief Writes back everything before the device is suspended
+/// @details
+/// Called from postsuspend, when device mapper has no bio of the device in
+/// flight. Tries the failed entries once more; those that fail again keep their
+/// data in RAM, which is lost if the target is destroyed, as a suspend cannot fail.
+/// Then flushes the device below and writes the trailing copies of the
+/// metadata, see cache_sync, so that no metadata area is pinned.
+///
+/// Expected execution context - process, may sleep.
+void cache_suspend(struct cache *cache)
+{
+    unsigned long failed;
+
+    spin_lock(&cache->lock);
+    cache->write_all = true;
+    cache->suspended = true;
+    cache_retry_failed(cache);
+    spin_unlock(&cache->lock);
+
+    cache_kick(cache);
+    wait_event(cache->wait, !READ_ONCE(cache->nr_dirty) && !READ_ONCE(cache->nr_writing));
+    cancel_delayed_work_sync(&cache->write_back);
+
+    cache_sync(cache, NULL, false);
+
+    spin_lock(&cache->lock);
+    cache->write_all = false;
+    failed = cache->nr_failed;
+    spin_unlock(&cache->lock);
+
+    if (failed)
+        DM_ERR("%lu chunks failed to write back on suspend, their data is only in RAM\n", failed);
+}
+
+/// @brief Lets the worker schedule itself again after a suspend
+void cache_resume(struct cache *cache)
+{
+    spin_lock(&cache->lock);
+    cache->suspended = false;
+    spin_unlock(&cache->lock);
+
+    cache_kick(cache);
+}
+
+/// @brief Numbers of dirty and failed entries, for dmsetup status
+void cache_counters(struct cache *cache, unsigned long *dirty, unsigned long *failed)
+{
+    spin_lock(&cache->lock);
+    *dirty = cache->nr_dirty + cache->nr_writing;
+    *failed = cache->nr_failed;
+    spin_unlock(&cache->lock);
+}
+
+/// @brief Frees the pages of the entries and the tables
+static void cache_free(struct cache *cache)
+{
+    if (cache->wq)
+        destroy_workqueue(cache->wq);
+
+    if (cache->entries)
+    {
+        for (unsigned long i = 0; i < CACHE_ENTRIES; i++)
+        {
+            if (cache->entries[i].page)
+                __free_page(cache->entries[i].page);
+        }
+    }
+
+    kvfree(cache->job_table);
+    kvfree(cache->entries);
+    kfree(cache);
+}
+
+/// @brief Allocates the cache whole: entries, their pages, jobs and the worker
+/// @details
+/// Expected execution context - dm_ctr, may sleep.
+/// @param dm_ctx Driver context, with the device below already open
+/// @return The cache, or ERR_PTR(-ENOMEM)
+struct cache *cache_create(struct dm_context *dm_ctx)
+{
+    struct cache *cache = kzalloc_obj(*cache, GFP_KERNEL);
+
+    if (!cache)
+        return ERR_PTR(-ENOMEM);
+
+    spin_lock_init(&cache->lock);
+    cache->tree = RB_ROOT;
+    cache->reads = RB_ROOT;
+    cache->sectors = RB_ROOT;
+    INIT_LIST_HEAD(&cache->free);
+    INIT_LIST_HEAD(&cache->dirty);
+    INIT_LIST_HEAD(&cache->failed);
+    INIT_LIST_HEAD(&cache->jobs);
+    bio_list_init(&cache->flushes);
+    bio_list_init(&cache->discards);
+    init_waitqueue_head(&cache->wait);
+    INIT_DELAYED_WORK(&cache->write_back, cache_write_back);
+    cache->dm_ctx = dm_ctx;
+    atomic64_set(&cache->free_waits, 0);
+    atomic64_set(&cache->busy_waits, 0);
+    atomic64_set(&cache->read_waits, 0);
+    atomic64_set(&cache->crowded_flushes, 0);
+    atomic64_set(&cache->barriers, 0);
+    atomic64_set(&cache->nr_discards, 0);
+    atomic64_set(&cache->discarded_chunks, 0);
+
+    cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
+    cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);
+    cache->wq = alloc_ordered_workqueue("dcorr_write_back", WQ_MEM_RECLAIM);
+    if (!cache->entries || !cache->job_table || !cache->wq)
+        goto error;
+
+    for (unsigned long i = 0; i < CACHE_ENTRIES; i++)
+    {
+        struct cache_entry *entry = &cache->entries[i];
+
+        entry->page = alloc_page(GFP_KERNEL);
+        if (!entry->page)
+            goto error;
+        RB_CLEAR_NODE(&entry->node);
+        entry->state = CACHE_FREE;
+        list_add_tail(&entry->list, &cache->free);
+    }
+    cache->nr_free = CACHE_ENTRIES;
+
+    for (unsigned int i = 0; i < CACHE_JOBS; i++)
+        list_add_tail(&cache->job_table[i].list, &cache->jobs);
+
+    return cache;
+
+error:
+    cache_free(cache);
+    return ERR_PTR(-ENOMEM);
+}
+
+/// @brief Frees the cache
+/// @details
+/// Device mapper suspends a device before destroying its active table, so
+/// nothing is in flight and only failed entries can hold data. Their chunks
+/// are lost, and named in the log.
+///
+/// Expected execution context - dm_dtr, may sleep.
+void cache_destroy(struct cache *cache)
+{
+    struct cache_entry *entry;
+
+    cancel_delayed_work_sync(&cache->write_back);
+
+    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !bio_list_empty(&cache->discards) ||
+            !RB_EMPTY_ROOT(&cache->reads) || !RB_EMPTY_ROOT(&cache->sectors));
+    list_for_each_entry(entry, &cache->dirty, list)
+        DM_ERR_LIMIT("chunk %llu is lost: it was never written back\n", (unsigned long long)entry->chunk);
+    list_for_each_entry(entry, &cache->failed, list)
+        DM_ERR_LIMIT("chunk %llu is lost: its write back failed\n", (unsigned long long)entry->chunk);
+    if (cache->nr_dirty || cache->nr_failed)
+        DM_ERR("%lu chunks are lost\n", cache->nr_dirty + cache->nr_failed);
+
+    cache_free(cache);
+}

@@ -58,7 +58,13 @@ dkms.conf
 *.img
 *.bkp
 *.state
-correction-driver/.*
-correction-driver/benchmarks/figures/
-correction-driver/benchmarks/results/
-correction-driver/vdb
+# Files of kbuild at the top, such as .module-common.o and .cache.mk
+/.*
+!/.gitignore
+benchmarks/figures/
+benchmarks/results/
+/vdb
+
+# Python
+__pycache__/
+/tools/dcorrsetup

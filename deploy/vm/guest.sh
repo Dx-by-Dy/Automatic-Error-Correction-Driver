@@ -4,20 +4,21 @@
 #
 # The whole script is read before main runs, so commands below cannot eat the rest of it from stdin.
 
-# Rebuilds and reloads the driver, then creates the corrdm device on /dev/vdb, zeroed at the start.
+# Rebuilds and reloads the driver and dcorrsetup, then creates the dcorr device on /dev/vdb, zeroed at
+# the start and formatted.
 # -d builds the debug version.
 guest_reinit() {
     local device
-    cd "$TREE/correction-driver"
+    cd "$TREE"
 
     # The test devices stay behind when a test run was cut short.
-    for device in corrdm corrdm-test corrdm-test-log corrdm-test-faulty corrdm-test-logdev corrdm-test-lower; do
+    for device in dcorr dcorr-test dcorr-test-log dcorr-test-faulty dcorr-test-logdev dcorr-test-lower; do
         if dmsetup info "$device" >/dev/null 2>&1; then
             dmsetup remove "$device"
         fi
     done
-    if lsmod | grep -q '^correction_driver '; then
-        rmmod correction_driver
+    if lsmod | grep -q '^dm_dcorr '; then
+        rmmod dm_dcorr
     fi
 
     make clean
@@ -26,10 +27,11 @@ guest_reinit() {
     else
         make
     fi
-    insmod correction_driver.ko
+    insmod dm-dcorr.ko
 
     dd if=/dev/zero of=/dev/vdb bs=1G count=1
-    echo "0 $(blockdev --getsz /dev/vdb) corrdm /dev/vdb" | dmsetup create corrdm
+    tools/dcorrsetup format --force /dev/vdb
+    tools/dcorrsetup table /dev/vdb | dmsetup create dcorr
 }
 
 # Runs the tests, passing the arguments to pytest. Exit code 3 means a hang: the kernel is
@@ -38,8 +40,8 @@ guest_reinit() {
 # Runs pytest in the background because a process stuck in the kernel cannot exit,
 # even after a SIGKILL. The tests leave a file when they declare a hang (harness.py).
 guest_test() {
-    local hang_file=/run/corrdm-tests.hung hang_exit_code=3 pid
-    cd "$TREE/correction-driver/tests"
+    local hang_file=/run/dcorr-tests.hung hang_exit_code=3 pid
+    cd "$TREE/tests"
     rm -f "$hang_file"
 
     PYTHONDONTWRITEBYTECODE=1 pytest "$@" &

@@ -7,9 +7,9 @@ debug kernel (KASAN, lockdep, UBSAN, kmemleak) and is reachable over SSH on loca
 ```bash
 deploy/vm.sh create       # once: download the image, create and provision the VM
 deploy/vm.sh start        # start the VM and wait for SSH
-deploy/vm.sh reinit       # sync the working tree, rebuild, reload, recreate the device
+deploy/vm.sh reinit       # sync the working tree, rebuild the driver and dcorrsetup, reload, recreate the device
 deploy/vm.sh test [ARGS]  # reinit, run the tests, ARGS go to pytest: -m "not slow", -k corruption
-deploy/vm.sh check        # compiler warnings at W=1, sparse, checkpatch
+deploy/vm.sh check        # compiler warnings at W=1, sparse, checkpatch; dcorrsetup with -Werror
 deploy/vm.sh ssh [CMD]    # shell in the VM or run CMD there
 deploy/vm.sh status       # the VM, the test disk and the driver
 deploy/vm.sh reset        # power off and start again, for a stuck kernel
@@ -24,7 +24,7 @@ deploy/vm.sh stop
   the kernel console in `serial.log`, the console of the boot before in `serial.prev.log`.
 - The working tree is copied to `~/corrdm` in the VM, including uncommitted changes. Edit on the host, not in
   the VM: the next sync overwrites the copy.
-- The tests are described in [correction-driver/tests/README.md](../correction-driver/tests/README.md).
+- The tests are described in [tests/README.md](../tests/README.md).
 
 ## The test disk
 
@@ -54,7 +54,7 @@ reaches the file. It uses Linux AIO on a real disk and its own threads on tmpfs,
 | `image.sh` | `create`, `provision`, `destroy` |
 | `power.sh` | `start`, `stop`, `reset`, `status`, the test disk |
 | `driver.sh` | `sync`, `reinit`, `test`, `check` |
-| `guest.sh` | Runs as root inside the VM: rebuilds and reloads the driver, runs pytest |
+| `guest.sh` | Runs as root inside the VM: rebuilds and reloads the driver and `dcorrsetup`, formats `/dev/vdb` and creates `dcorr` on it, runs pytest |
 
 `guest_run` sends `guest.sh` over SSH to `bash` in the VM, so the guest needs only the synced tree.
 `guest.sh` refuses to run outside a VM.
@@ -90,7 +90,7 @@ To check that the tests catch a bug, break the copy in the VM and test it withou
 
 ```bash
 deploy/vm.sh sync
-deploy/vm.sh ssh                       # edit ~/corrdm/correction-driver/src/ in the VM
+deploy/vm.sh ssh                       # edit ~/corrdm/src/ in the VM
 deploy/vm.sh test --no-sync -m "not slow"
 deploy/vm.sh sync                      # restore the copy
 ```

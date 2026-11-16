@@ -1,5 +1,5 @@
 #!/bin/bash
-# Development VM for the corrdm driver: the latest Fedora with its debug kernel
+# Development VM for the dm-dcorr driver: the latest Fedora with its debug kernel
 # (KASAN, lockdep, UBSAN, kmemleak), plain QEMU, reachable over SSH on localhost.
 # The driver is only ever loaded inside this VM, never on the host. See deploy/README.md.
 #
@@ -45,7 +45,7 @@ Usage: deploy/vm.sh COMMAND
 
 Environment (defaults in brackets):
   CORRDM_VM_DIR [$HOME/vms/corrdm]  CORRDM_SSH_PORT [2225]  CORRDM_CPUS [6]
-  CORRDM_MEMORY [8G]  CORRDM_ROOT_SIZE [40G]  CORRDM_TEST_TIMEOUT [1800]
+  CORRDM_MEMORY [8G]  CORRDM_ROOT_SIZE [40G]  CORRDM_TEST_TIMEOUT [3600]
   CORRDM_TEST_DISK_DIR [/dev/shm/corrdm]: in RAM; a directory on a real disk to test on it
   CORRDM_TEST_DISK_SIZE [2G]: used when the test disk is created
 USAGE
