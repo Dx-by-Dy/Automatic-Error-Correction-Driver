@@ -33,7 +33,7 @@ where the rest is done.
 | **Data damaged silently**: decay, firmware, transfer, bits flipped by a power fault | 0.86% of nearline and 0.065% of enterprise HDDs in 41 months, often in consecutive blocks | CRC per 512-byte sector | As above | Detected | Correction |
 | **A write cut short by a crash**, torn at 512 bytes on some SSDs | 3 of 15 SSDs under power faults | Two copies of the metadata, the leading one durable before the data | Each sector reads its old or its new data | Done, except a crash together with a lost sector of the other copy | |
 | **A range reads back as zeros**: discarded by mistake, the mapping of an FTL lost, never written | No field data, only the mechanisms | A nonzero seed; the bitmap of written chunks says the chunk holds data | A read error for a chunk that was written; zeros, without a read, for one that was not | Done | |
-| **A lost write**: acknowledged, even flushed, but not on the medium | 0.04% of nearline and 0.007% of enterprise HDDs in 17 months; 8 of 15 SSDs and 1 of 2 HDDs lost or reordered completed writes at a power fault | Data and metadata are separate writes: once the flush after a write back has passed, both copies hold the new CRC | A read error | Detected after that flush. Not detected before it, nor when both copies of the metadata are lost with the data | Format: a test |
+| **A lost write**: acknowledged, even flushed, but not on the medium | 0.04% of nearline and 0.007% of enterprise HDDs in 17 months; 8 of 15 SSDs and 1 of 2 HDDs lost or reordered completed writes at a power fault | Data and metadata are separate writes: once the flush after a write back has passed, both copies hold the new CRC | A read error | Detected after that flush, at once for a first write. Not detected before it, nor when both copies of the metadata are lost with the data | Correction: a scrub against the parity may find the rest |
 | **A misdirected write**: the data lands on another sector | Counted with lost writes; not seen under power faults | The CRC of the sector hit; its own place as a lost write; the logical sector and a salt per device in the seed | A read error | Detected unless the data equals that of the sector hit | |
 | **A write fails** | Rare: the drive remaps a bad place first, so an error that reaches the host means its spare is gone or the region is in a bad way | An error of the lower device | The chunk stays in RAM and is retried, every flush fails meanwhile, new writes are refused when such chunks fill the cache, reads go on. No reserved area | Done | |
 | **The drive is near its end** | After the first error 14 to 39 times more likely to fail within 60 days; but over half of failed HDDs gave no warning | Every error and mismatch | Counters in `dmsetup status` and a device mapper event, so that the user moves the data off; **Proposed** | Only a line in the kernel log | Device Mapper integration |
@@ -380,9 +380,10 @@ it counts.
   leading copy; that order is checked in the log itself: the leading write is FUA and comes first. A second
   crash is replayed on top of the state of the first, with a log started from it.
 - Failures of the lower device are tested with `dm-dust` (reads of chosen sectors fail, and writes to them a
-  chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes dropped silently
-  (`dm-flakey` with `drop_writes`) are to be tested in the format stage: a lost write is detected once the flush
-  after its write back has passed, and passes as the old contents before it.
+  chosen number of times) and `dm-flakey` (every write fails, reads go through). Writes dropped silently are
+  tested with `dm-flakey` and `drop_writes` over chosen sectors, `linear` elsewhere: a lost write is detected
+  once the flush after its write back has passed, and passes as the old contents before it; a lost copy of the
+  metadata or of a block of the bitmap is covered by the other.
 
 **Decided** on 2026-11-15, an idea of the user, replacing the copy of the superblock in the middle: **groups.**
 

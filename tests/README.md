@@ -1,6 +1,6 @@
 # Driver tests
 
-345 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+352 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 345 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 304 tests
+deploy/vm.sh test                                     # all 352 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 311 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -37,7 +37,8 @@ formats through its top layer, so `test_crash.py` formats through `dm-log-writes
 superblock with its salt. Two files build stacks of their own, with a
 third layer between the two: `test_crash.py` puts `dm-log-writes` there (`dcorr-test-log`, its log on
 `dcorr-test-logdev` at 256 MiB of `/dev/vdb`), `test_lower_errors.py` puts `dm-dust` or `dm-flakey` there
-(`dcorr-test-faulty`).
+(`dcorr-test-faulty`), and `test_lost_writes.py` a table of `linear` with `dm-flakey` dropping writes over
+chosen sectors, under the same name.
 
 **I/O.** `BlockDevice` in `harness.py` reads and writes whole sectors with `O_DIRECT`. The page cache
 would hide reads from the driver, and a buffered write to the lower device writes a whole 4 KiB block
@@ -251,6 +252,20 @@ Five chunks written and flushed; the discards start in the chunk before the midd
 | `test_a_second_write_after_a_flushed_discard_needs_no_barrier` | 1 | Once a flush has put the cleared bit on the device, a write back of the chunk takes no barrier |
 | `test_blkdiscard_of_the_whole_device_is_one_discard` | 1 | `blkdiscard` of the device: one discard reaches the target, every chunk is discarded, the chunks read as zeros |
 | `test_fstrim_on_ext4_keeps_the_files` | 1 | `mkfs.ext4` discards the device; two files of 4 MiB, one deleted, `fstrim` discards at least its chunks, `e2fsck -fn` is clean and the other file intact after a remount |
+
+### `test_lost_writes.py`: writes acknowledged and lost (7 tests)
+
+Three chunks written and flushed. The faulty layer is loaded after a write from above and before its write
+back by age, dropping writes to the data slot of the chunk, a copy of its metadata sector or a copy of the
+block of the bitmap, then `linear` again; each test checks on the lower device that the write was dropped.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_lost_data_of_a_rewrite_reads_old_until_the_flush_then_fails` | 2 | A whole chunk and one sector: before the flush the old data reads without an error; after it `EIO`, also after the target is created again; the other sectors still read |
+| `test_lost_data_of_a_first_write_fails_at_once` | 1 | A chunk never written: `EIO` before the flush, and after it and a recreation |
+| `test_a_lost_leading_copy_is_covered_by_the_trailing_one` | 1 | The leading metadata sector dropped: the new data reads before and after the flush and a recreation, the copies differ on the device; the next write back reads the chunk to settle it, with no mismatch, and the copies are equal again |
+| `test_data_lost_with_both_copies_of_its_metadata_passes_as_old` | 1 | The blind spot, pinned: the data and both metadata sectors dropped through the flush: the old data reads without an error. Its control is the rewrite test, which differs only in the trailing copy |
+| `test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other` | 2 | A first write whose leading or trailing copy of the block is dropped: that copy keeps its old generation, and the chunk reads after the target is created again |
 
 ### `test_lower_errors.py`: the lower device fails (17 tests)
 
@@ -583,6 +598,14 @@ discards. 4 of 5 caught:
 | The sync never records the clears it made durable | Failed, 2 | `test_a_second_write_after_a_flushed_discard_needs_no_barrier`, the crash test |
 | A discard into a read only range is not refused | Failed | `test_a_discard_touching_a_read_only_block_fails_whole` |
 | The partial chunk at the head of a discard is discarded too | Passed | Not reachable from userspace, see "What is not tested yet" |
+
+Lost writes, with `test_lost_writes.py`; all 3 caught:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The trailing copy of the metadata is never written | Failed, 3 | Both cases of the rewrite, which then reads old after the flush too, and the lost leading copy |
+| The seed is zero | Failed | `test_lost_data_of_a_first_write_fails_at_once`: zeros below with zero metadata pass |
+| The second copy of a block of the bitmap is never written | Failed | `[leading]` of the bitmap test: the bit is lost; `[trailing]` passes, as the trailing copy is the second one |
 
 The seed of the CRC of data, with `test_corruption.py`; all 3 caught:
 

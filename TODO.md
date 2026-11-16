@@ -59,10 +59,12 @@ in a run, **From reading** means it was only found in the code.
   back before it are forgotten without their trailing copy, so their copies differ, and the read before their
   next write back may see data that is not durable. A device that fails flushes gives no durability anyway.
   Fix, if it matters: keep them pinned and retry, with a way out when the areas run out.
-- **A lost write passes as the old contents until the flush after its write back.** By decision of the threat
-  model: until then the trailing copy holds the old CRC, and the read accepts it; a write lost together with both
-  copies of its metadata passes for ever. Not tested: dropped writes need a test with `dm-flakey` and
-  `drop_writes`, detected after that flush and passing before it.
+- **A lost write passes as the old contents until the flush after its write back.** Confirmed by
+  `test_lost_writes.py`, by decision of the threat model: until then the trailing copy holds the old CRC, and the
+  read accepts it; a write lost together with both copies of its metadata passes for ever, which a test pins.
+  Fix, for the correction stage: parity computed from the data in RAM, not from what is read back, would make
+  such a stripe disagree, and P+Q can tell which member is wrong, so a scrub could find the chunk and rebuild
+  it.
 - **No write zeroes.** By decision on 2026-11-16: device mapper offers it only through `iterate_devices` with
   every device below capable, which the target does not have, so `blkdev_issue_zeroout` writes zero pages
   through the cache. Correct, only slower. Fix: with `iterate_devices`, under Device Mapper integration, clear
@@ -184,19 +186,15 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Integrity and format.** A test of lost writes. The threat model was settled, the superblock written, the
-   device laid out in groups with room for parity and the bitmap of written chunks read and written on
-   2026-11-15; no reserved area. The seed of the CRC of data, with the logical sector and the salt, and discard
-   through the bitmap on 2026-11-16; write zeroes moved to Device Mapper integration.
-3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
+2. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
-4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits with `iterate_devices` and write zeroes, the
+3. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits with `iterate_devices` and write zeroes, the
    README.
-5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
+4. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
    the cache and for the cache, with the memory a load takes through the driver against the lower device:
    on the debug kernel KASAN and kmemleak hold freed bios back, 100 to 535 MiB under `fio` with 1 MiB
    requests, as device mapper makes a clone per 4 KiB.
-6. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
+5. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
    implement recovery.
-7. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
+6. **Optimization.** Proportions of metadata, preallocation, Crypto API, tuning the limit on parts in
    flight, guided by the baseline.
