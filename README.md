@@ -29,7 +29,9 @@ The threat model, the guarantees to the layer above, the on-disk format and the 
 The lower device is a sequence of groups of one size, 1 GiB by default, each with a header of 1 MiB written by
 `dcorrsetup format`: a copy of the superblock and the bitmaps of written chunks. The virtual device is divided
 into chunks of 4 KiB, 8 sectors, and the slots of the chunks on the lower device into regions of 1024, 4 MiB,
-as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per sector, 64 bytes; a
+as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per sector, 64 bytes,
+each over the salt of the device, the logical sector and its data, so that data in another place or from another
+device, or zeros with zeroed metadata, do not pass; a
 metadata sector holds the entries of 8 neighbouring chunks. The metadata of a region is kept in two copies: the
 leading one next to its slots, the trailing one in the next region of the group.
 

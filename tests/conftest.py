@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from harness import BlockDevice, capacity, declare_hang, format_device, run
+from harness import BlockDevice, capacity, declare_hang, format_device, layout, run
 
 TEST_DISK = "/dev/vdb"
 REINIT_DEVICE = "dcorr"
@@ -229,6 +229,10 @@ class Stack:
     @property
     def sectors(self):
         return capacity(self.lower_sectors)
+
+    @property
+    def lower_layout(self):
+        return layout(self.lower_sectors)
 
     def status(self):
         return device_status()

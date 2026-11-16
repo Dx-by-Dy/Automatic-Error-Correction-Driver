@@ -6,19 +6,29 @@ CRC from either, so damage to metadata is detected only when it is in both.
 """
 
 import errno
+import struct
 
 import pytest
 
+from conftest import UPPER_NAME, dmsetup_remove
 from harness import (
     CRC_SIZE,
     DATA_SECTORS,
     METADATA_ENTRY_SIZE,
+    REGION_SECTORS,
+    SALT_OFFSET,
+    SALT_SIZE,
     SECTOR_SIZE,
+    BlockDevice,
+    data_crc,
+    format_device,
     metadata_offset,
     metadata_sector,
     metadata_sectors,
     pattern,
     physical_sector,
+    region_sector,
+    run,
 )
 
 # A chunk with written neighbours on both sides, all three in one metadata sector.
@@ -211,7 +221,28 @@ def test_corruption_is_detected_after_recreating_the_device(stack, written):
     assert_read_fails(stack.upper, FIRST)
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: A zeroed chunk passes the check")
+def salt(stack):
+    """The salt of the device, from the superblock of group 0."""
+    return stack.lower.read(0)[SALT_OFFSET : SALT_OFFSET + SALT_SIZE]
+
+
+def entry(stack, sector, logical):
+    """The CRCs of the chunk of a logical sector in a copy of its metadata sector on the lower device."""
+    offset = metadata_offset(logical)
+    return list(struct.unpack("<8Q", stack.lower.read(sector)[offset : offset + METADATA_ENTRY_SIZE]))
+
+
+def test_the_crcs_on_the_device_are_those_of_the_model(stack, written):
+    """Each CRC runs over the salt, the logical sector as le64 and the data, as data_crc in harness.py."""
+    for chunk_start in (FIRST - DATA_SECTORS, FIRST, FIRST + DATA_SECTORS):
+        expected = [
+            data_crc(salt(stack), logical, sector_of(written, logical))
+            for logical in range(chunk_start, chunk_start + DATA_SECTORS)
+        ]
+        for sector in copies(stack, chunk_start):
+            assert entry(stack, sector, chunk_start) == expected, f"chunk at {chunk_start}, lower sector {sector}"
+
+
 def test_zeroed_chunk_is_detected(stack, written):
     stack.lower.write(physical_sector(FIRST, stack.lower_sectors), bytes(DATA_SECTORS * SECTOR_SIZE))
     for sector in copies(stack, FIRST):
@@ -220,7 +251,6 @@ def test_zeroed_chunk_is_detected(stack, written):
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: The CRC does not depend on the position")
 def test_chunk_copied_elsewhere_is_detected(stack, written):
     target = FIRST + DATA_SECTORS
     stack.lower.write(physical_sector(target, stack.lower_sectors), stack.lower.read(physical_sector(FIRST, stack.lower_sectors), DATA_SECTORS))
@@ -230,3 +260,78 @@ def test_chunk_copied_elsewhere_is_detected(stack, written):
         stack.lower.patch(sector, metadata_offset(target), entry)
     stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST + DATA_SECTORS, DATA_SECTORS)
+
+
+def test_sectors_swapped_inside_a_chunk_with_their_crcs_are_detected(stack, written):
+    """The seed takes the logical sector, not only the chunk."""
+    first, second = (physical_sector(FIRST + i, stack.lower_sectors) for i in (0, 1))
+    data = [stack.lower.read(first), stack.lower.read(second)]
+    stack.lower.write(first, data[1])
+    stack.lower.write(second, data[0])
+    for sector in copies(stack, FIRST):
+        crcs = entry(stack, sector, FIRST)
+        crcs[0], crcs[1] = crcs[1], crcs[0]
+        stack.lower.patch(sector, metadata_offset(FIRST), struct.pack("<8Q", *crcs))
+    stack.drop_metadata()
+    assert_read_fails(stack.upper, FIRST)
+    assert_read_fails(stack.upper, FIRST + 1)
+    assert stack.upper.read(FIRST + 2) == sector_of(written, FIRST + 2)
+
+
+def test_a_zeroed_region_with_its_chunks_written_is_detected(stack):
+    """A region lost or trimmed whole, its leading metadata with it, while the bitmap says its chunks were written.
+
+    The trailing copy of its metadata, in the next region, is left; the zeros match neither copy."""
+    start = region_sector(1, stack.lower_sectors)
+    data = pattern("region", 3 * DATA_SECTORS)
+    stack.upper.write(start, data)
+    stack.upper.flush_settled()
+    region = stack.lower_layout.region_start(1)
+    stack.lower.write(region, bytes(REGION_SECTORS * SECTOR_SIZE))
+    stack.drop_metadata()
+    for chunk_start in range(start, start + 3 * DATA_SECTORS, DATA_SECTORS):
+        assert_read_fails(stack.upper, chunk_start, DATA_SECTORS)
+
+
+def test_a_region_shifted_whole_with_its_metadata_is_detected(stack):
+    """As a table off by a whole region, or a misdirected write of a region: data and leading metadata
+    of region 0 over region 1, where the same chunk was written with other data."""
+    index = CHUNK
+    starts = [region_sector(region, stack.lower_sectors) + index * DATA_SECTORS for region in (0, 1)]
+    for start in starts:
+        stack.upper.write(start, pattern(start, DATA_SECTORS))
+    stack.upper.flush_settled()
+    device = stack.lower_layout
+    assert device.trail_region(1) != 0, "the trailing copy of region 1 must stay out of the shift"
+    stack.lower.write(device.region_start(1), stack.lower.read(device.region_start(0), REGION_SECTORS))
+    stack.drop_metadata()
+    assert_read_fails(stack.upper, starts[1], DATA_SECTORS)
+
+
+def reformat(stack):
+    """Formats the lower device again, a new salt and UUID, and puts the driver back on it."""
+    stack.upper.close()
+    dmsetup_remove(UPPER_NAME)
+    format_device(stack.lower_path, force=True)
+    run("dmsetup", "create", UPPER_NAME, stdin=stack.table)
+    stack.upper = BlockDevice(stack.upper_path)
+
+
+def test_a_chunk_from_another_device_is_detected(stack):
+    """The same data in the same place with its CRCs, from a device of another salt: as a disk of an array
+    put in the place of another one."""
+    data = pattern("same", DATA_SECTORS)
+    stack.upper.write(FIRST, data)
+    stack.upper.flush_settled()
+    old_salt = salt(stack)
+    old = [stack.lower.read(sector) for sector in copies(stack, FIRST)]
+
+    reformat(stack)
+    assert salt(stack) != old_salt
+    stack.upper.write(FIRST, data)
+    stack.upper.flush_settled()
+    assert stack.upper.read(FIRST, DATA_SECTORS) == data, "the positive control: the new device reads"
+    for sector, contents in zip(copies(stack, FIRST), old):
+        stack.lower.write(sector, contents)
+    stack.drop_metadata()
+    assert_read_fails(stack.upper, FIRST, DATA_SECTORS)

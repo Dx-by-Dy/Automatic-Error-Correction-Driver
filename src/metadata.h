@@ -196,6 +196,9 @@ struct metadata_cache
     /// @brief Layout of the device, owned by the context of the target
     const struct dcorr_layout *layout;
 
+    /// @brief Where the CRC of every data sector starts, see data_crc.h
+    u64 salt_crc;
+
     /// @brief How many areas were read from the device below
     atomic64_t loads;
 
@@ -212,7 +215,8 @@ struct metadata_cache
     atomic64_t settle_mismatches;
 };
 
-struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout);
+struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout,
+                                             u64 salt_crc);
 void metadata_cache_destroy(struct metadata_cache *cache);
 struct metadata_area *metadata_get(struct metadata_cache *cache, sector_t sector);
 void metadata_put(struct metadata_cache *cache, struct metadata_area *area);

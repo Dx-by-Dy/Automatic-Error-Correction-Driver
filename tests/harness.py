@@ -246,6 +246,11 @@ SALT_OFFSET = 48
 SALT_SIZE = 16
 
 
+def data_crc(salt, logical, data):
+    """The CRC of a data sector: over the salt of the device, the logical sector as le64, then the data."""
+    return crc64_be(crc64_be(0, salt), struct.pack("<Q", logical) + bytes(data))
+
+
 def bitmap_block_crc(block, salt):
     """The CRC of a block of the bitmap: over the salt of the device, then over the block with crc zeroed."""
     return crc64_be(crc64_be(0, salt), bytes(8) + bytes(block[8:]))

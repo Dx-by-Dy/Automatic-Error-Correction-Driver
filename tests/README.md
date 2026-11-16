@@ -1,6 +1,6 @@
 # Driver tests
 
-326 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+331 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 326 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 285 tests
+deploy/vm.sh test                                     # all 331 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 290 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -55,7 +55,9 @@ entries to a metadata sector. The positions depend on the size of the lower devi
 group 16 MiB unless given. A change of layout has to be made there as well.
 `test_layout_of_the_chunks_at_the_borders` spells the positions out apart from both, and
 `test_dcorrsetup_gives_the_layout_of_the_tests` compares `dcorrsetup dump` with `harness.py`. `crc64_be` there is
-the CRC of the kernel, so that the tests can build a superblock and a block of the bitmap by hand.
+the CRC of the kernel, so that the tests can build a superblock and a block of the bitmap by hand, and `data_crc`
+the CRC of a data sector, over the salt, the logical sector and the data, which
+`test_the_crcs_on_the_device_are_those_of_the_model` compares with what the driver writes.
 
 **Metadata in RAM.** The driver keeps the metadata of the regions it used in RAM until a suspend, so a test that
 changes metadata on the lower device calls `drop_metadata()` from `conftest.py` afterwards, which suspends and
@@ -143,7 +145,7 @@ metadata, happen every time.
 | `test_the_write_backs_of_chunks_sharing_a_metadata_sector_wait_for_its_metadata` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
 | `test_a_read_of_a_clean_sector_waits_for_the_write_back` | 1 | Metadata delayed: a read of sector 5 while sector 1 is written back waits for it, counted in `read_waits`, and reads the old data |
 
-### `test_corruption.py`: damage is detected, and only where it is (39 tests)
+### `test_corruption.py`: damage is detected, and only where it is (44 tests)
 
 Three chunks are written, whose entries share one metadata sector, and the damage is done to the middle one.
 A read accepts a CRC from either copy of the metadata, so damage to metadata is done to both, but where a test
@@ -166,8 +168,16 @@ says one copy.
 | `test_rewriting_a_corrupted_sector_clears_the_error` | 1 | A write of that sector gives it a new, correct CRC |
 | `test_write_to_a_neighbour_does_not_hide_corruption` | 1 | A partial write keeps the old CRC of the damaged sector |
 | `test_corruption_is_detected_after_recreating_the_device` | 1 | Detection does not depend on driver state |
-| `test_zeroed_chunk_is_detected` | 1 | **xfail**: A zeroed chunk passes the check |
-| `test_chunk_copied_elsewhere_is_detected` | 1 | **xfail**: The CRC does not depend on the position |
+| `test_the_crcs_on_the_device_are_those_of_the_model` | 1 | Both copies of the entries of the three chunks hold `data_crc` of `harness.py`: over the salt from the superblock, the logical sector as `le64`, the data |
+| `test_zeroed_chunk_is_detected` | 1 | The chunk and its entry zeroed in both copies, its bit set: a read error, not zeros |
+| `test_chunk_copied_elsewhere_is_detected` | 1 | The chunk with its entry copied over the next chunk: the copy fails there |
+| `test_sectors_swapped_inside_a_chunk_with_their_crcs_are_detected` | 1 | Sectors 0 and 1 swapped with their CRCs in both copies: both fail, sector 2 reads |
+| `test_a_zeroed_region_with_its_chunks_written_is_detected` | 1 | Region 1 zeroed whole, its leading copy with it, its trailing copy in region 2 left: its three written chunks fail |
+| `test_a_region_shifted_whole_with_its_metadata_is_detected` | 1 | Region 0 copied whole over region 1, where the same chunk was written with other data, as a table off by a region: the chunk fails |
+| `test_a_chunk_from_another_device_is_detected` | 1 | The same data written in the same place on the device formatted again, then the metadata sectors of the old format put back: the chunk fails. Before that, the new device reads, as a control |
+
+All but the model test passed before the seed: zeros with zero metadata and a CRC that does not depend on the
+place or the device. Each of the 7 failed on the driver of step 2, on its check of detection.
 
 ### `test_durability.py`: flushes and FUA writes reach the lower device (7 tests)
 
@@ -536,6 +546,14 @@ The bitmap of written chunks, with `test_bitmap.py` and
 | The bitmap read in the constructor, not on the first resume | Failed, 3 | Both cases of `test_a_reload_keeps_the_bits_the_old_table_sets`, `test_table_reload_under_load`; the first full run found it there |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
+
+The seed of the CRC of data, with `test_corruption.py`; all 3 caught:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The seed is the CRC of the salt only, without the logical sector | Failed, 4 | The model test, `test_chunk_copied_elsewhere_is_detected`, the sectors swapped, the region shifted |
+| The seed is the logical sector only, without the salt | Failed, 2 | The model test, `test_a_chunk_from_another_device_is_detected` |
+| The settle before a write back computes the CRC with a zero seed | Failed, 2 | Both cases of `test_a_sector_whose_copies_differ_is_read_before_it_is_written`: the settle counts mismatches |
 
 The cache, with `test_cache.py` and the tests changed for it:
 

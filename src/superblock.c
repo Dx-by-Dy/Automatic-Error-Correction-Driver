@@ -4,6 +4,7 @@
 #include <linux/stddef.h>
 #include <linux/string.h>
 
+#include "data_crc.h"
 #include "superblock.h"
 #include "macros.h"
 
@@ -179,6 +180,7 @@ int superblock_read(struct block_device *bdev, struct superblock_info *info, cha
     info->layout = layout[chosen];
     memcpy(info->uuid, sb[chosen]->uuid, sizeof(info->uuid));
     memcpy(info->salt, sb[chosen]->salt, sizeof(info->salt));
+    info->salt_crc = data_crc_salt(info->salt, sizeof(info->salt));
     info->group = chosen;
     info->generation = le64_to_cpu(sb[chosen]->generation);
     DM_INFO("superblock of group %u, generation %llu, groups of %llu sectors\n", chosen,

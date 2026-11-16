@@ -12,6 +12,8 @@ struct superblock_info
     struct dcorr_layout layout;
     u8 uuid[16];
     u8 salt[16];
+    /// @brief The CRC of the salt, where the CRC of every data sector starts, see data_crc.h
+    u64 salt_crc;
     /// @brief The group whose copy it was taken from, 0 or 1
     unsigned int group;
     u64 generation;

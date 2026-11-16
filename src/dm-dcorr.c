@@ -182,7 +182,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto error_metadata;
     }
 
-    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, &dm_ctx->sb.layout);
+    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, &dm_ctx->sb.layout, dm_ctx->sb.salt_crc);
     if (IS_ERR(dm_ctx->metadata))
     {
         ti->error = "metadata cache alloc failed";

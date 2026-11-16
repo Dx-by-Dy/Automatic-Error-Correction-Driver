@@ -1,6 +1,7 @@
 #include "trn_mr_rq.h"
 #include "trn_p_rq.h"
 #include "macros.h"
+#include "data_crc.h"
 
 /// @brief Initializes struct trn_mr_rq
 /// @details
@@ -34,8 +35,8 @@ blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
 /// Runs as work in the transform_wq after successful completion
 /// of the bio reading the data, completed via trn_p_rq_end_io.
 ///
-/// Computes CRC64 for each data sector of bio,
-/// comparing the result with both copies of the entry of the chunk: a sector
+/// Computes CRC64 for each data sector of bio, from the seed of its logical
+/// sector, see data_crc.h, comparing the result with both copies of the entry of the chunk: a sector
 /// passes if it matches either. On CRC mismatch, sets the status of the part
 /// and outputs error to the log.
 ///
@@ -50,8 +51,10 @@ void check_crc(struct trn_mr_rq *meta)
 
     const struct chunk_metadata *lead = &meta->md[METADATA_LEAD];
     const struct chunk_metadata *trail = &meta->md[METADATA_TRAIL];
+    u64 salt_crc = part->dm_ctx->sb.salt_crc;
+    sector_t sector = part->sector;
     unsigned int sector_idx = meta->first_sector;
-    u64 current_crc = 0;
+    u64 current_crc = data_crc_seed(salt_crc, sector);
     unsigned int in_sector_pos = 0;
     bool crc_error = false;
     struct bvec_iter iter = meta->saved_iter;
@@ -89,7 +92,7 @@ void check_crc(struct trn_mr_rq *meta)
                     goto out;
                 }
                 sector_idx++;
-                current_crc = 0;
+                current_crc = data_crc_seed(salt_crc, ++sector);
                 in_sector_pos = 0;
             }
         }

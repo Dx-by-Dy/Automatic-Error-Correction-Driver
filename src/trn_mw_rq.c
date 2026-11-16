@@ -1,23 +1,27 @@
 #include "trn_mw_rq.h"
 #include "trn_p_rq.h"
 #include "macros.h"
+#include "data_crc.h"
 
 /// @brief Calculates CRC64 for each bio sector and keeps the results in meta->crc
 /// @details
 /// Traverses all bio segments byte-by-byte, accumulating CRC64 (big-endian)
-/// for each data sector. Upon completion of each sector, keeps the final CRC
-/// at the index of the sector in the chunk, starting with meta->first_sector.
+/// for each data sector, each from the seed of its logical sector, see
+/// data_crc.h. Upon completion of each sector, keeps the final CRC at the index
+/// of the sector in the chunk, starting with meta->first_sector.
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure for write
-/// @param bio  Bio with data for CRC calculation
+/// @param bio  Bio with data for CRC calculation, not yet redirected to the device below
 static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 {
     DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
              meta, meta->first_sector, meta->nr_sectors);
 
+    u64 salt_crc = meta->part->dm_ctx->sb.salt_crc;
+    sector_t sector = meta->part->sector;
     unsigned int sector_idx = meta->first_sector;
-    u64 current_crc = 0;
+    u64 current_crc = data_crc_seed(salt_crc, sector);
     unsigned int in_sector_pos = 0;
 
     struct bio_vec bvec;
@@ -45,7 +49,7 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
                          current_crc);
 
                 meta->crc[sector_idx++] = cpu_to_le64(current_crc);
-                current_crc = 0;
+                current_crc = data_crc_seed(salt_crc, ++sector);
                 in_sector_pos = 0;
             }
         }

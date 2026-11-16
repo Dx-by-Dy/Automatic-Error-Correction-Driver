@@ -51,6 +51,11 @@
 #define DCORR_CHUNK_SECTORS 8
 
 /// @brief Bytes of metadata of one chunk: a CRC of each of its sectors
+/// @details
+/// Each CRC is crc64_be, as an le64, over the salt of the superblock, the
+/// logical sector as le64, then the 512 bytes of the sector, so that it depends
+/// on the place of the sector and on the device. A slot of a parity column has
+/// no logical sector; the correction stage defines its CRC.
 #define DCORR_METADATA_ENTRY_BYTES 64
 
 /// @brief Chunks whose metadata shares one metadata sector

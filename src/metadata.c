@@ -2,6 +2,7 @@
 #include <linux/crc64.h>
 #include <linux/slab.h>
 
+#include "data_crc.h"
 #include "metadata.h"
 #include "macros.h"
 
@@ -650,7 +651,8 @@ void metadata_settle(struct metadata_cache *cache, struct metadata_area *area, s
         if (!(differ & BIT(i)))
             continue;
 
-        crc = cpu_to_le64(crc64_be(0, data + i * SECTOR_SIZE, SECTOR_SIZE));
+        crc = cpu_to_le64(crc64_be(data_crc_seed(cache->salt_crc, sector - sector % DATA_SIZE_SECTORS + i),
+                                   data + i * SECTOR_SIZE, SECTOR_SIZE));
         if (crc == md[METADATA_LEAD].crc[i])
             to_trail |= BIT(i);
         else if (crc != md[METADATA_TRAIL].crc[i])
@@ -765,8 +767,10 @@ static void metadata_cache_free(struct metadata_cache *cache)
 /// Expected execution context - dm_ctr, may sleep.
 /// @param bdev    The device below
 /// @param layout  Layout of the device, which must outlive the cache
+/// @param salt_crc Where the CRC of every data sector starts, see data_crc.h
 /// @return The cache, or ERR_PTR(-ENOMEM)
-struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout)
+struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout,
+                                             u64 salt_crc)
 {
     struct metadata_cache *cache = kzalloc_obj(*cache, GFP_KERNEL);
 
@@ -781,6 +785,7 @@ struct metadata_cache *metadata_cache_create(struct block_device *bdev, const st
     init_waitqueue_head(&cache->wait);
     cache->bdev = bdev;
     cache->layout = layout;
+    cache->salt_crc = salt_crc;
     atomic64_set(&cache->loads, 0);
     atomic64_set(&cache->waits, 0);
     atomic64_set(&cache->trail_errors, 0);

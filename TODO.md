@@ -23,11 +23,6 @@ in a run, **From reading** means it was only found in the code.
 
 ## Integrity and durability
 
-- **A zeroed chunk passes the check.** Confirmed: with a chunk and its metadata sector zeroed
-  on the lower device, the read succeeds and returns zeros. CRC64 of zeros with a zero seed is
-  0, the same as empty metadata. A lost or trimmed region is never noticed. The bitmap of written chunks
-  tells such a chunk from one never written since 2026-11-15, but its zeros still pass the CRC. Fix,
-  decided on 2026-11-15: a nonzero seed, step 3 of the format stage.
 - **A damaged copy of the superblock stays damaged.** By decision, for now: the driver never writes a
   superblock; it warns about a copy that is not valid each time the device is created, and counts those of
   groups 2 and on in `dmsetup status`. Fix: write it from another copy, with a command of `dcorrsetup`.
@@ -54,10 +49,9 @@ in a run, **From reading** means it was only found in the code.
 - **The unused end of every group is lost.** By decision on 2026-11-15: a group holds whole regions only, so
   1 to 3.6 MiB of a group of a size other than 1 GiB is not used, and so is a tail of the device shorter than
   a header and two regions. Fix, if it matters: short regions, in the optimization stage.
-- **The CRC does not depend on the position.** Confirmed: a chunk copied with its metadata over
-  another chunk reads back without an error, as the sector number is not part of the CRC. A
-  misdirected write would pass the same way, and so would a table whose offset is wrong by a whole number of
-  regions. Fix, decided on 2026-11-15: mix the logical sector and a random salt per device into the seed.
+- **A parity slot has no CRC defined.** By decision on 2026-11-16: the CRC of a data sector takes its logical
+  sector, which a slot of a parity column does not have. Fix: define it in the correction stage, from the
+  physical slot or the stripe.
 - **A crash together with a lost sector of the other copy fails the chunks that were in flight.** By
   decision: between the write back of a chunk and the flush after it, only the trailing copy has the CRC of the
   old data and only the leading one that of the new. Fix, if the threat model asks for it: a third copy, or ECC.
@@ -187,9 +181,10 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Integrity and format.** A nonzero seed with the logical sector and a salt, discard and write zeroes, a test
-   of lost writes. The threat model was settled, the superblock written, the device laid out in groups with room
-   for parity and the bitmap of written chunks read and written on 2026-11-15; no reserved area.
+2. **Integrity and format.** Discard and write zeroes, a test of lost writes. The threat model was settled, the
+   superblock written, the device laid out in groups with room for parity and the bitmap of written chunks read
+   and written on 2026-11-15; no reserved area. The seed of the CRC of data, with the logical sector and the
+   salt, on 2026-11-16.
 3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
 4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits, the
