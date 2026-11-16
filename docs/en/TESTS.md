@@ -1,7 +1,8 @@
 # Driver tests
 
 352 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
-as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
+as they overwrite `/dev/vdb`. The VM is described in [DEPLOY.md](DEPLOY.md), why the tests work this way in
+[D1](DECISIONS.md#d1-tests-run-in-a-vm-crashes-are-replayed-from-a-log).
 
 Keep this file up to date when adding or removing tests.
 
@@ -393,7 +394,7 @@ the kernel log. The device is two groups of 16 MiB unless said otherwise.
 ### `test_memory.py`: I/O when memory is short (5 tests)
 
 Failures come from the kernel's fault injection (`failslab`), limited to one thread and to allocations whose
-stack passes through given code. How the driver uses memory is in "Memory" in `README.md`. The two tests of the
+stack passes through given code. How the driver uses memory is in [Memory](ARCHITECTURE.md#memory). The two tests of the
 pool of metadata pages were removed with the pool: the I/O path takes no page any more.
 
 | Test | Cases | Checks |
@@ -433,7 +434,7 @@ that window would go unseen.
 ## Do the tests catch bugs?
 
 Checked by breaking the driver on purpose, in the copy inside the VM, and running the fast tests with
-`deploy/vm.sh test --no-sync`, see [deploy/README.md](../deploy/README.md):
+`deploy/vm.sh test --no-sync`, see [DEPLOY.md](DEPLOY.md):
 
 | Change | Failed | Where |
 | ------ | ------ | ----- |

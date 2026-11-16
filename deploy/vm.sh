@@ -1,7 +1,7 @@
 #!/bin/bash
 # Development VM for the dm-dcorr driver: the latest Fedora with its debug kernel
 # (KASAN, lockdep, UBSAN, kmemleak), plain QEMU, reachable over SSH on localhost.
-# The driver is only ever loaded inside this VM, never on the host. See deploy/README.md.
+# The driver is only ever loaded inside this VM, never on the host. See docs/en/DEPLOY.md.
 #
 # The commands live in deploy/vm/: config.sh (settings), connection.sh (SSH), image.sh (create,
 # provision, destroy), power.sh (start, stop, test disk), driver.sh (sync, reinit, test, check),
