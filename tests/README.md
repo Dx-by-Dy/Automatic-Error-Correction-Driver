@@ -1,6 +1,6 @@
 # Driver tests
 
-331 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+345 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [deploy/README.md](../deploy/README.md).
 
 Keep this file up to date when adding or removing tests.
@@ -8,8 +8,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 331 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 290 tests
+deploy/vm.sh test                                     # all 345 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 304 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -192,7 +192,7 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
 | `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: the journal commit is seen, as a FUA write on the lower device alone and as a flush through the driver, whose cache turns FUA into a write back and a flush; and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
-### `test_crash.py`: the device after a crash (13 tests)
+### `test_crash.py`: the device after a crash (15 tests)
 
 `dm-log-writes` logs every write that reaches the disk below the driver, with its flushes and FUA, in
 the order the data reaches the disk itself. `logwrites.py` reads the log and replays a prefix of it to the
@@ -212,9 +212,11 @@ is started again from the state of a replay, and the entries of both run in a ro
 | `test_a_second_crash_after_one_between_the_copies` | 2 | A crash after the leading copy (old data left) or after the data (new data left), then a write of the chunk, logged anew: one read before the write back, no mismatch, and a second crash at every entry leaves what the first crash left or the newest data |
 | `test_ext4_survives_a_crash_after_each_fsync` | 2 | `slow`: 8 files on ext4 with 1 KiB and 4 KiB blocks, each with an `fsync` and a mark. At every mark: ext4 mounts, `e2fsck -fn` finds nothing, and each file marked so far is intact |
 | `test_first_writes_cut_anywhere_read_zeros_or_new` | 1 | On a lower device of random data, a whole chunk and one sector of another written for the first time and flushed: a crash at every entry leaves each of them zeros or the new data with zeros around it, never an error, and both states are seen |
+| `test_a_discard_cut_anywhere_reads_old_or_zeros` | 1 | Four chunks written and flushed, the two in the middle discarded and flushed: a crash at every entry leaves each of those old or zeros, both seen, zeros after the flush, the neighbours unchanged |
+| `test_a_write_after_a_discard_cut_anywhere_reads_zeros_or_new` | 1 | The trap of a discard: a first crash after the data leaves copies of the metadata that differ; then the chunk is discarded and one sector written back by age: one barrier, no read to settle, and a second crash at every entry leaves what the first left, zeros, or the sector with zeros around it. Without the sync before that write back, the first entry already leaves a chunk that does not read |
 | `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush after `mkfs`, and at every fourth FUA write: each write back writes its leading metadata sector with FUA, about 270 points besides 60 flushes, too many to check all in 10 minutes. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA |
 
-### `test_bitmap.py`: the bitmap of written chunks (23 tests)
+### `test_bitmap.py`: the bitmap of written chunks (24 tests)
 
 Groups of 16 MiB, one block of the bitmap each, on 48 MiB of random data, three groups.
 
@@ -228,9 +230,27 @@ Groups of 16 MiB, one block of the bitmap each, on 48 MiB of random data, three 
 | `test_the_copy_with_the_larger_generation_is_taken` | 2 | One copy put back to an older valid version: the chunk of the newer reads |
 | `test_a_block_of_another_place_or_device_is_not_taken` | 5 | The leading copy with another group, index or role, or a CRC from another salt, all with generation 100 and no bits: not taken, the chunk reads from the trailing copy. The same copy with nothing wrong is taken, and the chunk then reads as zeros: the positive control |
 | `test_a_block_invalid_in_both_copies_makes_its_range_read_only` | 1 | Both copies damaged: a warning, `read_only_blocks` 1; a written chunk reads, one never written fails its CRC, a write there fails and is counted; group 1 is written and read; the damaged copies are never written |
+| `test_a_discard_touching_a_read_only_block_fails_whole` | 1 | A discard across the end of group 0, whose block is invalid in both copies, into group 1: it fails, is counted in `refused_writes`, and the chunks of group 1 keep their data |
 | `test_the_superblock_of_every_other_group_is_checked` | 4 | The superblock of group 2 zeroed, of another device or of another generation: the device is created, `bad_superblocks` 1 and the reason in the log; unchanged, 0 |
 | `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write` | 1 | Over `dm-dust` failing one write of the leading copy: the flush fails, the error is counted, no copy has the bit; the next flush writes both, and the chunk reads after the target is created again |
 | `test_a_second_copy_that_fails_to_write_is_counted` | 1 | Over `dm-dust` failing one write of the trailing copy: the flush succeeds, the error is counted, the leading copy has the bit, the chunk reads after the target is created again |
+
+### `test_discard.py`: discard through the bitmap (11 tests)
+
+Five chunks written and flushed; the discards start in the chunk before the middle one, or at it.
+
+| Test | Cases | Checks |
+| ---- | ----- | ------ |
+| `test_the_device_offers_discard_in_chunks_and_no_write_zeroes` | 1 | In sysfs: `discard_granularity` 4096, `discard_max_bytes` at least 1 GiB, `write_zeroes_max_bytes` 0 |
+| `test_a_discard_reads_zeros_in_whole_chunks_and_keeps_the_ends` | 1 | From sector 3 of one chunk to sector 5 of the third after it: the two whole chunks read as zeros, without a lower read, the ends keep their data, `discarded_chunks` 2. The block layer sends the unaligned head as a discard of its own |
+| `test_a_discard_inside_one_chunk_changes_nothing` | 1 | Sectors 1 to 6 of a chunk: counted, no chunk discarded, the data unchanged |
+| `test_a_discard_writes_no_data_below` | 1 | No write reaches the lower device at the discard; after a flush its slot still holds the old data, and the chunk reads zeros |
+| `test_data_in_the_cache_is_dropped_by_a_discard` | 1 | A chunk still dirty in the cache is dropped: no dirty entry left, zeros, and after a flush its slot below is still zeros |
+| `test_a_discard_survives_recreating_the_device` | 2 | After a flush, or only the sync of the suspend, the target created again reads the chunk as zeros and the next one as written |
+| `test_a_write_after_a_discard_is_written_whole_after_a_barrier` | 1 | One sector written after a discard: one barrier, no read to settle, and after the target is created again the sector with zeros around it |
+| `test_a_second_write_after_a_flushed_discard_needs_no_barrier` | 1 | Once a flush has put the cleared bit on the device, a write back of the chunk takes no barrier |
+| `test_blkdiscard_of_the_whole_device_is_one_discard` | 1 | `blkdiscard` of the device: one discard reaches the target, every chunk is discarded, the chunks read as zeros |
+| `test_fstrim_on_ext4_keeps_the_files` | 1 | `mkfs.ext4` discards the device; two files of 4 MiB, one deleted, `fstrim` discards at least its chunks, `e2fsck -fn` is clean and the other file intact after a remount |
 
 ### `test_lower_errors.py`: the lower device fails (17 tests)
 
@@ -385,6 +405,12 @@ Three things of the bitmap are not tested: the flush between the first copies of
 ones, the order of the bitmap write after the flush of the data, and which copy `trail_first` writes first. A
 crash test would need a cut between two writes that the log replays in the order they completed, and dm-log-writes
 logs nothing of a write until it completes, so a reorder inside one flush never shows in a replay.
+
+Two things of discard are not tested. The cache rounds the start of a discard up to a chunk, but
+`__blkdev_issue_discard` always ends the first bio of a range at the boundary of the granularity, so an unaligned
+head reaches the target as a bio with no whole chunk, completed in `dm_map`, and the rounding is never needed
+from userspace: discarding the head chunk too passed every test. And the settle of a chunk whose bit is clear
+when the sync before its write back failed needs a flush that fails at that moment.
 
 If the kernel log overruns during a run, the summary reports it as `Kernel log overran N times`; a report in
 that window would go unseen.
@@ -546,6 +572,17 @@ The bitmap of written chunks, with `test_bitmap.py` and
 | The bitmap read in the constructor, not on the first resume | Failed, 3 | Both cases of `test_a_reload_keeps_the_bits_the_old_table_sets`, `test_table_reload_under_load`; the first full run found it there |
 
 Repeat this after large changes to the tests. `deploy/vm.sh sync` restores the copy in the VM.
+
+Discard, with the tests whose names hold `discard`; the 14 failed on the driver of step 3, as it refused
+discards. 4 of 5 caught:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| No sync before the first write back of a chunk with its bit clear while a clear is not durable | Failed, 2 | `test_a_write_after_a_discard_is_written_whole_after_a_barrier` and the crash test, on the counters: the chunk is settled instead, which is the fallback and safe. With that settle taken out too and the check of the counters dropped, the crash test fails on the read: the chunk gives `EIO` after a crash at the first entry |
+| The entries of the range are not dropped | Failed | `test_data_in_the_cache_is_dropped_by_a_discard` |
+| The sync never records the clears it made durable | Failed, 2 | `test_a_second_write_after_a_flushed_discard_needs_no_barrier`, the crash test |
+| A discard into a read only range is not refused | Failed | `test_a_discard_touching_a_read_only_block_fails_whole` |
+| The partial chunk at the head of a discard is discarded too | Passed | Not reachable from userspace, see "What is not tested yet" |
 
 The seed of the CRC of data, with `test_corruption.py`; all 3 caught:
 

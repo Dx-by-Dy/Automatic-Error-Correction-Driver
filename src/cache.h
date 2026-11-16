@@ -146,6 +146,16 @@ struct cache
     /// @brief Flushes and FUA writes waiting for the worker
     struct bio_list flushes;
 
+    /// @brief Discards waiting for the worker, see cache_discard
+    struct bio_list discards;
+
+    /// @brief Changes whenever a discard clears a bit of the bitmap of written chunks
+    /// @details Changed and read only by the worker, or in postsuspend once it is cancelled.
+    u64 clears;
+
+    /// @brief The value of clears the last sync made durable, see cache_prepare_metadata
+    u64 synced_clears;
+
     /// @brief The worker writes back everything dirty, set during a suspend
     bool write_all;
 
@@ -188,8 +198,14 @@ struct cache
     atomic64_t crowded_flushes;
 
     /// @brief How many times the worker flushed before a write back, as the chunk had been written
-    /// back since the last flush, see cache_prepare_metadata
+    /// back since the last flush, or its bit had been cleared since, see cache_prepare_metadata
     atomic64_t barriers;
+
+    /// @brief How many discards reached the target, the ones that cover no whole chunk among them
+    atomic64_t nr_discards;
+
+    /// @brief How many whole chunks discards covered
+    atomic64_t discarded_chunks;
 };
 
 struct cache *cache_create(struct dm_context *dm_ctx);
@@ -198,6 +214,7 @@ void cache_write(struct cache *cache, struct bio *bio);
 bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range);
 void cache_read_done(struct cache *cache, struct cache_range *range);
 void cache_flush(struct cache *cache, struct bio *bio);
+void cache_discard(struct cache *cache, struct bio *bio);
 void cache_suspend(struct cache *cache);
 void cache_resume(struct cache *cache);
 void cache_counters(struct cache *cache, unsigned long *dirty, unsigned long *failed);

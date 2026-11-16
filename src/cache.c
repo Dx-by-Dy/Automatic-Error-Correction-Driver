@@ -484,6 +484,121 @@ void cache_flush(struct cache *cache, struct bio *bio)
     cache_kick(cache);
 }
 
+/// @brief Hands a discard to the worker, which completes it
+/// @details
+/// The bio covers at least one whole chunk, and no block of the bitmap
+/// invalid in both copies; dm_map has checked that. The bits are cleared by the
+/// worker, see cache_discard_bios, as a sync writes the blocks of the bitmap
+/// from RAM, and only the worker runs syncs while the device is live.
+///
+/// Expected execution context - dm_map.
+void cache_discard(struct cache *cache, struct bio *bio)
+{
+    spin_lock(&cache->lock);
+    bio_list_add(&cache->discards, bio);
+    spin_unlock(&cache->lock);
+    cache_kick(cache);
+}
+
+/// @brief Finds the entry of the first chunk from this one on in the tree; the lock must be held
+static struct cache_entry *cache_find_from(struct cache *cache, sector_t chunk)
+{
+    struct rb_node *node = cache->tree.rb_node;
+    struct cache_entry *found = NULL;
+
+    while (node)
+    {
+        struct cache_entry *entry = rb_entry(node, struct cache_entry, node);
+
+        if (chunk > entry->chunk)
+        {
+            node = node->rb_right;
+            continue;
+        }
+        found = entry;
+        node = node->rb_left;
+    }
+
+    return found;
+}
+
+/// @brief Drops the entries of the chunks of a range, their data not yet written back; the lock must be held
+/// @details No entry may be under write back. A failed entry is dropped too: its data is discarded.
+static void cache_drop_range(struct cache *cache, sector_t first, sector_t end)
+{
+    struct cache_entry *entry = cache_find_from(cache, first);
+
+    while (entry && entry->chunk < end)
+    {
+        struct rb_node *next = rb_next(&entry->node);
+
+        WARN_ON_ONCE(entry->state == CACHE_WRITING);
+        if (entry->state == CACHE_FAILED)
+            cache->nr_failed--;
+        else
+            cache->nr_dirty--;
+        list_del(&entry->list);
+        rb_erase(&entry->node, &cache->tree);
+        entry->state = CACHE_FREE;
+        entry->mask = 0;
+        list_add(&entry->list, &cache->free);
+        cache->nr_free++;
+
+        entry = next ? rb_entry(next, struct cache_entry, node) : NULL;
+    }
+}
+
+/// @brief Carries out the discards handed to the worker, and completes them
+/// @details
+/// Waits for the write backs in flight first, so that no entry is under write
+/// back and no bit is set meanwhile. For the whole chunks of each discard, the
+/// entries are dropped and the bits cleared, a block of the bitmap at a time
+/// under the lock, so that a read sees a chunk either as it was or as zeros. A
+/// cleared bit reaches the device with the next sync, so a discard is durable
+/// once a flush from above that follows it completes; until then the chunk may
+/// hold its old data after a crash. The first write back of such a chunk syncs
+/// first, see cache_prepare_metadata.
+///
+/// Expected execution context - the worker, may sleep.
+static void cache_discard_bios(struct cache *cache, struct bio_list *discards)
+{
+    struct written_map *written = cache->dm_ctx->written;
+    struct bio *bio;
+
+    wait_event(cache->wait, !READ_ONCE(cache->nr_writing));
+
+    while ((bio = bio_list_pop(discards)))
+    {
+        sector_t first = DIV_ROUND_UP(bio->bi_iter.bi_sector, DATA_SIZE_SECTORS);
+        sector_t end = bio_end_sector(bio) / DATA_SIZE_SECTORS;
+        sector_t chunk = first;
+        bool wake;
+
+        spin_lock(&cache->lock);
+        cache_drop_range(cache, first, end);
+        wake = !list_empty(&cache->free);
+        cache_event(cache);
+        spin_unlock(&cache->lock);
+        if (wake)
+            wake_up_all(&cache->wait);
+
+        while (chunk < end)
+        {
+            u64 done;
+
+            spin_lock(&cache->lock);
+            if (written_clear(written, chunk * DATA_SIZE_SECTORS, end - chunk, &done))
+                cache->clears++;
+            spin_unlock(&cache->lock);
+            chunk += done;
+            cond_resched();
+        }
+
+        atomic64_add(end - first, &cache->discarded_chunks);
+        bio_endio(bio);
+    }
+}
+
 /// @brief Ends the write back of an entry once its last job is done; the lock must be held
 /// @details
 /// A written entry is freed, and the bit of its chunk set in the bitmap of
@@ -638,6 +753,13 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 /// barrier. Then metadata_settle reads the chunk if its copies still differ in
 /// the sectors to be written. A chunk never written back is not read: its old
 /// contents are zeros whatever its copies hold.
+///
+/// That holds only while its bit is clear on the device too. A discard clears
+/// a bit in RAM, and the device keeps it set until the next sync; a crash after
+/// a write back that skipped the settle could then leave sectors matching
+/// neither copy. So a chunk with its bit clear, while a clear is not yet
+/// durable, waits for a sync too, counted as a barrier; if that sync fails,
+/// the chunk is settled as one written before.
 /// @param unwritten Whether the bit of the chunk in the bitmap of written chunks is clear
 static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entry, bool unwritten)
 {
@@ -645,14 +767,15 @@ static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entr
     sector_t sector = entry->chunk * DATA_SIZE_SECTORS;
     struct metadata_area *area = metadata_get(metadata, sector);
 
-    if (metadata_written_since_flush(metadata, area, sector))
+    if (metadata_written_since_flush(metadata, area, sector) ||
+        (unwritten && cache->clears != cache->synced_clears))
     {
         wait_event(cache->wait, !READ_ONCE(cache->nr_jobs));
         atomic64_inc(&cache->barriers);
         cache_sync(cache, NULL, false);
     }
 
-    if (!unwritten)
+    if (!unwritten || cache->clears != cache->synced_clears)
         metadata_settle(metadata, area, sector, entry->mask);
     metadata_put(metadata, area);
 }
@@ -732,7 +855,8 @@ static bool cache_under_pressure(struct cache *cache)
 /// Once the device below has flushed, the data written back is durable, and
 /// the first copy of each block of the bitmap with new bits is written, then
 /// the device below is flushed again, see written_write_first: a bit on the
-/// device means durable data. The flushes from above complete then: with
+/// device means durable data, and the bits cleared before the sync are clear on
+/// the device, as synced_clears records. The flushes from above complete then: with
 /// BLK_STS_IOERR if failed is set, as a flush promises that nothing is left
 /// only in RAM, or if a flush or a block of the bitmap failed. Then the
 /// trailing copies of the metadata of the chunks written back before get the
@@ -752,6 +876,7 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
     struct metadata_cache *metadata = cache->dm_ctx->metadata;
     struct written_map *written = cache->dm_ctx->written;
     struct block_device *bdev = cache->dm_ctx->dev->bdev;
+    u64 clears = cache->clears;
     blk_status_t status;
     struct bio *bio;
     int r;
@@ -765,6 +890,8 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
         else if (r < 0)
             DM_ERR_LIMIT("the bitmap of written chunks failed to write, err=%d\n", r);
     }
+    if (!r)
+        cache->synced_clears = clears;
     status = failed ? BLK_STS_IOERR : errno_to_blk_status(r);
     while (flushes && (bio = bio_list_pop(flushes)))
     {
@@ -825,7 +952,8 @@ static void cache_relieve_metadata(struct cache *cache)
 
 /// @brief The worker
 /// @details
-/// Writes back the dirty entries, the oldest first: all of them for a flush,
+/// Carries out the discards first, see cache_discard_bios. Then writes back
+/// the dirty entries, the oldest first: all of them for a flush,
 /// a FUA write or a suspend, and otherwise those older than CACHE_AGE_MS and
 /// as many as keep CACHE_STOP_FREE entries free or on their way to it. A flush
 /// tries the failed entries again, and writes the trailing copies of the
@@ -842,8 +970,17 @@ static void cache_write_back(struct work_struct *work)
     struct cache_entry *entry;
     struct cache_entry *next;
     struct bio_list flushes;
+    struct bio_list discards;
     LIST_HEAD(picked);
     bool all;
+
+    spin_lock(&cache->lock);
+    discards = cache->discards;
+    bio_list_init(&cache->discards);
+    spin_unlock(&cache->lock);
+
+    if (!bio_list_empty(&discards))
+        cache_discard_bios(cache, &discards);
 
     spin_lock(&cache->lock);
     flushes = cache->flushes;
@@ -983,6 +1120,7 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     INIT_LIST_HEAD(&cache->failed);
     INIT_LIST_HEAD(&cache->jobs);
     bio_list_init(&cache->flushes);
+    bio_list_init(&cache->discards);
     init_waitqueue_head(&cache->wait);
     INIT_DELAYED_WORK(&cache->write_back, cache_write_back);
     cache->dm_ctx = dm_ctx;
@@ -991,6 +1129,8 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     atomic64_set(&cache->read_waits, 0);
     atomic64_set(&cache->crowded_flushes, 0);
     atomic64_set(&cache->barriers, 0);
+    atomic64_set(&cache->nr_discards, 0);
+    atomic64_set(&cache->discarded_chunks, 0);
 
     cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
     cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);
@@ -1034,8 +1174,8 @@ void cache_destroy(struct cache *cache)
 
     cancel_delayed_work_sync(&cache->write_back);
 
-    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !RB_EMPTY_ROOT(&cache->reads) ||
-            !RB_EMPTY_ROOT(&cache->sectors));
+    WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !bio_list_empty(&cache->discards) ||
+            !RB_EMPTY_ROOT(&cache->reads) || !RB_EMPTY_ROOT(&cache->sectors));
     list_for_each_entry(entry, &cache->dirty, list)
         DM_ERR_LIMIT("chunk %llu is lost: it was never written back\n", (unsigned long long)entry->chunk);
     list_for_each_entry(entry, &cache->failed, list)

@@ -486,3 +486,86 @@ def test_first_writes_cut_anywhere_read_zeros_or_new(logged_random):
         finally:
             device.close()
     assert {(3, True), (3, False), (5, True), (5, False)} <= states, states
+
+
+def discard(path, start, sectors):
+    device = BlockDevice(path)
+    try:
+        device.discard(start, sectors)
+    finally:
+        device.close()
+
+
+def test_a_discard_cut_anywhere_reads_old_or_zeros(logged):
+    """Chunks written and flushed, then discarded and flushed: a crash at any entry leaves each of them its
+    old data or zeros, and after the flush zeros."""
+    zeros = bytes(DATA_SECTORS * 512)
+    old = pattern("old", 4 * DATA_SECTORS)
+    start = 3 * DATA_SECTORS
+    write_and_flush(logged.upper_path, [(start, old)])
+    logged.mark("old")
+    discard(logged.upper_path, start + DATA_SECTORS, 2 * DATA_SECTORS)
+    write_and_flush(logged.upper_path, [])
+    logged.mark("discarded")
+    entries = logged.finish()
+
+    chunks = [old[i * DATA_SECTORS * 512 :][: DATA_SECTORS * 512] for i in range(4)]
+    states = set()
+    last = mark_index(entries, "discarded")
+    for point in range(mark_index(entries, "old"), last + 1):
+        data = read_after(logged, entries[: point + 1], start, 4 * DATA_SECTORS)
+        found = [data[i * DATA_SECTORS * 512 :][: DATA_SECTORS * 512] for i in range(4)]
+        assert found[0] == chunks[0] and found[3] == chunks[3], f"a neighbour changed at entry {point}"
+        assert found[1] in (chunks[1], zeros) and found[2] in (chunks[2], zeros), f"after a crash at entry {point}"
+        states.add(found[1] == zeros)
+        if point == last:
+            assert found[1] == found[2] == zeros, "the discard is not durable after the flush"
+    assert states == {True, False}, "every point gave the same state, so the test checked nothing"
+
+
+def test_a_write_after_a_discard_cut_anywhere_reads_zeros_or_new(logged):
+    """The trap of a discard: its bit cleared in RAM, still set on the device, and copies of the metadata
+    that differ after a crash. A first write back of the chunk skips the settle; without a sync before it, a
+    crash between its leading copy and its data would leave data that matches neither copy.
+
+    A first crash between the data and the trailing copy leaves the new data, matching the leading copy
+    only. Then the chunk is discarded and one sector written; a second crash at any entry leaves the data
+    of the first crash, zeros, or the new sector with zeros around it.
+    """
+    chunk = 3
+    start = chunk * DATA_SECTORS
+    entries, old, new = write_old_and_new(logged, start, DATA_SECTORS)
+    data, metadata = chunk_entries(entries, mark_index(entries, "old"), mark_index(entries, "new"), chunk)
+    first = entries[: data[0] + 1]
+    assert read_after(logged, first, start) == new
+    lower = BlockDevice(logged.lower_path)
+    try:
+        lead, trail = metadata_sectors(start, logged.lower_sectors)
+        assert lower.read(lead) != lower.read(trail), "the copies of the metadata are equal after the first crash"
+    finally:
+        lower.close()
+
+    logged.log_again()
+    discard(logged.upper_path, start, DATA_SECTORS)
+    update = pattern("update", 1)
+    device = BlockDevice(logged.upper_path)
+    try:
+        device.write(start + 2, update)
+        wait_for_write_back()
+        status = device_status()
+        assert (status["barriers"], status["settle_reads"]) == (1, 0), status
+        device.flush()
+    finally:
+        device.close()
+    second = logged.finish()
+
+    zeros = bytes(DATA_SECTORS * 512)
+    newer = bytearray(zeros)
+    newer[2 * 512 : 3 * 512] = update
+    states = set()
+    for point in range(len(second)):
+        found = read_after(logged, first + second[: point + 1], start)
+        assert found in (new, zeros, bytes(newer)), f"after a second crash at entry {point}"
+        states.add(found)
+    assert found == bytes(newer), "the new sector is not durable after the flush"
+    assert {zeros, bytes(newer)} <= states, "some states were never reached, so the test checked less"

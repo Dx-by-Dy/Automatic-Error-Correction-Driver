@@ -144,6 +144,13 @@ the chunk is written.
   and the other copies of the blocks, flush. A bit on the device thus means the data is durable, and a crash
   before it leaves the chunk zeros. A first copy that fails to write fails the flush from above and stays
   dirty; a second one is counted, and is written first with the next change of its block.
+- A discard clears the bits of its whole chunks, dropping their data from the cache, and is never passed down;
+  the partial chunks at its ends are left. The worker of the cache does it, after the write backs in flight,
+  so that no bit changes while a sync writes a block. The bits reach the device with the next sync, so after a
+  crash before it the chunks may hold their old data. A first write back of a chunk with its bit clear while
+  a clear is not yet on the device syncs first, counted as a barrier: its bit is still set there, and the
+  write back does not settle its metadata. If that sync fails, the chunk is settled as one written before. A
+  discard touching a read only range fails. Write zeroes is not offered, see the decisions below.
 - Only a lower device with 512-byte logical blocks works, as metadata is written as one 512-byte sector.
 - The tests have their own copy of the layout in `tests/harness.py`.
 
@@ -410,6 +417,24 @@ it counts.
 - A chunk whose bit is not on the device yet keeps its barrier, and the metadata of a region with no bit set is
   read: both for the optimization stage.
 
+**Decided** on 2026-11-16, discard, step 4 of the format stage:
+
+- **Discard in whole chunks through the bitmap**, not passed down, with no limit of our own on its length.
+  Checked in the source of 7.2.15: device mapper does not split a discard at `max_io_len`, only
+  `bio_split_to_limits` and `__blkdev_issue_discard` split it, by the limits of the queue; the head of a range
+  not aligned to a chunk comes as a bio of its own.
+- **A generation of clears**, chosen by the user over a sync per discard and over a second bitmap of the bits on
+  the device: the first write back of a chunk skips the settle only while its bit is clear on the device too;
+  after a discard that holds only after the next sync, so such a write back syncs first. No memory; the cost
+  only on first writes between a discard and the next flush.
+- **The worker clears the bits**, not `dm_map`: a sync writes a block of the bitmap from its page in RAM after
+  computing its CRC, and a bit changed meanwhile would leave a copy whose CRC does not match on the device.
+- **No write zeroes for now**: device mapper offers it only with `iterate_devices` and every device below
+  capable; there is no flag for a target that emulates it. It comes with `iterate_devices` in the stage of
+  device mapper integration. Until then `blkdev_issue_zeroout` writes zero pages, which is correct, only slower.
+- A discard and a write racing on one chunk may land in either order: concurrent I/O, the business of the layer
+  above.
+
 ## Decision log
 
 | Date | Decision | Why |
@@ -436,3 +461,4 @@ it counts.
 | 2026-11-15 | Groups of 16 MiB to 4 GiB, 1 GiB by default, each a header of 1 MiB with a full superblock and the bitmaps, and whole regions; parity reserved in 2 of 32 columns at the end of each group; the constructor reads groups 0 and 1 and probes group 1 for every size | A superblock in every group survives a lost range and allows growing; parity far from its data within a group, room for ECC now so the layout does not change; the user chose the fixed header and whole regions |
 | 2026-11-15 | The bitmap of written chunks read from every header on the first resume of the table, written by the flush sequence: the first copy of the changed blocks after the flush that made their data durable, then a flush, the other copy with the trailing metadata; a first write back of a chunk writes it whole with zeros; a block invalid in both copies makes its range read only | A bit on the device means durable data, so a fresh device needs no zeroing and a crash leaves a first write zeros or new; a range whose bits are lost is still checked by its CRC, never read as zeros |
 | 2026-11-16 | The CRC of a data sector runs over the salt, its logical sector as `le64` and its data; the format stays version 1 | The place of each sector and the device in the CRC, as in `dm-integrity`; no device is in use yet |
+| 2026-11-16 | Discard in whole chunks through the bitmap, by the worker of the cache, not passed down; a first write back after a discard not yet synced syncs first; no write zeroes until `iterate_devices` | A cleared bit is not on the device until a sync, and a sync writes the bitmap from RAM; device mapper offers write zeroes only through the devices below |

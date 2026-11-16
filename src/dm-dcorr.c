@@ -31,11 +31,17 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// its own, which stays on current->bio_list until it returns: the metadata
 /// area is read by a worker of the metadata cache.
 ///
+/// A discard is not split at chunks, only by the limits of the queue, see
+/// dm_io_hints. Its whole chunks go to the cache, which clears their bits in
+/// the bitmap of written chunks, so they read as zeros; the partial chunks at
+/// its ends are left as they are, and one with no whole chunk completes at
+/// once. It is refused if it touches a read only range, and never passed down.
+///
 /// Other operations are refused: device mapper sends none of them, as the
 /// target does not offer them, and remapping one would bypass the CRC.
 /// @param ti  DM target
 /// @param bio Incoming bio request
-/// @return DM_MAPIO_SUBMITTED for READ, WRITE and an empty flush.
+/// @return DM_MAPIO_SUBMITTED for READ, WRITE, DISCARD and an empty flush.
 ///         DM_MAPIO_KILL for anything else.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
@@ -74,6 +80,23 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
             return DM_MAPIO_KILL;
         }
         cache_write(dm_ctx->cache, bio);
+        return DM_MAPIO_SUBMITTED;
+
+    case REQ_OP_DISCARD:
+        atomic64_inc(&dm_ctx->cache->nr_discards);
+        if (DIV_ROUND_UP(bio->bi_iter.bi_sector, DATA_SIZE_SECTORS) >= bio_end_sector(bio) / DATA_SIZE_SECTORS)
+        {
+            bio_endio(bio);
+            return DM_MAPIO_SUBMITTED;
+        }
+        if (written_range_read_only(dm_ctx->written, bio->bi_iter.bi_sector, bio_sectors(bio)))
+        {
+            atomic64_inc(&dm_ctx->written->refused_writes);
+            DM_ERR_LIMIT("discard at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
+                         (unsigned long long)bio->bi_iter.bi_sector);
+            return DM_MAPIO_KILL;
+        }
+        cache_discard(dm_ctx->cache, bio);
         return DM_MAPIO_SUBMITTED;
 
     default:
@@ -151,6 +174,8 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     ti->per_io_data_size = sizeof(struct trn_p_rq);
     ti->num_flush_bios = 1;
     ti->flush_supported = true;
+    ti->num_discard_bios = 1;
+    ti->discards_supported = true;
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)
@@ -315,7 +340,7 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
@@ -333,13 +358,28 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                (unsigned long long)atomic64_read(&dm_ctx->written->single_blocks),
                (unsigned long long)atomic64_read(&dm_ctx->written->bad_superblocks),
                (unsigned long long)atomic64_read(&dm_ctx->written->write_errors),
-               (unsigned long long)atomic64_read(&dm_ctx->written->refused_writes));
+               (unsigned long long)atomic64_read(&dm_ctx->written->refused_writes),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->nr_discards),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->discarded_chunks));
         break;
     case STATUSTYPE_TABLE:
     case STATUSTYPE_IMA:
         result[0] = '\0';
         break;
     }
+}
+
+/// @brief Sets the limits of the queue the target needs
+/// @details
+/// Discards in whole chunks, of any length: device mapper does not split them
+/// at max_io_len, only the block layer by these limits. No write zeroes: device
+/// mapper offers them only with every device below capable, through
+/// iterate_devices, which the target does not have; the kernel zeroes with
+/// writes then.
+static void dm_io_hints(struct dm_target *ti, struct queue_limits *limits)
+{
+    limits->discard_granularity = DATA_SIZE_SECTORS << SECTOR_SHIFT;
+    limits->max_hw_discard_sectors = UINT_MAX >> SECTOR_SHIFT;
 }
 
 static struct target_type target = {
@@ -353,6 +393,7 @@ static struct target_type target = {
     .preresume = dm_target_preresume,
     .resume = dm_target_resume,
     .status = dm_status,
+    .io_hints = dm_io_hints,
 };
 
 /// @brief Registers the DM target on module load

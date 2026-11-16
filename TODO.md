@@ -63,9 +63,12 @@ in a run, **From reading** means it was only found in the code.
   model: until then the trailing copy holds the old CRC, and the read accepts it; a write lost together with both
   copies of its metadata passes for ever. Not tested: dropped writes need a test with `dm-flakey` and
   `drop_writes`, detected after that flush and passing before it.
-- **No discard.** The device does not offer it (`discard_max_bytes=0`), and `dm_map` refuses any
-  operation other than read, write and an empty flush. A bit of the bitmap of written chunks is never
-  cleared yet; discard and write zeroes are to clear it, step 4 of the format stage.
+- **No write zeroes.** By decision on 2026-11-16: device mapper offers it only through `iterate_devices` with
+  every device below capable, which the target does not have, so `blkdev_issue_zeroout` writes zero pages
+  through the cache. Correct, only slower. Fix: with `iterate_devices`, under Device Mapper integration, clear
+  the bits of whole chunks as a discard does and write the partial ends as zeros.
+- **A discard is not durable until the next flush.** By decision on 2026-11-16, as for writes: the cleared bits
+  reach the device with the next sync, so after a crash before it the chunks may hold their old data.
 
 - **A metadata sector failed in both copies fails 8 chunks.** By design of the layout: a metadata sector holds
   the entries of 8 chunks, so when neither copy reads, the reads of all of them fail, and so do the write backs,
@@ -81,9 +84,9 @@ in a run, **From reading** means it was only found in the code.
   arguments, as `.status` gives nothing for `STATUSTYPE_TABLE`, so the table cannot be saved and
   reloaded. `dmsetup status` has only the counters of waits and of dirty and failed entries of the
   cache; counters such as CRC mismatches do not exist yet.
-- **Queue limits are not inherited.** From reading: there is no `.iterate_devices` or `.io_hints`.
-  A lower device with 4K logical blocks is not rejected, although metadata is written
-  as single 512-byte sectors.
+- **Queue limits are not inherited.** From reading: there is no `.iterate_devices`; `.io_hints` sets only the
+  limits of discard. A lower device with 4K logical blocks is not rejected, although metadata is written
+  as single 512-byte sectors. Write zeroes waits for `.iterate_devices` too, see above.
 - **Nothing warns the user of a failing drive.** By decision of the threat model: the first error is a strong sign
   that a drive is failing, but today it is only a line in the kernel log. Fix: counters of errors and
   mismatches in `dmsetup status` and a device mapper event at the first one. An idea of the user, to think over:
@@ -181,13 +184,13 @@ Carried over from the previous list.
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
    and lifecycle tests are in place, known bugs are strict `xfail` or `known_hang`, `make check` is
    clean. What is left: mark the commit before the cache.
-2. **Integrity and format.** Discard and write zeroes, a test of lost writes. The threat model was settled, the
-   superblock written, the device laid out in groups with room for parity and the bitmap of written chunks read
-   and written on 2026-11-15; no reserved area. The seed of the CRC of data, with the logical sector and the
-   salt, on 2026-11-16.
+2. **Integrity and format.** A test of lost writes. The threat model was settled, the superblock written, the
+   device laid out in groups with room for parity and the bitmap of written chunks read and written on
+   2026-11-15; no reserved area. The seed of the CRC of data, with the logical sector and the salt, and discard
+   through the bitmap on 2026-11-16; write zeroes moved to Device Mapper integration.
 3. **Runs.** Neighbouring chunks written back as one bio, as decided in `ARCHITECTURE.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
-4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits, the
+4. **Device Mapper integration and docs.** `.status` with the table and more counters, queue limits with `iterate_devices` and write zeroes, the
    README.
 5. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
    the cache and for the cache, with the memory a load takes through the driver against the lower device:

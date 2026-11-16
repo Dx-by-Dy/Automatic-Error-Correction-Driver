@@ -80,12 +80,60 @@ void written_set(struct written_map *map, sector_t sector)
     set_bit(idx, map->dirty);
 }
 
+/// @brief Clears the bits of whole chunks from a logical sector on, up to the end of its block of the bitmap
+/// @details
+/// The chunks of a group are consecutive slots of its data columns, so a run
+/// of chunks within one block is a run of bits. Clears at most chunks bits;
+/// the caller goes on from the sector after them.
+///
+/// Expected execution context - the worker of the data cache, under its lock,
+/// so that no sync writes the block meanwhile.
+/// @param map    The bitmap
+/// @param sector The first logical sector of a chunk
+/// @param chunks How many chunks are left to clear
+/// @param done   Set to how many chunks this call covered, at least 1
+/// @return Whether a bit was set before
+bool written_clear(struct written_map *map, sector_t sector, u64 chunks, u64 *done)
+{
+    const struct dcorr_layout *layout = &map->sb->layout;
+    unsigned int bit;
+    u64 idx = written_locate(map, sector, &bit);
+    struct dcorr_bitmap_block *block = written_block(map, idx);
+    u64 group_left = (layout->group_capacity - sector % layout->group_capacity) / DCORR_CHUNK_SECTORS;
+    bool cleared = false;
+
+    *done = min3(chunks, (u64)(DCORR_BITMAP_BLOCK_BITS - bit), group_left);
+    for (u64 i = 0; i < *done; i++)
+    {
+        if (test_and_clear_bit_le(bit + i, block->bits))
+            cleared = true;
+    }
+    if (cleared)
+        set_bit(idx, map->dirty);
+
+    return cleared;
+}
+
 /// @brief Whether the chunk of a logical sector lies in a block invalid in both copies, where writes fail
 bool written_read_only(struct written_map *map, sector_t sector)
 {
     unsigned int bit;
 
     return test_bit(written_locate(map, sector, &bit), map->read_only);
+}
+
+/// @brief Whether a range of logical sectors touches a block invalid in both copies
+/// @details
+/// The blocks of the range are numbered in order, so the blocks between its
+/// first and its last are checked; one between them that covers only parity
+/// slots is checked too, which errs on the side of refusing.
+bool written_range_read_only(struct written_map *map, sector_t sector, sector_t sectors)
+{
+    unsigned int bit;
+    u64 first = written_locate(map, sector, &bit);
+    u64 last = written_locate(map, sector + sectors - 1, &bit);
+
+    return find_next_bit(map->read_only, last + 1, first) <= last;
 }
 
 /// @brief Takes a copy of a block read from the trailing place into RAM

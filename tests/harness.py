@@ -1,5 +1,6 @@
 """Helpers shared by the tests: the on-disk layout and direct I/O on block devices."""
 
+import fcntl
 import functools
 import mmap
 import os
@@ -367,6 +368,9 @@ def fio(path, timeout=FIO_SECONDS, **options):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+BLKDISCARD = 0x1277  # _IO(0x12, 119) of <linux/fs.h>
+
+
 class BlockDevice:
     """Sector-addressed I/O that bypasses the page cache.
 
@@ -399,6 +403,10 @@ class BlockDevice:
                 self.fd, [memoryview(buffer)[: len(data)]], sector * SECTOR_SIZE, flags
             )
         assert done == len(data), f"short write: {done} of {len(data)} bytes"
+
+    def discard(self, sector, count):
+        """Discards sectors with the BLKDISCARD ioctl, as blkdiscard does; raises OSError if it fails."""
+        fcntl.ioctl(self.fd, BLKDISCARD, struct.pack("QQ", sector * SECTOR_SIZE, count * SECTOR_SIZE))
 
     def flush(self):
         """Makes the writes so far durable; only then are they sure to be on the device below."""

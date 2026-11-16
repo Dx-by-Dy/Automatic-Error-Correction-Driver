@@ -87,7 +87,20 @@ above as zeros, and sets its bit in RAM once it succeeds; the bit reaches the de
 [Flushes](#flushes). A copy of a block is valid with its CRC, which starts from the salt, its group, its index
 and its role. A block valid in one copy is repaired by the next flush, unless the table is read only. A block
 invalid in both makes its range read only: its chunks are read as written, so their CRC decides, and writes
-there fail. The code is in `src/written.c`.
+and discards there fail. The code is in `src/written.c`.
+
+### Discard
+
+The device offers discard in whole chunks (`discard_granularity` 4 KiB, no limit of its own on the length) and
+does not pass it down. Device mapper does not split a discard at the chunks, only the block layer by these
+limits. The worker of the cache carries it out: it waits for the write backs in flight, drops the entries of
+the whole chunks of the range with their data, clears their bits and completes the bio; the partial chunks at
+the ends are left as they are. The worker does it, not `dm_map`, as a sync writes the blocks of the bitmap from
+RAM and no bit may change under it. The cleared bits reach the device with the next flush, so the discarded
+chunks may hold their old data after a crash before it. Until then the bit of such a chunk is still set on the
+device, so its first write back, which writes it whole and does not settle its metadata, syncs first, counted
+as a barrier. Write zeroes is not offered: device mapper offers it only through `iterate_devices` with every
+device below capable, so the kernel zeroes with writes.
 
 ### Cache
 
@@ -159,7 +172,7 @@ to write, as it would promise data that is not on the device. After that the wor
 of the metadata and the other copies of the blocks, and flushes the lower device again, so that both copies are
 durable before the chunks are written back again. A suspend writes back everything
 too, so a table reload or a removal loses nothing, except chunks that still fail to write: they are named
-in the kernel log. Any other operation, such as discard, is refused.
+in the kernel log. A discard goes to the worker too, see [Discard](#discard); any other operation is refused.
 
 ### Synchronization
 

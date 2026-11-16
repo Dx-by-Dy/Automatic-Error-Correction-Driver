@@ -77,6 +77,8 @@ STATUS_FIELDS = (
     "bad_superblocks",
     "bitmap_write_errors",
     "refused_writes",
+    "discards",
+    "discarded_chunks",
 )
 
 
@@ -100,7 +102,9 @@ def device_status(name=UPPER_NAME):
     single_blocks: blocks of the bitmap with one valid copy then, repaired by the next flush;
     bad_superblocks: copies of the superblock of groups 2 and on that are invalid or differ;
     bitmap_write_errors: copies of blocks of the bitmap that failed to write;
-    refused_writes: writes refused in the range of a block invalid in both copies.
+    refused_writes: writes and discards refused in the range of a block invalid in both copies;
+    discards: discards that reached the target, those covering no whole chunk among them;
+    discarded_chunks: whole chunks they covered, which read as zeros since.
     """
     fields = run("dmsetup", "status", name).stdout.split()
     assert fields[2] == "dcorr", fields

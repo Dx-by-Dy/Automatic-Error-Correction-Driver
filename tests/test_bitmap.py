@@ -345,6 +345,25 @@ def test_a_block_invalid_in_both_copies_makes_its_range_read_only(device):
         assert not device.block(0, role).valid(device.salt), "a block invalid in both copies was written"
 
 
+def test_a_discard_touching_a_read_only_block_fails_whole(device):
+    """A discard across the end of a group whose block is invalid in both copies fails, also in the next group."""
+    start = device.layout.group_capacity - 2 * DATA_SECTORS
+    data = pattern("kept", 4 * DATA_SECTORS)
+    flushed(device, [(start, data)])
+    device.remove()
+    for role in ROLES.values():
+        device.damage_block(0, role)
+    device.create()
+    before = device_status()
+
+    with pytest.raises(OSError):
+        device.upper.discard(start, 4 * DATA_SECTORS)
+    status = device_status()
+    assert status["refused_writes"] == before["refused_writes"] + 1
+    assert status["discarded_chunks"] == before["discarded_chunks"]
+    assert device.upper.read(start, 4 * DATA_SECTORS) == data, "a chunk of the next group was discarded"
+
+
 SUPERBLOCK_CRC_OFFSET = 152
 
 
