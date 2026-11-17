@@ -124,6 +124,7 @@ in [its documentation](docs/ru/archive/full_docs.pdf), in Russian. The details o
 | [RESEARCH.md](docs/en/RESEARCH.md) | The reading behind it: how drives fail, how other targets do it |
 | [TESTS.md](docs/en/TESTS.md) | What the tests check, and how they were shown to catch bugs |
 | [DEPLOY.md](docs/en/DEPLOY.md) | The development VM, where the driver is built, loaded and tested |
+| [DEMO.md](DEMO.md) | Commands to show the driver in the VM: setup, status, a damaged sector |
 | [TODO.md](docs/en/TODO.md) | What is not done yet, and the stages |
 | [TODO_OPTIMIZATION.md](docs/en/TODO_OPTIMIZATION.md) | What was left simple, to be measured and improved |
 
