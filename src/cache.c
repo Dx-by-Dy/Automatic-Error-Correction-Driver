@@ -278,32 +278,24 @@ static void cache_retry_failed(struct cache *cache)
     cache->nr_failed = 0;
 }
 
-/// @brief Writes a bio into the cache
+/// @brief Takes the entry of a chunk for a write, the lock held on return
 /// @details
-/// Device mapper splits requests at chunk boundaries, so the bio is within one
-/// chunk. Waits while the entry of the chunk is under write back, or while no
-/// entry is free; then copies the data and completes the bio at once. A FUA
-/// write completes once the worker has written back everything and flushed
-/// the device below. With no free entry and nothing that could free one, as
-/// all entries failed to write back, the write fails.
+/// Waits while the entry of the chunk is under write back, or while no entry
+/// is free. With no free entry and nothing that could free one, as all
+/// entries failed to write back, gives up.
 ///
 /// Expected execution context - dm_map, may sleep.
-/// @param cache The cache of the device
-/// @param bio   Write with bi_sector relative to the start of the target
-void cache_write(struct cache *cache, struct bio *bio)
+/// @return The entry, with the lock held; or NULL, with the lock released
+static struct cache_entry *cache_take_entry(struct cache *cache, sector_t chunk)
 {
-    sector_t chunk = bio->bi_iter.bi_sector / DATA_SIZE_SECTORS;
-    unsigned int first = bio->bi_iter.bi_sector % DATA_SIZE_SECTORS;
-    bool fua = bio->bi_opf & REQ_FUA;
     struct cache_entry *entry;
-    bool kick;
 
     spin_lock(&cache->lock);
     for (;;)
     {
         entry = cache_find(cache, chunk);
         if (entry && entry->state != CACHE_WRITING)
-            break;
+            return entry;
 
         if (entry)
         {
@@ -320,16 +312,15 @@ void cache_write(struct cache *cache, struct bio *bio)
             entry->chunk = chunk;
             entry->mask = 0;
             cache_insert(cache, entry);
-            break;
+            return entry;
         }
 
         if (!cache->nr_dirty && !cache->nr_writing)
         {
             spin_unlock(&cache->lock);
             DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "no entry for the write at sector %llu: the cache is full of chunks that failed to write back\n",
-                             (unsigned long long)bio->bi_iter.bi_sector);
-            bio_io_error(bio);
-            return;
+                             (unsigned long long)(chunk * DATA_SIZE_SECTORS));
+            return NULL;
         }
 
         atomic64_inc(&cache->free_waits);
@@ -339,22 +330,55 @@ void cache_write(struct cache *cache, struct bio *bio)
         if (list_empty(&cache->free) && (cache->nr_dirty || cache->nr_writing))
             cache_wait(cache);
     }
+}
+
+/// @brief Marks sectors of an entry written and the entry dirty; the lock must be held
+static void cache_mark_dirty(struct cache *cache, struct cache_entry *entry, unsigned int first,
+                             unsigned int sectors)
+{
+    entry->mask |= sector_mask(first, sectors);
+
+    if (entry->state == CACHE_DIRTY)
+        return;
+    if (entry->state == CACHE_FAILED)
+    {
+        list_del_init(&entry->list);
+        cache->nr_failed--;
+    }
+    entry->state = CACHE_DIRTY;
+    entry->dirtied = jiffies;
+    list_add_tail(&entry->list, &cache->dirty);
+    cache->nr_dirty++;
+}
+
+/// @brief Writes a bio into the cache
+/// @details
+/// Device mapper splits requests at chunk boundaries, so the bio is within one
+/// chunk. Takes the entry of the chunk, see cache_take_entry, copies the data
+/// and completes the bio at once. A FUA write completes once the worker has
+/// written back everything and flushed the device below. With no entry to
+/// take, the write fails.
+///
+/// Expected execution context - dm_map, may sleep.
+/// @param cache The cache of the device
+/// @param bio   Write with bi_sector relative to the start of the target
+void cache_write(struct cache *cache, struct bio *bio)
+{
+    sector_t chunk = bio->bi_iter.bi_sector / DATA_SIZE_SECTORS;
+    unsigned int first = bio->bi_iter.bi_sector % DATA_SIZE_SECTORS;
+    bool fua = bio->bi_opf & REQ_FUA;
+    struct cache_entry *entry;
+    bool kick;
+
+    entry = cache_take_entry(cache, chunk);
+    if (!entry)
+    {
+        bio_io_error(bio);
+        return;
+    }
 
     copy_to_entry(entry, bio, first);
-    entry->mask |= sector_mask(first, bio_sectors(bio));
-
-    if (entry->state != CACHE_DIRTY)
-    {
-        if (entry->state == CACHE_FAILED)
-        {
-            list_del_init(&entry->list);
-            cache->nr_failed--;
-        }
-        entry->state = CACHE_DIRTY;
-        entry->dirtied = jiffies;
-        list_add_tail(&entry->list, &cache->dirty);
-        cache->nr_dirty++;
-    }
+    cache_mark_dirty(cache, entry, first, bio_sectors(bio));
 
     kick = fua || cache->nr_free < CACHE_START_FREE;
     if (fua)
@@ -367,6 +391,64 @@ void cache_write(struct cache *cache, struct bio *bio)
         cache_schedule(cache);
 
     if (!fua)
+        bio_endio(bio);
+}
+
+/// @brief Writes zeros into sectors of one chunk in the cache, as a write of zeros would
+/// @return 0, or -EIO if no entry could be taken
+static int cache_zero(struct cache *cache, sector_t sector, unsigned int sectors)
+{
+    unsigned int first = sector % DATA_SIZE_SECTORS;
+    struct cache_entry *entry;
+    bool kick;
+
+    entry = cache_take_entry(cache, sector / DATA_SIZE_SECTORS);
+    if (!entry)
+        return -EIO;
+
+    memzero_page(entry->page, first << SECTOR_SHIFT, sectors << SECTOR_SHIFT);
+    cache_mark_dirty(cache, entry, first, sectors);
+    kick = cache->nr_free < CACHE_START_FREE;
+    spin_unlock(&cache->lock);
+
+    if (kick)
+        cache_kick(cache);
+    else
+        cache_schedule(cache);
+    return 0;
+}
+
+/// @brief Zeroes the range of a write zeroes bio, and completes it
+/// @details
+/// Device mapper does not split write zeroes at chunks. The partial chunks at
+/// its ends are written as zeros through the cache, as a write would be; its
+/// whole chunks go to the worker as a discard does, see cache_discard_bios,
+/// and read as zeros once their bits are cleared. REQ_NOUNMAP changes nothing:
+/// nothing is passed down. Like a write, it is durable after the next flush;
+/// with REQ_FUA it completes once the worker has flushed.
+///
+/// Expected execution context - dm_map, may sleep.
+/// @param cache The cache of the device
+/// @param bio   Write zeroes with bi_sector relative to the start of the target, outside any read only range
+void cache_write_zeroes(struct cache *cache, struct bio *bio)
+{
+    sector_t start = bio->bi_iter.bi_sector;
+    sector_t end = bio_end_sector(bio);
+    sector_t head = min_t(sector_t, end, round_up(start, DATA_SIZE_SECTORS));
+    sector_t tail = max_t(sector_t, head, round_down(end, DATA_SIZE_SECTORS));
+
+    if ((start < head && cache_zero(cache, start, head - start)) ||
+        (tail < end && cache_zero(cache, tail, end - tail)))
+    {
+        bio_io_error(bio);
+        return;
+    }
+
+    if (head < tail)
+        cache_discard(cache, bio);
+    else if (bio->bi_opf & REQ_FUA)
+        cache_flush(cache, bio);
+    else
         bio_endio(bio);
 }
 
@@ -484,7 +566,7 @@ void cache_flush(struct cache *cache, struct bio *bio)
     cache_kick(cache);
 }
 
-/// @brief Hands a discard to the worker, which completes it
+/// @brief Hands a discard, or a write zeroes with its ends zeroed, to the worker, which completes it
 /// @details
 /// The bio covers at least one whole chunk, and no block of the bitmap
 /// invalid in both copies; dm_map has checked that. The bits are cleared by the
@@ -550,6 +632,8 @@ static void cache_drop_range(struct cache *cache, sector_t first, sector_t end)
 
 /// @brief Carries out the discards handed to the worker, and completes them
 /// @details
+/// The whole chunks of a write zeroes come here too; one with REQ_FUA is handed
+/// on to the flushes, which the worker takes right after.
 /// Waits for the write backs in flight first, so that no entry is under write
 /// back and no bit is set meanwhile. For the whole chunks of each discard, the
 /// entries are dropped and the bits cleared, a block of the bitmap at a time
@@ -594,7 +678,15 @@ static void cache_discard_bios(struct cache *cache, struct bio_list *discards)
             cond_resched();
         }
 
-        atomic64_add(end - first, &cache->discarded_chunks);
+        if (bio_op(bio) == REQ_OP_DISCARD)
+            atomic64_add(end - first, &cache->discarded_chunks);
+        if (bio->bi_opf & REQ_FUA)
+        {
+            spin_lock(&cache->lock);
+            bio_list_add(&cache->flushes, bio);
+            spin_unlock(&cache->lock);
+            continue;
+        }
         bio_endio(bio);
     }
 }

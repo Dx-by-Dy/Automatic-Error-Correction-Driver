@@ -317,6 +317,26 @@ Covered by [`test_discard.py`](../../tests/test_discard.py) (all); [`test_crash.
 `test_a_discard_cut_anywhere_reads_old_or_zeros`, `test_a_write_after_a_discard_cut_anywhere_reads_zeros_or_new`;
 [`test_bitmap.py`](../../tests/test_bitmap.py): `test_a_discard_touching_a_read_only_block_fails_whole`.
 
+## Write zeroes
+
+```mermaid
+flowchart TD
+    wz(["Write zeroes over sectors 3 of chunk 4 to 5 of chunk 7"]) --> offered{"Has the lower device write zeroes?"}
+    offered -- no --> writes["not offered: the kernel writes zero pages, ordinary writes through the cache"]
+    offered -- yes --> ro{"Touches a read only range?"}
+    ro -- yes --> fail["refused"]
+    ro -- no --> ends["partial chunks 4 and 7: zeros written into their entries, as a write"]
+    ends --> whole["whole chunks 5 and 6: to the worker as a discard, entries dropped, bits cleared"]
+    whole --> done["completed; zeros read from the cache and without a read below"]
+    done --> durable["durable after the next flush, as a write"]
+```
+
+Covered by [`test_discard.py`](../../tests/test_discard.py): `test_the_device_offers_discard_in_chunks_and_write_zeroes`,
+`test_write_zeroes_reads_zeros_and_keeps_the_neighbours`, `test_write_zeroes_survives_recreating_the_device`,
+`test_write_zeroes_over_data_in_the_cache`, `test_blkdiscard_z_zeroes_through_write_zeroes`,
+`test_write_zeroes_inside_one_chunk_zeroes_only_its_sectors`; [`test_lower_errors.py`](../../tests/test_lower_errors.py):
+`test_write_zeroes_is_not_offered_over_a_lower_device_without_it`.
+
 ## Failures of the lower device
 
 ```mermaid

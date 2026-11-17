@@ -9,6 +9,15 @@ endif
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
+# The driver is built and checked only in the development VM, through deploy/vm.sh: a build on the host
+# leaves objects in the tree and checks without the sparse the VM has. dcorrsetup and clean are allowed.
+IN_VM := $(shell systemd-detect-virt --vm --quiet 2>/dev/null && echo yes)
+ifneq ($(IN_VM),yes)
+ifneq ($(filter all debug check,$(or $(MAKECMDGOALS),all)),)
+$(error Not in the VM: run deploy/vm.sh check, or deploy/vm.sh test, which builds the driver there)
+endif
+endif
+
 # dcorrsetup, in userspace. The layout comes from src/dcorr-format.h, shared with the driver.
 TOOL := tools/dcorrsetup
 TOOL_CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc

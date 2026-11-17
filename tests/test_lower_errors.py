@@ -37,6 +37,7 @@ from harness import (
     metadata_sectors,
     pattern,
     physical_sector,
+    queue_limit,
     region_sector,
     run,
 )
@@ -396,3 +397,16 @@ def test_the_first_error_raises_one_device_mapper_event(faulty):
     for _ in range(3):
         assert fails_with_eio(lambda: faulty.upper.read(bad))
     assert not wait_for_event(after=events + 1, seconds=2), "a later error raised an event"
+
+
+def test_write_zeroes_is_not_offered_over_a_lower_device_without_it(faulty):
+    """dm-dust has no write zeroes, so the driver offers none: the kernel zeroes with ordinary writes, which
+    set the bits of the chunks, so they read from the lower device afterwards."""
+    assert queue_limit(f"/dev/mapper/{FAULTY_NAME}", "write_zeroes_max_bytes") == 0
+    assert queue_limit(faulty.upper.path, "write_zeroes_max_bytes") == 0
+    first = BAD_CHUNK * DATA_SECTORS
+    faulty.upper.zeroout(first, 2 * DATA_SECTORS)
+    faulty.upper.flush_settled()
+    unwritten = device_status()["unwritten_reads"]
+    assert faulty.upper.read(first, 2 * DATA_SECTORS) == bytes(2 * DATA_SECTORS * 512)
+    assert device_status()["unwritten_reads"] == unwritten

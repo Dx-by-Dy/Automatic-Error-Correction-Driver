@@ -96,11 +96,17 @@ void dcorr_error(struct dm_target *ti)
 /// its ends are left as they are, and one with no whole chunk completes at
 /// once. It is refused if it touches a read only range, and never passed down.
 ///
+/// A write zeroes is not split at chunks either: its partial chunks are
+/// written as zeros through the cache, its whole chunks cleared as by a
+/// discard, see cache_write_zeroes. Device mapper sends it only while the
+/// device below has write zeroes, see dm_io_hints. It is refused if it
+/// touches a read only range.
+///
 /// Other operations are refused: device mapper sends none of them, as the
 /// target does not offer them, and remapping one would bypass the CRC.
 /// @param ti  DM target
 /// @param bio Incoming bio request
-/// @return DM_MAPIO_SUBMITTED for READ, WRITE, DISCARD and an empty flush.
+/// @return DM_MAPIO_SUBMITTED for READ, WRITE, DISCARD, WRITE_ZEROES and an empty flush.
 ///         DM_MAPIO_KILL for anything else.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
@@ -156,6 +162,17 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
             return DM_MAPIO_KILL;
         }
         cache_discard(dm_ctx->cache, bio);
+        return DM_MAPIO_SUBMITTED;
+
+    case REQ_OP_WRITE_ZEROES:
+        if (written_range_read_only(dm_ctx->written, bio->bi_iter.bi_sector, bio_sectors(bio)))
+        {
+            atomic64_inc(&dm_ctx->written->refused_writes);
+            DM_DEV_ERR_LIMIT(ti, "write zeroes at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
+            return DM_MAPIO_KILL;
+        }
+        cache_write_zeroes(dm_ctx->cache, bio);
         return DM_MAPIO_SUBMITTED;
 
     default:
@@ -239,6 +256,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     ti->flush_supported = true;
     ti->num_discard_bios = 1;
     ti->discards_supported = true;
+    ti->num_write_zeroes_bios = 1;
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)
@@ -246,6 +264,15 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         ti->error = "dm_get_device failed";
         DM_DEV_ERR(ti, "dm_get_device failed, dev=%s err=%d\n", argv[0], r);
         goto error_dm_get_device;
+    }
+
+    if (bdev_logical_block_size(dm_ctx->dev->bdev) != SECTOR_SIZE)
+    {
+        ti->error = "The device below must have logical blocks of 512 bytes";
+        DM_DEV_ERR(ti, "the device below has logical blocks of %u bytes, the metadata is written in sectors of 512\n",
+                   bdev_logical_block_size(dm_ctx->dev->bdev));
+        r = -EINVAL;
+        goto error_metadata;
     }
 
     r = superblock_read(ti, dm_ctx->dev->bdev, &dm_ctx->sb);
@@ -428,17 +455,51 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     }
 }
 
-/// @brief Sets the limits of the queue the target needs
+/// @brief Gives device mapper the device below, the part of it the layout uses
 /// @details
-/// Discards in whole chunks, of any length: device mapper does not split them
-/// at max_io_len, only the block layer by these limits. No write zeroes: device
-/// mapper offers them only with every device below capable, through
-/// iterate_devices, which the target does not have; the kernel zeroes with
-/// writes then.
+/// Device mapper stacks the limits of the device below into those of the
+/// target through it, before dm_io_hints, checks that the area lies on the
+/// device, and offers write zeroes only if the device below has it.
+static int dm_iterate_devices(struct dm_target *ti, iterate_devices_callout_fn fn, void *data)
+{
+    struct dm_context *dm_ctx = ti->private;
+
+    return fn(ti, dm_ctx->dev, 0, dm_ctx->sb.layout.lower_sectors, data);
+}
+
+/// @brief Sets the limits of the queue the target needs, over those of the device below
+/// @details
+/// What the target does itself replaces what it took from the device below:
+/// - a chunk of 4 KiB is the smallest write that does not make the cache
+///   merge, and the unit of the CRC work, so it is the physical block and the
+///   minimal I/O, unless the device below has larger ones; the optimal I/O and
+///   the alignment of the device below say nothing of the layout on top;
+/// - discards in whole chunks, of any length: device mapper does not split
+///   them at max_io_len, only the block layer by these limits; they are not
+///   passed down, so whatever the device below allows does not matter;
+/// - write zeroes of any length, carried out in the cache, see
+///   cache_write_zeroes; device mapper turns it off when the device below has
+///   none, as then nothing says that zeroing is cheap there;
+/// - no polling, as every request completes from a workqueue, and no stable
+///   pages, as a write is copied into the cache.
+///
+/// A device below with logical blocks other than 512 bytes is refused by the
+/// constructor; a zoned one by device mapper, as the target is not zoned.
 static void dm_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
+    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, DATA_SIZE_SECTORS << SECTOR_SHIFT);
+    limits->io_min = max_t(unsigned int, limits->io_min, DATA_SIZE_SECTORS << SECTOR_SHIFT);
+    limits->io_opt = 0;
+    limits->alignment_offset = 0;
+
     limits->discard_granularity = DATA_SIZE_SECTORS << SECTOR_SHIFT;
+    limits->discard_alignment = 0;
     limits->max_hw_discard_sectors = UINT_MAX >> SECTOR_SHIFT;
+
+    limits->max_write_zeroes_sectors = UINT_MAX >> SECTOR_SHIFT;
+    limits->max_hw_wzeroes_unmap_sectors = 0;
+
+    limits->features &= ~(BLK_FEAT_POLL | BLK_FEAT_STABLE_WRITES);
 }
 
 static struct target_type target = {
@@ -452,6 +513,7 @@ static struct target_type target = {
     .preresume = dm_target_preresume,
     .resume = dm_target_resume,
     .status = dm_status,
+    .iterate_devices = dm_iterate_devices,
     .io_hints = dm_io_hints,
 };
 

@@ -26,9 +26,10 @@ decisions stay here for their reasoning. "The user" is the author of the project
 | [D17](#d17-groups) | 2026-11-15 | Groups, a superblock in each, parity reserved in columns | In force |
 | [D18](#d18-a-bitmap-of-written-chunks) | 2026-11-15 | A bitmap of written chunks, a bit on the device meaning durable data | In force |
 | [D19](#d19-the-seed-salt-logical-sector-data) | 2026-11-15, 11-16 | The seed: salt, logical sector, data | In force |
-| [D20](#d20-discard-through-the-bitmap) | 2026-11-16 | Discard through the bitmap; no write zeroes yet | In force |
+| [D20](#d20-discard-through-the-bitmap) | 2026-11-16 | Discard through the bitmap; no write zeroes yet | In force; write zeroes superseded by D23 |
 | [D21](#d21-device-mapper-integration-and-docs-before-runs) | 2026-11-16 | Device mapper integration and docs before runs | In force |
 | [D22](#d22-errors-as-a-signal-counters-one-event-the-name-of-the-device) | 2026-11-16 | Errors as a signal: counters, one event, the name of the device | In force |
+| [D23](#d23-the-limits-of-the-lower-device-and-write-zeroes) | 2026-11-16 | The limits of the lower device, and write zeroes | In force; supersedes the write zeroes of D20 |
 
 ## D1. Tests run in a VM; crashes are replayed from a log
 
@@ -434,3 +435,32 @@ I/O can repeat rate limited.
   I/O, so it is safe from the workers; the completion of a bio cannot take it, so a failed read is logged by
   `complete_work` and a failed write back by the cache. `dm_table_event` takes a mutex too, so the event is
   raised from a work item.
+
+## D23. The limits of the lower device, and write zeroes
+
+**Why a choice was needed.** Without `iterate_devices` the device took none of the limits of the lower device,
+and device mapper offers write zeroes only through it. A lower device with logical blocks of 4 KiB was taken,
+although the metadata is written in sectors of 512 bytes.
+
+**Options.** For write zeroes: offered only where the lower device has it, or always, with an `iterate_devices`
+that names no device. For a lower device with 4 KiB logical blocks: refuse it, or write the metadata in blocks of
+4 KiB, a question of the format (see the open questions of [ARCHITECTURE.md](ARCHITECTURE.md#open-questions)).
+
+**Chosen**, on 2026-11-16, the choices of the user: `iterate_devices` over the part of the lower device the layout
+uses; a lower device whose logical block is not 512 bytes refused by the constructor; the physical block and the
+minimal I/O a chunk; write zeroes only where the lower device has it, the whole chunks cleared as by a discard and
+the partial ends written as zeros through the cache, `REQ_NOUNMAP` ignored; the target version stays 1.0.0.
+
+**Why.**
+
+- Without a device below, `iterate_devices` would hide the device from what device mapper checks, and write zeroes
+  would be offered over a device where zeroing is slow; with it, the area of the lower device is checked, and the
+  limits that do not depend on the layout, as the largest request, are taken.
+- What the target does itself overrides what is stacked: discard and write zeroes are not passed down, so the
+  limits of the lower device for them do not matter; the optimal I/O and the alignment of the lower device say
+  nothing of the logical sectors on top, as groups and regions move the data; every request completes from a
+  workqueue, so polling gives nothing; a write is copied into the cache, so stable pages are not needed.
+- A zoned lower device is refused by device mapper itself, as the target does not declare zones.
+- A FUA write zeroes is carried out as a FUA write, through the flushes of the worker; nothing in userspace sends
+  one, so it is not tested.
+

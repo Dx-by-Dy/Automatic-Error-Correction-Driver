@@ -321,8 +321,12 @@ The cleared bits reach the device with the next sync, so after a crash before it
 data. Until then the bit of such a chunk is still set on the device, so its first write back, which does not
 settle, syncs first, counted as a barrier; if that sync fails, the chunk is settled as one written before.
 
-Write zeroes is not offered: device mapper offers it only through `iterate_devices` with every device below
-capable, so the kernel zeroes with ordinary writes.
+Write zeroes is offered where the device below has it, as device mapper offers it only then (D23), and is never
+passed down either. Device mapper does not split it at chunks. Its partial chunks are written as zeros through the
+cache, as a write would be; its whole chunks go to the worker as a discard and read as zeros once their bits are
+cleared, without counting as a discard. `REQ_NOUNMAP` changes nothing. Like a write it is durable after the next
+flush, and with FUA it completes after the worker has flushed. One that touches a read only range fails. Where
+the device below has no write zeroes, the kernel zeroes with ordinary writes.
 
 ### Synchronization
 
@@ -412,8 +416,13 @@ The first error that any of `trail_errors`, `settle_mismatches`, `read_only_bloc
 `bad_superblocks`, `bitmap_write_errors` and counters 22 to 26 counts raises a device mapper event, see
 [Errors](#errors).
 
-**Queue limits:** `discard_granularity` 4 KiB and `max_hw_discard_sectors` of `UINT_MAX >> 9`; the device reports
-a write cache with FUA. Nothing else is set, and nothing is inherited from the lower device yet.
+**Queue limits:** the limits of the lower device are stacked through `iterate_devices`, over the part of it
+the layout uses, then `io_hints` puts what the target does itself (D23): logical blocks of 512 bytes, the lower
+device refused otherwise; the physical block and the minimal I/O a chunk, 4 KiB, or larger if the lower device
+has them; no optimal I/O and no alignment offset, as the layout breaks those of the lower device; discard in
+chunks, `discard_granularity` 4 KiB and `max_hw_discard_sectors` of `UINT_MAX >> 9`; write zeroes of the same
+length where the lower device has it; no polling and no stable pages. The device reports a write cache with FUA.
+A zoned lower device is refused by device mapper, as the target is not zoned.
 
 ## Open questions
 

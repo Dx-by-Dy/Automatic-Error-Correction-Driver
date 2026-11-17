@@ -16,6 +16,9 @@ deploy/vm.sh reset        # power off and start again, for a stuck kernel
 deploy/vm.sh stop
 ```
 
+The driver is built and checked only in the VM: on the host `make`, `make check` and `make debug` stop with an
+error, as a build there would leave objects in the tree and check without the sparse of the VM.
+
 `deploy/vm.sh help` lists all commands and the settings, which are environment variables.
 
 ## Where things are

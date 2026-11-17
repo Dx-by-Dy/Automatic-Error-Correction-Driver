@@ -1,6 +1,6 @@
 # Driver tests
 
-359 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+368 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [DEPLOY.md](DEPLOY.md), why the tests work this way in
 [D1](DECISIONS.md#d1-tests-run-in-a-vm-crashes-are-replayed-from-a-log).
 
@@ -9,8 +9,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 359 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 318 tests
+deploy/vm.sh test                                     # all 368 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 327 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -239,13 +239,14 @@ Groups of 16 MiB, one block of the bitmap each, on 48 MiB of random data, three 
 | `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write` | 1 | Over `dm-dust` failing one write of the leading copy: the flush fails, the error is counted, no copy has the bit; the next flush writes both, and the chunk reads after the target is created again |
 | `test_a_second_copy_that_fails_to_write_is_counted` | 1 | Over `dm-dust` failing one write of the trailing copy: the flush succeeds, the error is counted, the leading copy has the bit, the chunk reads after the target is created again |
 
-### `test_discard.py`: discard through the bitmap (11 tests)
+### `test_discard.py`: discard and write zeroes through the bitmap (17 tests)
 
-Five chunks written and flushed; the discards start in the chunk before the middle one, or at it.
+Five chunks written and flushed; the discards start in the chunk before the middle one, or at it, and the
+write zeroes go from sector 3 of the chunk before it to sector 5 of the chunk after it.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_the_device_offers_discard_in_chunks_and_no_write_zeroes` | 1 | In sysfs: `discard_granularity` 4096, `discard_max_bytes` at least 1 GiB, `write_zeroes_max_bytes` 0 |
+| `test_the_device_offers_discard_in_chunks_and_write_zeroes` | 1 | In sysfs: `discard_granularity` 4096, `discard_max_bytes` and `write_zeroes_max_bytes` at least 1 GiB, as the lower device has write zeroes |
 | `test_a_discard_reads_zeros_in_whole_chunks_and_keeps_the_ends` | 1 | From sector 3 of one chunk to sector 5 of the third after it: the two whole chunks read as zeros, without a lower read, the ends keep their data, `discarded_chunks` 2. The block layer sends the unaligned head as a discard of its own |
 | `test_a_discard_inside_one_chunk_changes_nothing` | 1 | Sectors 1 to 6 of a chunk: counted, no chunk discarded, the data unchanged |
 | `test_a_discard_writes_no_data_below` | 1 | No write reaches the lower device at the discard; after a flush its slot still holds the old data, and the chunk reads zeros |
@@ -255,6 +256,11 @@ Five chunks written and flushed; the discards start in the chunk before the midd
 | `test_a_second_write_after_a_flushed_discard_needs_no_barrier` | 1 | Once a flush has put the cleared bit on the device, a write back of the chunk takes no barrier |
 | `test_blkdiscard_of_the_whole_device_is_one_discard` | 1 | `blkdiscard` of the device: one discard reaches the target, every chunk is discarded, the chunks read as zeros |
 | `test_fstrim_on_ext4_keeps_the_files` | 1 | `mkfs.ext4` discards the device; two files of 4 MiB, one deleted, `fstrim` discards at least its chunks, `e2fsck -fn` is clean and the other file intact after a remount |
+| `test_write_zeroes_reads_zeros_and_keeps_the_neighbours` | 1 | `BLKZEROOUT`: the range reads as zeros, the rest as written; the two whole chunks without a lower read; the counters of discards unchanged |
+| `test_write_zeroes_survives_recreating_the_device` | 2 | After a flush, or only the sync of the suspend, the target created again reads the same |
+| `test_write_zeroes_over_data_in_the_cache` | 1 | Five dirty chunks: the whole chunks drop their data, the ends are zeroed in the cache; the same after a flush and the target created again |
+| `test_blkdiscard_z_zeroes_through_write_zeroes` | 1 | `blkdiscard -z` of the range: zeros, and the whole chunks read without a lower read, which ordinary writes of zeros would not give |
+| `test_write_zeroes_inside_one_chunk_zeroes_only_its_sectors` | 1 | Sectors 2 to 4 of a chunk: only they read as zeros, before and after the target is created again |
 
 ### `test_lost_writes.py`: writes acknowledged and lost (7 tests)
 
@@ -270,7 +276,7 @@ block of the bitmap, then `linear` again; each test checks on the lower device t
 | `test_data_lost_with_both_copies_of_its_metadata_passes_as_old` | 1 | The blind spot, pinned: the data and both metadata sectors dropped through the flush: the old data reads without an error. Its control is the rewrite test, which differs only in the trailing copy |
 | `test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other` | 2 | A first write whose leading or trailing copy of the block is dropped: that copy keeps its old generation, and the chunk reads after the target is created again |
 
-### `test_lower_errors.py`: the lower device fails (21 tests)
+### `test_lower_errors.py`: the lower device fails (22 tests)
 
 `dm-dust` with 512-byte blocks fails reads of chosen sectors of the lower device, and writes to them a
 chosen number of times; a write to such a sector clears it. One test loads `dm-flakey` in its place.
@@ -297,6 +303,7 @@ goes on.
 | `test_a_failed_metadata_read_is_counted_in_sectors` | 1 | Three sectors of the leading copy fail, metadata dropped from RAM: everything reads, and `metadata_read_errors` grows by a multiple of 3, as each read of the area counts each sector; udev reads it a number of times not known |
 | `test_a_failed_flush_is_counted` | 1 | `dm-flakey` with `error_writes` and nothing to write back: the flush from above fails, `flush_errors` grows by 1 and `write_errors` not; with `dm-linear` back the flush succeeds |
 | `test_the_first_error_raises_one_device_mapper_event` | 1 | A failed read: `dmsetup wait` sees one event; three more failed reads raise none |
+| `test_write_zeroes_is_not_offered_over_a_lower_device_without_it` | 1 | `dm-dust` has no write zeroes, nor then has the driver; `BLKZEROOUT` zeroes with ordinary writes, so after a flush the chunks read from the lower device |
 
 ### `test_metadata.py`: metadata in RAM (8 tests)
 
@@ -336,16 +343,18 @@ are not checked. The
 tables of the device are small enough for `kmalloc`, so `/proc/vmallocinfo` does not show them; it showed the
 lock table, which is gone.
 
-### `test_target.py`: arguments and table of the target (9 tests)
+### `test_target.py`: arguments, table and limits of the target (11 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_bad_arguments_are_rejected` | 3 | No arguments, too many, a missing device |
 | `test_device_takes_the_usable_length` | 1 | A table with the correct length gives a device of that size |
 | `test_a_length_other_than_the_capacity_is_rejected` | 2 | A chunk longer or shorter than the capacity in the superblock is refused |
-| `test_table_shows_the_lower_device` | 1 | `dmsetup table` gives the lower device as major:minor, as every target. A strict `xfail` until stage 5 |
+| `test_table_shows_the_lower_device` | 1 | `dmsetup table` gives the lower device as major:minor, as every target. It was a strict `xfail` until stage 5 |
 | `test_the_table_loads_again_as_dmsetup_gives_it` | 1 | The line of `dmsetup table`, saved, creates the device again on the same data |
 | `test_target_may_start_after_sector_0` | 1 | With a table that puts the target after sector 0, its first sector lands on sector 0 of the lower device |
+| `test_the_limits_are_those_of_a_chunk_over_the_lower_device` | 1 | In sysfs: logical block 512, physical block and minimal I/O 4096, no optimal I/O, `max_hw_sectors_kb` of the lower device, no polling, no stable pages |
+| `test_a_lower_device_with_4k_logical_blocks_is_refused` | 1 | An image formatted and loaded over a loop device with sectors of 512 bytes, as a control, is refused over one with sectors of 4096, and the log says why |
 
 ### `test_superblock.py`: the superblock and `dcorrsetup` (78 tests)
 
@@ -435,6 +444,11 @@ Two things of discard are not tested. The cache rounds the start of a discard up
 head reaches the target as a bio with no whole chunk, completed in `dm_map`, and the rounding is never needed
 from userspace: discarding the head chunk too passed every test. And the settle of a chunk whose bit is clear
 when the sync before its write back failed needs a flush that fails at that moment.
+
+Two things of write zeroes are not tested. A FUA write zeroes, as nothing in userspace sends one: `BLKZEROOUT`
+has no FUA; it goes the way of a FUA write, through the flushes of the worker. And a crash in the middle of one,
+as `dm-log-writes` has no write zeroes, so a write zeroes over it comes as ordinary writes; its whole chunks go
+the way of a discard and its ends the way of a write, both cut by the crash tests.
 
 If the kernel log overruns during a run, the summary reports it as `Kernel log overran N times`; a report in
 that window would go unseen.
@@ -660,6 +674,16 @@ Errors as a signal, stage 5, with the tests of the counters, the event and the l
 | A failed read of a copy of an area counts 1, not its sectors | Failed | `test_a_failed_metadata_read_is_counted_in_sectors` |
 | A failed write back is not counted | Failed, 4 | `test_failed_write_is_reported` |
 | A failed read is not counted | Failed | `test_a_failed_read_is_counted_and_logged_with_the_device` |
+
+Limits and write zeroes, stage 5:
+
+| Change | Result | Where |
+| ------ | ------ | ----- |
+| The driver before them (`e932f3c`), with these tests | Failed, 4 | `test_the_device_offers_discard_in_chunks_and_write_zeroes`, `test_write_zeroes_reads_zeros_and_keeps_the_neighbours`, `test_the_limits_are_those_of_a_chunk_over_the_lower_device`, `test_a_lower_device_with_4k_logical_blocks_is_refused`; the rest pass on ordinary writes of zeros, as they should |
+| The partial chunk at the start is not zeroed | Failed, 6 | Every test of write zeroes over written data |
+| The partial chunk at the end is not zeroed | Failed, 5 | The same but the one inside one chunk, which has no end of its own |
+| The whole chunks are not cleared | Failed, 5 | The same |
+| A partial chunk zeroes its whole entry | Failed | `test_write_zeroes_over_data_in_the_cache`: elsewhere the other sectors of the entry are not in its mask |
 
 A read cut to 0 sectors by `dm_accept_partial_bio` makes device mapper send it again and again, until the
 write back by age frees the entry and the read goes to the lower device, with the right data. The read tests

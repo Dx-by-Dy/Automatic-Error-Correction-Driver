@@ -60,10 +60,9 @@ in a run, **From reading** means it was only found in the code.
   Fix, for the correction stage: parity computed from the data in RAM, not from what is read back, would make
   such a stripe disagree, and P+Q can tell which member is wrong, so a scrub could find the chunk and rebuild
   it.
-- **No write zeroes.** By decision on 2026-11-16: device mapper offers it only through `iterate_devices` with
-  every device below capable, which the target does not have, so `blkdev_issue_zeroout` writes zero pages
-  through the cache. Correct, only slower. Fix: with `iterate_devices`, under Device Mapper integration, clear
-  the bits of whole chunks as a discard does and write the partial ends as zeros.
+- **No write zeroes over a lower device without it.** By decision (D23): device mapper offers write zeroes only
+  where every device below has it, so over such a device `blkdev_issue_zeroout` writes zero pages through the
+  cache. Correct, only slower. Fix, if it matters: device mapper has no flag for a target that zeroes by itself.
 - **A discard is not durable until the next flush.** By decision on 2026-11-16, as for writes: the cleared bits
   reach the device with the next sync, so after a crash before it the chunks may hold their old data.
 
@@ -80,9 +79,6 @@ in a run, **From reading** means it was only found in the code.
 - **Nothing is measured by IMA.** By decision on 2026-11-16: `STATUSTYPE_IMA` gives nothing, so a table of the
   driver is measured without its fields. Fix, if IMA is used: the keys and values of the target, as other
   targets give them.
-- **Queue limits are not inherited.** From reading: there is no `.iterate_devices`; `.io_hints` sets only the
-  limits of discard. A lower device with 4K logical blocks is not rejected, although metadata is written
-  as single 512-byte sectors. Write zeroes waits for `.iterate_devices` too, see above.
 - **Nothing tells the user in person of a failing drive.** By decision (D22): the driver counts the errors and
   raises a device mapper event at the first one, but something has to wait for it. An idea of the user, to think
   over: a daemon that reads SMART and the counters of the driver and warns.
