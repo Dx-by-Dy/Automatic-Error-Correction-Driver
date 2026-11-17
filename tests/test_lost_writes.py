@@ -222,3 +222,38 @@ def test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other(lossy, rol
 
     lossy.recreate_upper()
     assert lossy.upper.read(NEVER, DATA_SECTORS) == new
+
+
+@pytest.mark.parametrize(
+    "trailing",
+    [
+        "written",
+        pytest.param(
+            "lost",
+            marks=pytest.mark.xfail(
+                strict=True, reason="After a restart the trailing copy keeps the old CRC until the chunk is written again"
+            ),
+        ),
+    ],
+)
+def test_old_data_put_back_fails_once_the_new_was_read(lossy, trailing):
+    """The trailing copy of a rewrite is lost, as a crash after the flush and before the trailing copy leaves
+    it: the leading copy has the CRC of the new data and the trailing one that of the old. Once the target is
+    created again the new data reads and is flushed, so it is durable; yet the trailing copy keeps the old CRC
+    until the chunk is written again, and the old data, put back below by a drive that lost the write from its
+    cache, passes for ever. Settling such chunks when they are first read, or in the background, would close it.
+
+    "written" is the positive control: with both copies new, the old data put back fails its CRC.
+    """
+    new = pattern("new", DATA_SECTORS)
+    lossy.upper.write(FIRST, new)
+    if trailing == "lost":
+        lossy.lose(lossy.trail(FIRST))
+    lossy.upper.flush_settled()
+    lossy.heal()
+    lossy.recreate_upper()
+    assert lossy.upper.read(FIRST, DATA_SECTORS) == new
+    lossy.upper.flush_settled()
+
+    lossy.lower.write(lossy.data(FIRST)[0], OLD)
+    assert_read_fails(lossy.upper, FIRST)

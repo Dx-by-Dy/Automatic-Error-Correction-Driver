@@ -25,6 +25,7 @@ from conftest import (
     kernel_messages,
     make_lower,
     wait_for_event,
+    wait_for_write_back,
     warned,
 )
 from harness import (
@@ -209,6 +210,57 @@ def test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy():
         faulty.remove()
 
 
+REBUILT = "A metadata sector rebuilt from one copy can fail its neighbours for good"
+
+
+@pytest.mark.parametrize(
+    "failed, state",
+    [
+        ("leading", "copies equal"),
+        pytest.param("leading", "crash after the data", marks=pytest.mark.xfail(strict=True, reason=REBUILT)),
+        pytest.param("trailing", "crash before the data", marks=pytest.mark.xfail(strict=True, reason=REBUILT)),
+    ],
+)
+def test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable(faulty, failed, state):
+    """A copy of a metadata sector that fails to read is filled from the other one in RAM, and the next write of
+    a chunk there writes the whole sector from RAM. That is right while the copies agree. After a crash in a
+    write back they differ, and the data of the chunk matches only one of them: filled from the other, the
+    sector loses the CRC that matched, and once it is written the chunk fails for good, though the sector
+    reads again.
+
+    The chunk is left as a crash leaves it: the new data with the trailing copy still old, or the old data
+    with the leading copy already new. Then the copy that holds the CRC of the data fails to read, a
+    neighbouring chunk is written, and the sector is healed. "copies equal" is the positive control, the
+    copies left as the flush made them.
+    """
+    first = BAD_CHUNK * DATA_SECTORS
+    old = pattern("before", AREA)[first * 512 :][: DATA_SECTORS * 512]
+    new = pattern("after", DATA_SECTORS)
+    lead, trail = copies(BAD_CHUNK)
+    lower = BlockDevice(faulty.lower)
+    try:
+        old_trail = lower.read(trail)
+        flushed_write(faulty.upper, first, new)
+        expected = new
+        if state != "copies equal":
+            lower.write(trail, old_trail)
+        if state == "crash before the data":
+            lower.write(physical_sector(first, LOWER_MIB * 2048), old)
+            expected = old
+    finally:
+        lower.close()
+
+    faulty.fail(lead if failed == "leading" else trail)
+    drop_metadata()
+    neighbour = (BAD_CHUNK + 1) * DATA_SECTORS
+    flushed_write(faulty.upper, neighbour, pattern("neighbour", DATA_SECTORS))
+    faulty.heal()
+    drop_metadata()
+    assert faulty.upper.read(neighbour, DATA_SECTORS) == pattern("neighbour", DATA_SECTORS)
+    assert not fails_with_eio(lambda: faulty.upper.read(first, DATA_SECTORS)), "the chunk fails for good"
+    assert faulty.upper.read(first, DATA_SECTORS) == expected
+
+
 def test_failed_trailing_write_is_counted_and_warned(faulty):
     """A write whose trailing copy of the metadata fails still succeeds: the data and one copy are there.
 
@@ -383,6 +435,39 @@ def test_a_failed_flush_is_counted(faulty):
     faulty.load(f"linear {faulty.lower} 0")
     faulty.upper.flush()
     assert device_status()["flush_errors"] == after["flush_errors"]
+
+
+@pytest.mark.parametrize(
+    "flush",
+    [
+        "none",
+        pytest.param(
+            "failed",
+            marks=pytest.mark.xfail(
+                strict=True, reason="A failed flush of the lower device leaves the trailing copies behind"
+            ),
+        ),
+    ],
+)
+def test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier(faulty, flush):
+    """A chunk written back holds its old or its new data until the lower device flushes, so the next write
+    back of it takes a barrier first. A flush that fails has made nothing durable, so the same holds after it.
+
+    "none" is the positive control: no flush between the two write backs, and the second one takes a barrier.
+    """
+    first = BAD_CHUNK * DATA_SECTORS
+    faulty.upper.write(first, pattern("second", DATA_SECTORS))
+    wait_for_write_back()
+    if flush == "failed":
+        faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
+        assert fails_with_eio(faulty.upper.flush)
+        faulty.load(f"linear {faulty.lower} 0")
+    barriers = device_status()["barriers"]
+    faulty.upper.write(first, pattern("third", DATA_SECTORS))
+    wait_for_write_back()
+    assert device_status()["barriers"] == barriers + 1, "written back again with no barrier"
+    faulty.upper.flush_settled()
+    assert faulty.upper.read(first, DATA_SECTORS) == pattern("third", DATA_SECTORS)
 
 
 def test_the_first_error_raises_one_device_mapper_event(faulty):

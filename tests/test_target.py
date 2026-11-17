@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove, kernel_messages, make_lower
+from conftest import LOWER_NAME, OTHER_NAME, UPPER_NAME, dmsetup_remove, kernel_messages, make_lower
 from harness import (
     DATA_SECTORS,
     SECTOR_SIZE,
@@ -119,6 +119,34 @@ def test_the_limits_are_those_of_a_chunk_over_the_lower_device(lower):
     assert queue_limit(upper, "max_hw_sectors_kb") == queue_limit(path, "max_hw_sectors_kb")
     assert queue_limit(upper, "io_poll") == 0
     assert queue_limit(upper, "stable_writes") == 0
+
+
+@pytest.mark.xfail(strict=True, reason="Two devices can sit on one lower device")
+def test_a_second_device_on_the_same_lower_device_is_refused_or_agrees(lower):
+    """Each device keeps its cache, its metadata and its bitmap in RAM and writes them from there, so two
+    devices over one lower device do not see each other's writes: a chunk first written through one reads as
+    zeros through the other, whose bitmap does not have its bit, and each overwrites the blocks of the bitmap
+    of the other. The second device has to be refused; if it is taken, it must at least read what the first
+    wrote and flushed.
+    """
+    path, sectors = lower
+    table = f"0 {capacity(sectors)} dcorr {path}"
+    assert create(table).returncode == 0
+    try:
+        if run("dmsetup", "create", OTHER_NAME, stdin=table + "\n", check=False).returncode != 0:
+            return
+        data = pattern("first device", DATA_SECTORS)
+        first = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+        second = BlockDevice(f"/dev/mapper/{OTHER_NAME}")
+        try:
+            first.write(0, data)
+            first.flush_settled()
+            assert second.read(0, DATA_SECTORS) == data, "the second device reads zeros where the first wrote"
+        finally:
+            first.close()
+            second.close()
+    finally:
+        dmsetup_remove(OTHER_NAME)
 
 
 def loop_device(image, sector_size=SECTOR_SIZE):

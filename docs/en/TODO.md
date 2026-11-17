@@ -28,19 +28,35 @@ in a run, **From reading** means it was only found in the code.
   chunks are read as written, so the CRC decides, and writes there fail, for the life of the device: the driver
   never writes such a block, as it does not know which chunks were written. Counted in `dmsetup status`. Fix:
   rebuild the block from the CRCs of its chunks, with `dcorrsetup` or in the correction stage.
+- **A zeroed chunk in a read only range reads its old data.** Confirmed at `8a153d4` by
+  `test_a_zeroed_chunk_in_a_read_only_block_never_reads_its_old_data`: a discard or a write zeroes leaves the old
+  data and both copies of its CRCs below, and only the bit says that the chunk reads as zeros. Once the block of
+  the bitmap is invalid in both copies, its chunks are read as written and the CRC decides, which the old data
+  passes: a range zeroed by write zeroes gives back its old contents, with no error. Fix: when a bit is cleared,
+  make the entries of the chunk in both copies of the metadata match no data, at the cost of a write of metadata
+  per discard, or keep the cleared ranges apart from the bitmap.
 - **A copy of a block of the bitmap that failed to write is put right only with the next change of the block.**
   By decision, as for the trailing metadata: until then the block has one copy, and the next change writes the
   failed copy first. Counted. A block found with one copy when the device is created is repaired by the next
   flush, unless the table is read only.
+- **An older copy of a block of the bitmap stays on the device.** Confirmed at `8a153d4` by
+  `test_an_older_copy_is_rewritten_before_the_newer_is_lost`: when both copies of a block are valid but of
+  different generations, after a crash between the writes of the two copies or a second copy that failed to
+  write, the newer is taken and the older is left until the block changes. If the newer copy is lost later, the
+  older one is taken alone, and the chunks first written between the two generations read as zeros, with no
+  error; the repair of a block with one valid copy then writes those old bits into both. Fix: mark such a block
+  dirty when the device is created, as one with a single valid copy, so that the next flush writes both.
 - **A reload after a failed write of the bitmap loses its new bits.** The new table reads the bitmap on its
   first resume, after the old one has written its bitmap on suspend; when that write fails, the new table reads
   the chunks first written since the last good flush as zeros, though their data is on the device. Fix: hand
   the bitmap in RAM from the old table to the new one, or refuse the resume.
-- **A stale copy of group 1 in the data can win the probe.** From reading: with group 0 damaged the driver
-  takes the first valid copy of group 1 for any size of a group, from the smallest. `dcorrsetup format` wipes
-  the starts of group 1 of the smaller sizes, but data written later that holds the image of such a
-  superblock for the same device size, a dump of the lower device stored on it, would be taken as well.
-  Fix, if it matters: prefer the copy that agrees with other groups, or ask the user to name the size.
+- **A stale copy of group 1 in the data can win the probe.** Confirmed at `8a153d4` by
+  `test_a_superblock_stored_as_data_does_not_win_the_probe`: with group 0 damaged the driver takes the first
+  valid copy of group 1 for any size of a group, from the smallest. `dcorrsetup format` wipes the starts of
+  group 1 of the smaller sizes, but data written later that holds the image of such a superblock for the same
+  device size, a dump of the lower device stored on it, is taken as well: the device is then refused, as its
+  length is not the capacity of that layout, though group 1 at its own place is valid. Fix, if it matters:
+  prefer the copy that agrees with other groups, or ask the user to name the size.
 - **The device cannot grow.** By decision on 2026-11-15: the size of the lower device must be the one it was
   formatted for. Fix: a feature of its own, adding groups of the same size, as `xfs_growfs` does, rewriting
   every superblock and one trailing copy of the bitmap.
@@ -50,9 +66,19 @@ in a run, **From reading** means it was only found in the code.
 - **A crash together with a lost sector of the other copy fails the chunks that were in flight.** By
   decision: between the write back of a chunk and the flush after it, only the trailing copy has the CRC of the
   old data and only the leading one that of the new. Fix, if the threat model asks for it: a third copy, or ECC.
-- **A failed flush of the lower device leaves the trailing copies behind.** From reading: the chunks written
-  back before it are forgotten without their trailing copy, so their copies differ, and the read before their
-  next write back may see data that is not durable. A device that fails flushes gives no durability anyway.
+- **A metadata sector rebuilt from one copy can fail its neighbours for good.** Confirmed at `8a153d4` by
+  `test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`: a copy of a metadata sector that fails to
+  read is filled from the other in RAM, and the next write back of any of its 8 chunks writes the whole sector
+  from RAM. After a crash in a write back the copies of a chunk differ and its data matches only one of them; when
+  that copy fails to read, the chunk fails, as the item above says, but once a neighbour is written the CRC that
+  matched is overwritten on the device as well, and the chunk fails for good, though the sector reads again.
+  Fix, to be designed: read the failed copy again before the sector is written; while it still fails, read the
+  chunks of the sector, and if the data of one of them does not match the copy that reads, leave the failed copy
+  as it is and fail the write back, as for a sector failed in both copies.
+- **A failed flush of the lower device leaves the trailing copies behind.** Confirmed at `8a153d4` by
+  `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier`: the chunks written back before it are
+  forgotten without their trailing copy, so their copies differ, the next write back of such a chunk takes no
+  barrier, and the read before it may see data that is not durable. A device that fails flushes gives no durability anyway.
   Fix, if it matters: keep them pinned and retry, with a way out when the areas run out.
 - **A lost write passes as the old contents until the flush after its write back.** Confirmed by
   `test_lost_writes.py`, by decision of the threat model: until then the trailing copy holds the old CRC, and the
@@ -60,6 +86,14 @@ in a run, **From reading** means it was only found in the code.
   Fix, for the correction stage: parity computed from the data in RAM, not from what is read back, would make
   such a stripe disagree, and P+Q can tell which member is wrong, so a scrub could find the chunk and rebuild
   it.
+- **After a restart the trailing copy keeps the old CRC until the chunk is written again.** Confirmed at
+  `8a153d4` by `test_old_data_put_back_fails_once_the_new_was_read`: a crash after the flush that made a write
+  back durable and before its trailing copy, or a lost trailing write, leaves the leading copy with the CRC of the
+  new data and the trailing one with that of the old. Once the device is created again nothing settles such a
+  chunk before its next write back: its new data reads and is flushed, but the old data, put back by a drive that
+  lost the write from its cache, passes for ever, not only until the flush as in the item above. Fix: settle a
+  chunk whose copies differ when it is first read, or all of them in the background after activation, which
+  [TODO_OPTIMIZATION.md](TODO_OPTIMIZATION.md) proposes for speed.
 - **No write zeroes over a lower device without it.** By decision (D23): device mapper offers write zeroes only
   where every device below has it, so over such a device `blkdev_issue_zeroout` writes zero pages through the
   cache. Correct, only slower. Fix, if it matters: device mapper has no flag for a target that zeroes by itself.
@@ -73,9 +107,26 @@ in a run, **From reading** means it was only found in the code.
   simplicity: until a chunk of the sector is written back, it stays with one copy, and a warning is logged at
   every access, rate-limited. A trailing sector that failed to write is counted, not retried. Fix: rewrite the
   failed copy from the other once it is found, in the worker.
+- **A sync may start before the completion of the last write back has set its bit.** From reading, at
+  `8a153d4`: the worker waits for `nr_jobs` or `nr_writing` to reach zero without the lock of the cache, before
+  the barrier, the sync of crowded areas and the sync of a suspend, but the completion of a job decrements them
+  before it sets the bit of its chunk, in the same hold of the lock. The sync may then write a block of the
+  bitmap while a bit in it changes, and miss that bit or write a block whose CRC no longer matches. The flush of
+  the lower device that comes first makes it unlikely. Fix: take the lock once after the wait, or decrement last.
 
 ## Device Mapper integration
 
+- **Two devices can sit on one lower device.** Confirmed at `8a153d4` by
+  `test_a_second_device_on_the_same_lower_device_is_refused_or_agrees`: device mapper opens a lower device for
+  all its devices with one holder, so a second table over the same device is taken. Each device keeps its own
+  cache, metadata and bitmap in RAM and writes them from there, so a chunk first written through one reads as
+  zeros through the other, and each overwrites the bitmap of the other. Fix: refuse a second device with the
+  UUID of a superblock already in use, from a list kept by the module.
+- **The rate limit of a message is shared by all devices.** Confirmed at `8a153d4` by
+  `test_a_flood_on_one_device_does_not_hide_the_errors_of_another`: the state of each limit is static at its
+  place in the code, so a failing device that floods the log hides the first errors of the others for the rest
+  of the interval of 5 s. Their counters and their event are not affected. Fix: the limits of the messages of I/O
+  in the context of each device.
 - **Nothing is measured by IMA.** By decision on 2026-11-16: `STATUSTYPE_IMA` gives nothing, so a table of the
   driver is measured without its fields. Fix, if IMA is used: the keys and values of the target, as other
   targets give them.
@@ -105,8 +156,8 @@ Moved to [TODO_OPTIMIZATION.md](TODO_OPTIMIZATION.md).
 2. **Runs.** Neighbouring chunks written back as one bio, as decided in D12 of `DECISIONS.md`. After the format,
    as it may change what a write back writes, and before the baseline, so that the cache is measured with them.
 3. **Baseline.** Formalize the benchmarks and take numbers on a non-debug kernel, for the commit before
-   the cache and for the cache, with the memory a load takes through the driver against the lower device:
-   on the debug kernel KASAN and kmemleak hold freed bios back, 100 to 535 MiB under `fio` with 1 MiB
+   the cache, `7337848`, and for the cache, with the memory a load takes through the driver against the lower
+   device: on the debug kernel KASAN and kmemleak hold freed bios back, 100 to 535 MiB under `fio` with 1 MiB
    requests, as device mapper makes a clone per 4 KiB.
 4. **Correction.** Settle the open questions of `ARCHITECTURE.md`, design the code and the format,
    implement recovery.

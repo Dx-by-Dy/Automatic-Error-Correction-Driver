@@ -2,7 +2,8 @@
 
 The situations of [ARCHITECTURE.md](ARCHITECTURE.md) as pictures, each with the tests that cover it. The terms are
 in the [glossary](ARCHITECTURE.md#glossary); the tests are described in [TESTS.md](TESTS.md), and live in
-[`tests/`](../../tests). `tools/check-docs.py` checks that every diagram here parses.
+[`tests/`](../../tests). `tools/check-docs.py` checks that every diagram here parses. What the driver does wrong
+today, each case a strict `xfail`, is drawn at the end, in [Cases that fail today](#cases-that-fail-today).
 
 ## The stack
 
@@ -73,7 +74,7 @@ flowchart TD
     start(["Constructor"]) --> read0["Read the superblock of group 0"]
     read0 --> valid0{"Valid?"}
     valid0 -- yes --> read1["Read group 1 at the size of a group it records"]
-    valid0 -- no --> probe["Probe the start of group 1 for every size, from 16 MiB to 4 GiB"]
+    valid0 -- no --> probe["Probe the start of group 1 for every size, from 16 MiB to 4 GiB: the first valid copy wins"]
     read1 --> pick{"Valid copies"}
     probe --> pick
     pick -- "none" --> refuse(["Refuse the table"])
@@ -89,6 +90,8 @@ Covered by [`test_superblock.py`](../../tests/test_superblock.py): `test_a_devic
 `test_a_device_of_another_size_is_refused`, `test_a_wrong_field_in_both_copies_is_refused`;
 [`test_target.py`](../../tests/test_target.py): `test_a_length_other_than_the_capacity_is_rejected`;
 [`test_bitmap.py`](../../tests/test_bitmap.py): `test_the_superblock_of_every_other_group_is_checked`.
+The probe takes a copy stored as data as well: [The probe takes a copy stored as
+data](#the-probe-takes-a-copy-stored-as-data).
 
 ## The write path
 
@@ -208,6 +211,10 @@ Covered by [`test_durability.py`](../../tests/test_durability.py) (all);
 `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write`, `test_a_second_copy_that_fails_to_write_is_counted`;
 [`test_crash.py`](../../tests/test_crash.py): `test_flushed_writes_survive_a_crash`.
 
+The same sync runs for a barrier, when half the metadata areas are busy, and on a suspend. If the first flush
+fails, the flushes from above fail and no trailing copy is written, but the chunks written back are forgotten as
+well: [A failed flush of the lower device](#a-failed-flush-of-the-lower-device).
+
 ## A crash between the two copies
 
 What a sector holds after a crash at each point of a write back of new data over old, and what reads.
@@ -228,7 +235,10 @@ stateDiagram-v2
 ```
 
 A crash in any state leaves each sector readable, as old or new. Not covered: a crash in the middle states
-together with a lost sector of the copy that matches.
+together with a lost sector of the copy that matches, which a later write of a neighbour makes permanent, see [A
+metadata sector rebuilt from one copy](#a-metadata-sector-rebuilt-from-one-copy). A crash after the flush from
+above and before the trailing copy leaves the state with the new data, and nothing moves it on before the next
+write back: [The trailing copy after a restart](#the-trailing-copy-after-a-restart).
 
 Covered by [`test_crash.py`](../../tests/test_crash.py): `test_a_write_cut_between_data_and_metadata_reads_old_or_new`,
 `test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each`, `test_ext4_survives_a_crash_after_each_fsync`,
@@ -274,7 +284,7 @@ flowchart TD
     start(["First resume: both copies of a block read"]) --> lv{"Leading copy valid? CRC from the salt, group, index, role"}
     lv -- yes --> both{"Trailing copy valid too?"}
     lv -- no --> tv{"Trailing copy valid?"}
-    both -- yes --> newer["Take the one with the larger generation"]
+    both -- yes --> newer["Take the one with the larger generation; the older stays on the device"]
     both -- no --> single["Take the leading one, repair the other with the next flush"]
     tv -- yes --> single2["Take the trailing one, repair the other with the next flush"]
     tv -- no --> ro["Read only range: chunks read as written, CRC decides, writes and discards fail"]
@@ -284,7 +294,9 @@ Covered by [`test_bitmap.py`](../../tests/test_bitmap.py): `test_one_damaged_cop
 `test_the_copy_with_the_larger_generation_is_taken`, `test_a_block_of_another_place_or_device_is_not_taken`,
 `test_a_block_invalid_in_both_copies_makes_its_range_read_only`, `test_a_discard_touching_a_read_only_block_fails_whole`,
 `test_a_reload_keeps_the_bits_the_old_table_sets`; [`test_lost_writes.py`](../../tests/test_lost_writes.py):
-`test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other`.
+`test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other`. What the older copy costs later: [An older
+copy of a block of the bitmap](#an-older-copy-of-a-block-of-the-bitmap); what a read only range gives for a chunk
+zeroed before: [A zeroed chunk in a read only range](#a-zeroed-chunk-in-a-read-only-range).
 
 ## Discard and its trap
 
@@ -356,14 +368,16 @@ flowchart LR
 
 Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py) (all);
 [`test_bitmap.py`](../../tests/test_bitmap.py): `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write`,
-`test_a_second_copy_that_fails_to_write_is_counted`.
+`test_a_second_copy_that_fails_to_write_is_counted`. A metadata sector failed in one copy after a crash: [A
+metadata sector rebuilt from one copy](#a-metadata-sector-rebuilt-from-one-copy); a failed flush: [A failed
+flush of the lower device](#a-failed-flush-of-the-lower-device).
 
 ## Every error is a signal
 
 ```mermaid
 flowchart LR
     err(["An error: a failed read, write back or flush, a CRC mismatch, metadata or bitmap"]) --> cnt["its counter in dmsetup status grows"]
-    err --> log["a line in the kernel log: the name from dmsetup, the logical sector; rate limited"]
+    err --> log["a line in the kernel log: the name from dmsetup, the logical sector; rate limited, one limit for all devices"]
     err --> first{"The first since the table was created?"}
     first -- yes --> ev["a work item raises a device mapper event"]
     ev --> wait["dmsetup wait, dmeventd: the user reads the counters and moves the data off"]
@@ -375,7 +389,9 @@ Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py):
 `test_a_failed_metadata_read_is_counted_in_sectors`, `test_a_failed_flush_is_counted`,
 `test_failed_write_is_reported`; [`test_corruption.py`](../../tests/test_corruption.py):
 `test_every_damaged_sector_of_a_read_is_counted_and_logged`,
-`test_a_flood_of_mismatches_is_counted_whole_and_logged_rate_limited`.
+`test_a_flood_of_mismatches_is_counted_whole_and_logged_rate_limited`. The limit of each place in the code is
+shared by all devices, so a flood on one hides the first errors of another for 5 s: strict `xfail`
+`test_a_flood_on_one_device_does_not_hide_the_errors_of_another`.
 
 ## Lost writes
 
@@ -388,6 +404,7 @@ flowchart TD
     a1 --> a2["After the flush: both copies hold the new CRC, the chunk fails"]
     what -- "data of a first write" --> b1["Fails at once: zeros below match neither copy, through the seed"]
     what -- "the leading metadata sector" --> c1["The trailing copy covers it, the next write back settles it"]
+    what -- "the trailing metadata sector, or a crash before it" --> t1["The old CRC stays until the next write back: the old data put back passes, for ever"]
     what -- "one copy of a bitmap block" --> d1["The other copy, of the newer generation, is taken"]
     what -- "data and both metadata copies" --> e1["The old data passes, for ever: the blind spot, for the parity of the correction stage"]
 ```
@@ -396,4 +413,130 @@ Covered by [`test_lost_writes.py`](../../tests/test_lost_writes.py) (all); the s
 [`test_corruption.py`](../../tests/test_corruption.py): `test_zeroed_chunk_is_detected`,
 `test_chunk_copied_elsewhere_is_detected`, `test_sectors_swapped_inside_a_chunk_with_their_crcs_are_detected`,
 `test_a_zeroed_region_with_its_chunks_written_is_detected`, `test_a_region_shifted_whole_with_its_metadata_is_detected`,
-`test_a_chunk_from_another_device_is_detected`.
+`test_a_chunk_from_another_device_is_detected`. The trailing sector lost is drawn in [The trailing copy after a
+restart](#the-trailing-copy-after-a-restart).
+
+## Cases that fail today
+
+Found by the review of `src/` on 2026-11-17, each pinned by a strict `xfail` with its item in [TODO.md](TODO.md);
+the diagram shows the path to the wrong result. A positive control of each test passes.
+
+### An older copy of a block of the bitmap
+
+```mermaid
+sequenceDiagram
+    participant Drv as Driver
+    participant L as Leading copy
+    participant T as Trailing copy
+    Note over L,T: generation 2 in both, with the bit of chunk A
+    Drv->>L: first write of chunk B, flush: generation 3 with A and B
+    Note over Drv,T: a crash before the second copy, or its write fails
+    Drv->>Drv: created again: both valid, the newer taken
+    Note over T: generation 2 without B, not marked to repair, so it stays
+    Note over L: later the leading copy is lost
+    Drv->>T: created again: only the trailing copy is valid
+    Drv->>Drv: chunk B reads as zeros, with no error
+    Drv->>L: the repair of the next flush writes generation 2 into both
+```
+
+Pinned by `test_an_older_copy_is_rewritten_before_the_newer_is_lost`: with a flush alone between, strict
+`xfail`; with a first write to another chunk of the block between, which rewrites both copies, it passes.
+
+### A zeroed chunk in a read only range
+
+```mermaid
+flowchart TD
+    w["Chunk written and flushed: data OLD, both copies of its CRCs those of OLD, bit set"] --> z["Discard or write zeroes: the bit cleared, nothing written below"]
+    z --> r1["Reads zeros"]
+    r1 --> lost["Both copies of its block of the bitmap become invalid"]
+    lost --> ro["Read only range: every chunk read as written, the CRC decides"]
+    ro --> wrong["OLD below matches its old CRCs: OLD returned with no error, where zeros or an error are right"]
+```
+
+Pinned by `test_a_zeroed_chunk_in_a_read_only_block_never_reads_its_old_data`, for discard and write zeroes.
+
+### A metadata sector rebuilt from one copy
+
+```mermaid
+flowchart TD
+    crash["After a crash in a write back: chunk Y has data NEW, leading NEW, trailing OLD"] --> fail["The leading sector of Y fails to read"]
+    fail --> fill["Loaded: the leading copy in RAM filled from the trailing one, Y has OLD in both"]
+    fill --> eio1["Y fails: a crash with a lost sector of the copy that matches, by decision"]
+    fill --> neigh["Chunk X of the same metadata sector written back"]
+    neigh --> wr["The whole leading sector written from RAM: Y gets OLD on the device too"]
+    wr --> heal["The sector reads again"]
+    heal --> eio2["Y still fails, for good: data NEW, both copies OLD"]
+```
+
+The mirror case: a crash before the data leaves data OLD, leading NEW, trailing OLD; the trailing sector fails, is
+filled with NEW, and the next sync writes NEW over it. Pinned by
+`test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`, both cases strict `xfail`; with the copies
+equal, the positive control, Y reads.
+
+### The trailing copy after a restart
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    apart: data NEW, leading NEW, trailing OLD
+    read: created again, NEW reads, flushes change nothing
+    back: the drive gives OLD back
+    passes: OLD matches the trailing copy, read with no error
+    [*] --> apart: crash after the flush from above, before the trailing copy, or the trailing write lost
+    apart --> read
+    read --> back: a write lost from the cache of the drive
+    back --> passes
+    note right of read: nothing settles a chunk before its next write back
+```
+
+Pinned by `test_old_data_put_back_fails_once_the_new_was_read`: with the trailing copy lost, strict `xfail`; with
+both copies written, the old data put back fails its CRC.
+
+### A failed flush of the lower device
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant M as Metadata in RAM
+    participant Low as Lower device
+    W->>Low: write back of chunk A, version 2: leading copy with FUA, then the data
+    W->>M: A written since the flush, its area pinned
+    W->>Low: flush
+    Low-->>W: fails
+    W->>M: every area unpinned: A no longer counts as written
+    Note over Low: version 2 may not be durable, the trailing copy holds version 1
+    W->>W: next write back of A, version 3, with no barrier
+    W->>Low: settle reads A and may get version 2 from the cache of the drive
+    W->>Low: the trailing copy takes version 2 with FUA, then leading version 3 and the data
+    Note over Low: after a crash the drive may hold version 1, which matches neither copy
+```
+
+Pinned by `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier`: with the failed flush between
+the two write backs, no barrier, strict `xfail`; with no flush between, one barrier.
+
+### The probe takes a copy stored as data
+
+```mermaid
+flowchart TD
+    fmt["Formatted with groups of 32 MiB: group 1 starts at 32 MiB"] --> img["The image of a superblock of group 1 for groups of 16 MiB stored as data, at 16 MiB, inside group 0"]
+    img --> dmg["Group 0 damaged"]
+    dmg --> p16["The probe tries 16 MiB first: the image is valid for that place"]
+    p16 --> wrong["The layout of 16 MiB taken"]
+    wrong --> refused["The table length is not its capacity: refused"]
+    p16 -. "never read" .-> truecopy["The true copy at 32 MiB"]
+```
+
+Pinned by `test_a_superblock_stored_as_data_does_not_win_the_probe`. With a table for the layout of the image the
+device would come up over the wrong layout.
+
+### Two devices on one lower device
+
+```mermaid
+flowchart LR
+    a["Device A: its cache, metadata and bitmap in RAM"] -- "first write of chunk C, flush: the bit set" --> low[("One lower device")]
+    b["Device B: its bitmap read at its own resume, before"] -- "read of C" --> zeros["no bit for C in RAM: zeros, with no lower read and no error"]
+    a -. "each writes its own bitmap over the other" .- b
+```
+
+Pinned by `test_a_second_device_on_the_same_lower_device_is_refused_or_agrees`: device mapper takes the second
+table, so the second device reads zeros where the first wrote.

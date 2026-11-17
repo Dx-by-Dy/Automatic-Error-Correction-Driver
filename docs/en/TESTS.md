@@ -1,6 +1,6 @@
 # Driver tests
 
-368 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+385 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [DEPLOY.md](DEPLOY.md), why the tests work this way in
 [D1](DECISIONS.md#d1-tests-run-in-a-vm-crashes-are-replayed-from-a-log).
 
@@ -9,8 +9,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 368 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 327 tests
+deploy/vm.sh test                                     # all 385 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 344 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -94,7 +94,8 @@ A `-m` given to pytest replaces the default one, so `-m known_hang` runs those.
 
 **Known bugs.** A test for a known bug is a strict `xfail`, with the title of its `TODO.md` item as the
 reason: when the bug is fixed the test fails until the mark is removed. A bug that hangs the guest
-cannot be `xfail`, as it would end the run, so it gets `known_hang`. None of either is left since stage 5.
+cannot be `xfail`, as it would end the run, so it gets `known_hang`. Eleven cases of eight tests are strict `xfail`,
+added on 2026-11-17 with their items; none is `known_hang`.
 
 ## What is tested
 
@@ -147,7 +148,7 @@ metadata, happen every time.
 | `test_the_write_backs_of_chunks_sharing_a_metadata_sector_wait_for_its_metadata` | 1 | Metadata delayed: a sector of the chunk and the whole next chunk, whose entries share the sector: after the flush both read |
 | `test_a_read_of_a_clean_sector_waits_for_the_write_back` | 1 | Metadata delayed: a read of sector 5 while sector 1 is written back waits for it, counted in `read_waits`, and reads the old data |
 
-### `test_corruption.py`: damage is detected, and only where it is (46 tests)
+### `test_corruption.py`: damage is detected, and only where it is (48 tests)
 
 Three chunks are written, whose entries share one metadata sector, and the damage is done to the middle one.
 A read accepts a CRC from either copy of the metadata, so damage to metadata is done to both, but where a test
@@ -179,6 +180,7 @@ says one copy.
 | `test_a_chunk_from_another_device_is_detected` | 1 | The same data written in the same place on the device formatted again, then the metadata sectors of the old format put back: the chunk fails. Before that, the new device reads, as a control |
 | `test_every_damaged_sector_of_a_read_is_counted_and_logged` | 1 | Three sectors of the chunk damaged, the chunk read whole: `crc_mismatches` grows by 3, and the log names the device as `dmsetup` does, the logical sector of the read and of its first damaged sector |
 | `test_a_flood_of_mismatches_is_counted_whole_and_logged_rate_limited` | 1 | 80 chunks with a damaged sector each, read one after another: `crc_mismatches` grows by 80, the log has at most 20 lines of them |
+| `test_a_flood_on_one_device_does_not_hide_the_errors_of_another` | 2 | Two devices: a mismatch on the second is logged with its name; after a flood of mismatches on the first in the same 5 s it is not, a strict `xfail` |
 
 All but the model test passed before the seed: zeros with zero metadata and a CRC that does not depend on the
 place or the device. Each of the 7 failed on the driver of step 2, on its check of detection.
@@ -220,7 +222,7 @@ is started again from the state of a replay, and the entries of both run in a ro
 | `test_a_write_after_a_discard_cut_anywhere_reads_zeros_or_new` | 1 | The trap of a discard: a first crash after the data leaves copies of the metadata that differ; then the chunk is discarded and one sector written back by age: one barrier, no read to settle, and a second crash at every entry leaves what the first left, zeros, or the sector with zeros around it. Without the sync before that write back, the first entry already leaves a chunk that does not read |
 | `test_ext4_survives_a_crash_at_any_flush` | 1 | `slow`: the same at every flush after `mkfs`, and at every fourth FUA write: each write back writes its leading metadata sector with FUA, about 270 points besides 60 flushes, too many to check all in 10 minutes. Before the cache it failed at once, as ext4 writes its superblock, part of a chunk, with FUA |
 
-### `test_bitmap.py`: the bitmap of written chunks (24 tests)
+### `test_bitmap.py`: the bitmap of written chunks (30 tests)
 
 Groups of 16 MiB, one block of the bitmap each, on 48 MiB of random data, three groups.
 
@@ -232,8 +234,10 @@ Groups of 16 MiB, one block of the bitmap each, on 48 MiB of random data, three 
 | `test_a_reload_keeps_the_bits_the_old_table_sets` | 2 | A chunk written, still in the cache or written back by age, then `dmsetup reload` and `resume`: the chunk reads under the new table, and a sector written there keeps the rest of the chunk after the target is created again. It failed with the bitmap read in the constructor |
 | `test_one_damaged_copy_is_covered_and_repaired` | 4 | The leading or the trailing copy damaged: the chunk reads, `single_blocks` 1 and a warning; a flush rewrites the copy with the generation and the bits of the other; with a read only table it stays damaged |
 | `test_the_copy_with_the_larger_generation_is_taken` | 2 | One copy put back to an older valid version: the chunk of the newer reads |
+| `test_an_older_copy_is_rewritten_before_the_newer_is_lost` | 4 | One copy put back to an older valid version, then a flush, then the newer copy damaged: after a first write to another chunk of the block the chunk of the newer reads; after a flush alone it reads as zeros, a strict `xfail` |
 | `test_a_block_of_another_place_or_device_is_not_taken` | 5 | The leading copy with another group, index or role, or a CRC from another salt, all with generation 100 and no bits: not taken, the chunk reads from the trailing copy. The same copy with nothing wrong is taken, and the chunk then reads as zeros: the positive control |
 | `test_a_block_invalid_in_both_copies_makes_its_range_read_only` | 1 | Both copies damaged: a warning, `read_only_blocks` 1; a written chunk reads, one never written fails its CRC, a write there fails and is counted; group 1 is written and read; the damaged copies are never written |
+| `test_a_zeroed_chunk_in_a_read_only_block_never_reads_its_old_data` | 2 | Strict `xfail`: a chunk discarded, or zeroed by write zeroes, and flushed reads zeros; with its block then invalid in both copies it reads its old data, where an error or zeros would be right |
 | `test_a_discard_touching_a_read_only_block_fails_whole` | 1 | A discard across the end of group 0, whose block is invalid in both copies, into group 1: it fails, is counted in `refused_writes`, and the chunks of group 1 keep their data |
 | `test_the_superblock_of_every_other_group_is_checked` | 4 | The superblock of group 2 zeroed, of another device or of another generation: the device is created, `bad_superblocks` 1 and the reason in the log; unchanged, 0 |
 | `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write` | 1 | Over `dm-dust` failing one write of the leading copy: the flush fails, the error is counted, no copy has the bit; the next flush writes both, and the chunk reads after the target is created again |
@@ -262,7 +266,7 @@ write zeroes go from sector 3 of the chunk before it to sector 5 of the chunk af
 | `test_blkdiscard_z_zeroes_through_write_zeroes` | 1 | `blkdiscard -z` of the range: zeros, and the whole chunks read without a lower read, which ordinary writes of zeros would not give |
 | `test_write_zeroes_inside_one_chunk_zeroes_only_its_sectors` | 1 | Sectors 2 to 4 of a chunk: only they read as zeros, before and after the target is created again |
 
-### `test_lost_writes.py`: writes acknowledged and lost (7 tests)
+### `test_lost_writes.py`: writes acknowledged and lost (9 tests)
 
 Three chunks written and flushed. The faulty layer is loaded after a write from above and before its write
 back by age, dropping writes to the data slot of the chunk, a copy of its metadata sector or a copy of the
@@ -275,8 +279,9 @@ block of the bitmap, then `linear` again; each test checks on the lower device t
 | `test_a_lost_leading_copy_is_covered_by_the_trailing_one` | 1 | The leading metadata sector dropped: the new data reads before and after the flush and a recreation, the copies differ on the device; the next write back reads the chunk to settle it, with no mismatch, and the copies are equal again |
 | `test_data_lost_with_both_copies_of_its_metadata_passes_as_old` | 1 | The blind spot, pinned: the data and both metadata sectors dropped through the flush: the old data reads without an error. Its control is the rewrite test, which differs only in the trailing copy |
 | `test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other` | 2 | A first write whose leading or trailing copy of the block is dropped: that copy keeps its old generation, and the chunk reads after the target is created again |
+| `test_old_data_put_back_fails_once_the_new_was_read` | 2 | A rewrite flushed, the target created again, the new data read and flushed, then the old data put back in its slot: it fails with both copies written; with the trailing copy lost it passes, a strict `xfail` |
 
-### `test_lower_errors.py`: the lower device fails (22 tests)
+### `test_lower_errors.py`: the lower device fails (27 tests)
 
 `dm-dust` with 512-byte blocks fails reads of chosen sectors of the lower device, and writes to them a
 chosen number of times; a write to such a sector clears it. One test loads `dm-flakey` in its place.
@@ -293,6 +298,7 @@ goes on.
 | `test_failed_metadata_sector_fails_only_the_chunks_it_covers` | 1 | Metadata dropped from RAM first: every sector of the 8 chunks of that metadata sector fails, the other 8 chunks read, as the failed read of the area is retried one sector at a time |
 | `test_metadata_sector_failed_in_one_copy_fails_nothing_and_warns` | 2 | Metadata dropped from RAM first. The leading or the trailing sector fails: everything reads, with a warning that the chunk is read with one copy; a write of the chunk warns too and rewrites both copies, equal on the lower device, and after the metadata is read again no warning is left |
 | `test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy` | 1 | On 34 regions, so that the area of region 0 is read into one that held another region: the leading sector fails, a write of one chunk there makes it equal to the trailing one, and every chunk reads back |
+| `test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable` | 3 | A chunk rewritten, then the copy that holds the CRC of its data fails to read, a neighbour is written and the sector healed: with the copies equal the chunk reads; with them left as a crash after the data or before it leaves them, it fails for good, a strict `xfail` |
 | `test_failed_trailing_write_is_counted_and_warned` | 1 | The trailing sector fails to write once: the write and its flush succeed, `trail_errors` is 1, a read warns about one copy; the next write of the chunk restores the copy |
 | `test_device_works_again_once_the_sector_reads` | 1 | Metadata dropped from RAM first. A failed data and metadata sector, then cleared: everything reads back, no error state stays in the driver, an area that failed to read is not kept |
 | `test_write_fails_when_its_metadata_sector_does_not_read` | 3 | Metadata dropped from RAM first. A whole chunk, one sector, and a whole neighbouring chunk with its entry in the same sector: the write or its flush fails with `EIO`, as the sector holds the entries it has to keep; the other chunks read. What the chunk holds after it is open |
@@ -302,6 +308,7 @@ goes on.
 | `test_a_failed_read_is_counted_and_logged_with_the_device` | 1 | A failed data sector read alone: `read_errors` grows by 1, and the log names the device as `dmsetup` does and the logical sector |
 | `test_a_failed_metadata_read_is_counted_in_sectors` | 1 | Three sectors of the leading copy fail, metadata dropped from RAM: everything reads, and `metadata_read_errors` grows by a multiple of 3, as each read of the area counts each sector; udev reads it a number of times not known |
 | `test_a_failed_flush_is_counted` | 1 | `dm-flakey` with `error_writes` and nothing to write back: the flush from above fails, `flush_errors` grows by 1 and `write_errors` not; with `dm-linear` back the flush succeeds |
+| `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier` | 2 | A chunk written back by age twice: one barrier with no flush between; with a failed flush between, none, a strict `xfail` |
 | `test_the_first_error_raises_one_device_mapper_event` | 1 | A failed read: `dmsetup wait` sees one event; three more failed reads raise none |
 | `test_write_zeroes_is_not_offered_over_a_lower_device_without_it` | 1 | `dm-dust` has no write zeroes, nor then has the driver; `BLKZEROOUT` zeroes with ordinary writes, so after a flush the chunks read from the lower device |
 
@@ -343,7 +350,7 @@ are not checked. The
 tables of the device are small enough for `kmalloc`, so `/proc/vmallocinfo` does not show them; it showed the
 lock table, which is gone.
 
-### `test_target.py`: arguments, table and limits of the target (11 tests)
+### `test_target.py`: arguments, table and limits of the target (12 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
@@ -353,10 +360,11 @@ lock table, which is gone.
 | `test_table_shows_the_lower_device` | 1 | `dmsetup table` gives the lower device as major:minor, as every target. It was a strict `xfail` until stage 5 |
 | `test_the_table_loads_again_as_dmsetup_gives_it` | 1 | The line of `dmsetup table`, saved, creates the device again on the same data |
 | `test_target_may_start_after_sector_0` | 1 | With a table that puts the target after sector 0, its first sector lands on sector 0 of the lower device |
+| `test_a_second_device_on_the_same_lower_device_is_refused_or_agrees` | 1 | Strict `xfail`: a second device over the same lower device is taken, and reads zeros where the first wrote and flushed |
 | `test_the_limits_are_those_of_a_chunk_over_the_lower_device` | 1 | In sysfs: logical block 512, physical block and minimal I/O 4096, no optimal I/O, `max_hw_sectors_kb` of the lower device, no polling, no stable pages |
 | `test_a_lower_device_with_4k_logical_blocks_is_refused` | 1 | An image formatted and loaded over a loop device with sectors of 512 bytes, as a control, is refused over one with sectors of 4096, and the log says why |
 
-### `test_superblock.py`: the superblock and `dcorrsetup` (78 tests)
+### `test_superblock.py`: the superblock and `dcorrsetup` (79 tests)
 
 The superblock is also built by hand, with the layout and `crc64_be` of `harness.py`, so that the driver is
 seen to take one made apart from `dcorrsetup` and to refuse each field that is wrong. The reasons are read from
@@ -374,6 +382,7 @@ the kernel log. The device is two groups of 16 MiB unless said otherwise.
 | `test_one_damaged_copy_is_covered_by_the_other` | 2 | Group 0 or group 1 zeroed: the device comes up from the other with a warning, and the data written before in both groups reads |
 | `test_group_1_is_found_for_each_size_when_group_0_is_damaged` | 4 | Groups of 16, 32, 64 MiB and 1 GiB, group 0 zeroed: the probe finds group 1 at its size, past the smaller sizes inside group 0, and the data reads |
 | `test_a_format_with_larger_groups_wipes_group_1_of_the_smaller_sizes` | 1 | Formatted with 16 MiB, then with 32 MiB: the old copy of group 1 is zeroed and the probe finds the new one; the positive control: with the old copy put back, the probe takes it |
+| `test_a_superblock_stored_as_data_does_not_win_the_probe` | 1 | Strict `xfail`: groups of 32 MiB, the image of a superblock of group 1 for groups of 16 MiB written through the driver at its place, group 0 damaged: the probe takes the image and the device is refused |
 | `test_both_damaged_copies_are_refused` | 1 | Both copies zeroed |
 | `test_the_copy_with_the_larger_generation_is_taken` | 2 | Generation 2 in group 0 or in group 1 |
 | `test_copies_that_differ_in_the_same_generation_warn` | 2 | Another salt or UUID in group 1: a warning, group 0 taken |

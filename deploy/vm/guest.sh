@@ -12,7 +12,8 @@ guest_reinit() {
     cd "$TREE"
 
     # The test devices stay behind when a test run was cut short.
-    for device in dcorr dcorr-test dcorr-test-log dcorr-test-faulty dcorr-test-logdev dcorr-test-lower; do
+    for device in dcorr dcorr-test dcorr-test-other dcorr-test-log dcorr-test-faulty dcorr-test-logdev dcorr-test-lower \
+        dcorr-test-other-lower; do
         if dmsetup info "$device" >/dev/null 2>&1; then
             dmsetup remove "$device"
         fi

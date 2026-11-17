@@ -345,6 +345,42 @@ def test_a_format_with_larger_groups_wipes_group_1_of_the_smaller_sizes(lowers):
     assert logged(messages, f"groups of {16 * 2048} sectors"), messages
 
 
+@pytest.mark.xfail(strict=True, reason="A stale copy of group 1 in the data can win the probe")
+def test_a_superblock_stored_as_data_does_not_win_the_probe(lowers):
+    """Formatted with groups of 32 MiB, the start of group 1 for groups of 16 MiB lies in the data of group 0.
+    A superblock stored there as data, the image of one for this device with groups of 16 MiB, as a dump of the
+    lower device kept on it would hold, is valid for that place: with group 0 damaged the probe takes it, and
+    the device is refused, its length not that of the layout it gives, though group 1 at its own place is
+    valid. The probe has to prefer the copy that agrees with the other groups.
+
+    test_a_format_with_larger_groups_wipes_group_1_of_the_smaller_sizes shows that the probe takes such a copy
+    written to the lower device; here it is written through the driver, and dcorrsetup cannot wipe it.
+    """
+    group_sectors = 32 * 2048
+    lower = lowers(64 * 2048, group_sectors=group_sectors)
+    place = 16 * 2048
+    logical = next(
+        sector for sector in range(0, lower.layout.group_capacity, DATA_SECTORS)
+        if physical_sector(sector, lower.sectors, group_sectors) == place
+    )
+    image = lower.superblock(1)
+    small = layout(lower.sectors, 16 * 2048)
+    for name in LAYOUT_FIELDS:
+        set_field(image, name, getattr(small, name))
+    struct.pack_into("<Q", image, CRC_OFFSET, superblock_crc(image))
+    assert create(lower.path, lower.sectors, group_sectors=group_sectors).returncode == 0
+    writes = [(0, pattern("first", DATA_SECTORS)), (logical, bytes(image))]
+    write_and_flush(f"/dev/mapper/{UPPER_NAME}", writes)
+    dmsetup_remove(UPPER_NAME)
+    assert lower.read(place, SUPERBLOCK_SECTORS) == image, "the image is not at the start of group 1 of 16 MiB"
+
+    lower.damage(0)
+    taken, messages = created(lower)
+    assert taken, messages
+    assert logged(messages, f"superblock of group 1, generation 1, groups of {group_sectors} sectors"), messages
+    read_back(f"/dev/mapper/{UPPER_NAME}", writes)
+
+
 def test_both_damaged_copies_are_refused(lowers):
     lower = lowers()
     lower.damage(0)

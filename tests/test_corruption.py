@@ -7,10 +7,11 @@ CRC from either, so damage to metadata is detected only when it is in both.
 
 import errno
 import struct
+import time
 
 import pytest
 
-from conftest import UPPER_NAME, device_status, dmsetup_remove, kernel_messages, warned
+from conftest import OTHER_NAME, UPPER_NAME, device_status, dmsetup_remove, kernel_messages, warned
 from harness import (
     CRC_SIZE,
     DATA_SECTORS,
@@ -371,3 +372,42 @@ def test_a_flood_of_mismatches_is_counted_whole_and_logged_rate_limited(stack):
     assert device_status()["crc_mismatches"] == mismatches + chunks
     logged = [message for message in messages if "CRC mismatch" in message]
     assert len(logged) <= 2 * RATELIMIT_BURST, f"{len(logged)} messages for {chunks} damaged reads"
+
+
+# DEFAULT_RATELIMIT_INTERVAL of the kernel, with a margin: a new interval starts after it.
+RATELIMIT_SECONDS = 5.5
+
+
+@pytest.mark.parametrize(
+    "flood",
+    [
+        "none",
+        pytest.param(
+            "on the other device",
+            marks=pytest.mark.xfail(strict=True, reason="The rate limit of a message is shared by all devices"),
+        ),
+    ],
+)
+def test_a_flood_on_one_device_does_not_hide_the_errors_of_another(stack, other_stack, flood):
+    """The messages are rate limited for each place in the code, and the state is static, so a failing device
+    that floods the log hides the first error of a healthy one for the rest of the interval. The name of the
+    device is in each message so that the user can tell them apart; each device needs a limit of its own.
+
+    "none" is the positive control: with no flood the mismatch of the second device is logged.
+    """
+    chunks = 2 * RATELIMIT_BURST
+    stack.upper.write(0, pattern("flood", chunks * DATA_SECTORS))
+    stack.upper.flush_settled()
+    for chunk in range(chunks):
+        stack.lower.flip_bit(physical_sector(chunk * DATA_SECTORS, stack.lower_sectors), byte=0, bit=0)
+    other_stack.upper.write(0, pattern("other", DATA_SECTORS))
+    other_stack.upper.flush_settled()
+    other_stack.lower.flip_bit(physical_sector(0, other_stack.lower_sectors), byte=0, bit=0)
+
+    time.sleep(RATELIMIT_SECONDS)
+    with kernel_messages() as messages:
+        if flood != "none":
+            for chunk in range(chunks):
+                assert_read_fails(stack.upper, chunk * DATA_SECTORS, DATA_SECTORS)
+        assert_read_fails(other_stack.upper, 0, DATA_SECTORS)
+    assert any(f"dcorr {OTHER_NAME} [check_crc]: CRC mismatch" in message for message in messages), messages

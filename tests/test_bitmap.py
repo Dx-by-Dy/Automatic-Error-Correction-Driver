@@ -279,6 +279,70 @@ def test_the_copy_with_the_larger_generation_is_taken(device, older):
     assert device.upper.read(second, DATA_SECTORS) == pattern("second", DATA_SECTORS)
 
 
+@pytest.mark.parametrize("older", ROLES)
+@pytest.mark.parametrize(
+    "then",
+    [
+        "a new bit",
+        pytest.param(
+            "a flush alone",
+            marks=pytest.mark.xfail(strict=True, reason="An older copy of a block of the bitmap stays on the device"),
+        ),
+    ],
+)
+def test_an_older_copy_is_rewritten_before_the_newer_is_lost(device, older, then):
+    """Of two valid copies the newer is taken, but the older stays on the device until the block changes:
+    once the newer copy is lost, the older one alone reads the chunks written in between as zeros, with no
+    error. A block found with one valid copy is repaired by the next flush; one with an older copy has to be
+    as well.
+
+    "a new bit" is the positive control: a first write to another chunk of the block changes it, so the
+    flush writes both copies, and the chunk survives the loss of the newer one.
+    """
+    first, second, third = 3 * DATA_SECTORS, 4 * DATA_SECTORS, 5 * DATA_SECTORS
+    flushed(device, [(first, pattern("first", DATA_SECTORS))])
+    stale = device.block(0, ROLES[older])
+    flushed(device, [(second, pattern("second", DATA_SECTORS))])
+    device.remove()
+    device.write_block(0, ROLES[older], stale.pack())
+    device.create()
+    flushed(device, [(third, pattern("third", DATA_SECTORS))] if then == "a new bit" else [])
+    device.remove()
+    device.damage_block(0, BITMAP_TRAIL if older == "leading" else BITMAP_LEAD)
+    device.create()
+    assert device_status()["single_blocks"] == 1
+    assert device.upper.read(second, DATA_SECTORS) == pattern("second", DATA_SECTORS), "read as zeros"
+
+
+@pytest.mark.xfail(strict=True, reason="A zeroed chunk in a read only range reads its old data")
+@pytest.mark.parametrize("how", ["discard", "write zeroes"])
+def test_a_zeroed_chunk_in_a_read_only_block_never_reads_its_old_data(device, how):
+    """A discard or a write zeroes leaves the old data and its CRCs below, and only the bit says the chunk
+    reads as zeros. In a block invalid in both copies every chunk is read as written and the CRC decides, and
+    the old data passes it. An error would be right, or zeros; the old contents of a zeroed range are not.
+
+    The positive control is a chunk never written in the same range, which fails its CRC there, see
+    test_a_block_invalid_in_both_copies_makes_its_range_read_only; here the chunk reads as zeros before.
+    """
+    start = 3 * DATA_SECTORS
+    old = pattern("old", DATA_SECTORS)
+    flushed(device, [(start, old)])
+    if how == "discard":
+        device.upper.discard(start, DATA_SECTORS)
+    else:
+        device.upper.zeroout(start, DATA_SECTORS)
+    device.upper.flush_settled()
+    assert device.upper.read(start, DATA_SECTORS) == bytes(DATA_SECTORS * SECTOR_SIZE)
+    device.remove()
+    for role in ROLES.values():
+        device.damage_block(0, role)
+    device.create()
+    assert device_status()["read_only_blocks"] == 1
+    if read_fails(device, start):
+        return
+    assert device.upper.read(start, DATA_SECTORS) != old, "the old data of a zeroed chunk read back"
+
+
 # A copy of the leading block of group 0 with one thing wrong, its CRC right otherwise, and a generation
 # that would win.
 WRONG_PLACES = {

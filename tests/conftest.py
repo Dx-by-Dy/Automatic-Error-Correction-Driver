@@ -26,8 +26,12 @@ LOG_NAME = "dcorr-test-log"
 LOG_DEVICE_NAME = "dcorr-test-logdev"
 # The tests of lower device errors put dm-dust or dm-flakey there.
 FAULTY_NAME = "dcorr-test-faulty"
+# The tests that need a second device of the driver: its name, and its own lower device further on the disk.
+OTHER_NAME = "dcorr-test-other"
+OTHER_LOWER_NAME = "dcorr-test-other-lower"
+OTHER_LOWER_OFFSET_MIB = 128
 # Removed in this order, the devices on top first.
-TEST_DEVICES = (UPPER_NAME, LOG_NAME, FAULTY_NAME, LOG_DEVICE_NAME, LOWER_NAME)
+TEST_DEVICES = (UPPER_NAME, OTHER_NAME, LOG_NAME, FAULTY_NAME, LOG_DEVICE_NAME, LOWER_NAME, OTHER_LOWER_NAME)
 DEFAULT_LOWER_MIB = 32  # two groups of 16 MiB, the size harness.py formats with
 
 HUNG_TASK_SECONDS = 30
@@ -347,3 +351,19 @@ def make_stack():
 @pytest.fixture
 def stack(make_stack):
     return make_stack()
+
+
+@pytest.fixture
+def other_stack():
+    """A second device of the driver, OTHER_NAME, on a lower device of its own further on the test disk."""
+    sectors = DEFAULT_LOWER_MIB * 2048
+    lower_path = make_lower(sectors, name=OTHER_LOWER_NAME, offset_mib=OTHER_LOWER_OFFSET_MIB)
+    format_device(lower_path)
+    table = f"0 {capacity(sectors)} dcorr {lower_path}\n"
+    run("dmsetup", "create", OTHER_NAME, stdin=table)
+    other = Stack(sectors, lower_path, f"/dev/mapper/{OTHER_NAME}", table)
+    other.open()
+    yield other
+    other.close()
+    dmsetup_remove(OTHER_NAME)
+    dmsetup_remove(OTHER_LOWER_NAME)
