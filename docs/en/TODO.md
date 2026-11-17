@@ -77,21 +77,15 @@ in a run, **From reading** means it was only found in the code.
 
 ## Device Mapper integration
 
-- **`dmsetup status` has no counters of errors.** Counters such as CRC mismatches do not exist yet; step 3b of
-  stage 5.
 - **Nothing is measured by IMA.** By decision on 2026-11-16: `STATUSTYPE_IMA` gives nothing, so a table of the
   driver is measured without its fields. Fix, if IMA is used: the keys and values of the target, as other
   targets give them.
 - **Queue limits are not inherited.** From reading: there is no `.iterate_devices`; `.io_hints` sets only the
   limits of discard. A lower device with 4K logical blocks is not rejected, although metadata is written
   as single 512-byte sectors. Write zeroes waits for `.iterate_devices` too, see above.
-- **Nothing warns the user of a failing drive.** By decision of the threat model: the first error is a strong sign
-  that a drive is failing, but today it is only a line in the kernel log. Fix: counters of errors and
-  mismatches in `dmsetup status` and a device mapper event at the first one. An idea of the user, to think over:
-  a daemon that reads SMART and the counters of the driver and warns.
-- **Mismatch logging has no rate limit.** From reading: each failed read prints a line with
-  `pr_err`, so a reader in a loop can flood the log. The line also gives the physical sector,
-  and nothing identifies the device.
+- **Nothing tells the user in person of a failing drive.** By decision (D22): the driver counts the errors and
+  raises a device mapper event at the first one, but something has to wait for it. An idea of the user, to think
+  over: a daemon that reads SMART and the counters of the driver and warns.
 
 ## Correction
 

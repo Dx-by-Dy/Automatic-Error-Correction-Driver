@@ -19,7 +19,9 @@ struct superblock_info
     u64 generation;
 };
 
-int superblock_read(struct block_device *bdev, struct superblock_info *info, char **error);
+struct dm_target;
+
+int superblock_read(struct dm_target *ti, struct block_device *bdev, struct superblock_info *info);
 const char *superblock_verify(const struct dcorr_superblock *sb, unsigned int group,
                               const struct superblock_info *info);
 

@@ -338,6 +338,25 @@ Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py) (all);
 [`test_bitmap.py`](../../tests/test_bitmap.py): `test_a_flush_fails_when_the_first_copy_of_a_block_fails_to_write`,
 `test_a_second_copy_that_fails_to_write_is_counted`.
 
+## Every error is a signal
+
+```mermaid
+flowchart LR
+    err(["An error: a failed read, write back or flush, a CRC mismatch, metadata or bitmap"]) --> cnt["its counter in dmsetup status grows"]
+    err --> log["a line in the kernel log: the name from dmsetup, the logical sector; rate limited"]
+    err --> first{"The first since the table was created?"}
+    first -- yes --> ev["a work item raises a device mapper event"]
+    ev --> wait["dmsetup wait, dmeventd: the user reads the counters and moves the data off"]
+    first -- no --> none["no event"]
+```
+
+Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py):
+`test_the_first_error_raises_one_device_mapper_event`, `test_a_failed_read_is_counted_and_logged_with_the_device`,
+`test_a_failed_metadata_read_is_counted_in_sectors`, `test_a_failed_flush_is_counted`,
+`test_failed_write_is_reported`; [`test_corruption.py`](../../tests/test_corruption.py):
+`test_every_damaged_sector_of_a_read_is_counted_and_logged`,
+`test_a_flood_of_mismatches_is_counted_whole_and_logged_rate_limited`.
+
 ## Lost writes
 
 A write acknowledged by the lower device and never on its medium.

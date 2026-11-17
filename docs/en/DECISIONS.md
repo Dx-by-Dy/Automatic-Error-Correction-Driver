@@ -28,6 +28,7 @@ decisions stay here for their reasoning. "The user" is the author of the project
 | [D19](#d19-the-seed-salt-logical-sector-data) | 2026-11-15, 11-16 | The seed: salt, logical sector, data | In force |
 | [D20](#d20-discard-through-the-bitmap) | 2026-11-16 | Discard through the bitmap; no write zeroes yet | In force |
 | [D21](#d21-device-mapper-integration-and-docs-before-runs) | 2026-11-16 | Device mapper integration and docs before runs | In force |
+| [D22](#d22-errors-as-a-signal-counters-one-event-the-name-of-the-device) | 2026-11-16 | Errors as a signal: counters, one event, the name of the device | In force |
 
 ## D1. Tests run in a VM; crashes are replayed from a log
 
@@ -403,3 +404,33 @@ the choice of the user; no write zeroes until `iterate_devices`, in the stage of
 baseline (D12).
 
 **Why.** The documentation describes the driver as it is now, and the interface is what a user of it sees first.
+
+## D22. Errors as a signal: counters, one event, the name of the device
+
+**Why a choice was needed.** By the threat model (D13) the first error is a strong sign that a drive is failing,
+and the purpose of the driver is to keep the data readable long enough to move it. Until stage 5 an error was only
+a line in the kernel log, with no rate limit for a mismatch, the physical sector and no name of the device.
+
+**Options.** For the shape of the status: positional counters appended, or `key:value` pairs. For the event: at
+every error, at the first one, or at the first of each kind. For the name in the log: major:minor, as
+`dm_table_device_name` gives it and `dm-verity` prints it, or the name of `dmsetup`. For a mismatch: count reads
+or sectors.
+
+**Chosen**, on 2026-11-16, the choices of the user: five counters appended to the positional status
+(`read_errors`, `crc_mismatches` in sectors, `write_errors`, `metadata_read_errors` in sectors, `flush_errors`),
+more later if needed; a device mapper event at the first error since the table was created, of any kind; the
+name the user knows, from `dmsetup`, in every message of a device, with the logical sector; every message that
+I/O can repeat rate limited.
+
+**Why.**
+
+- Positional counters are what other targets give, and `key:value` pairs are a convention of table arguments,
+  not needed now; a new counter goes at the end, so readers by position keep working.
+- One event is enough to wake `dmsetup wait` or `dmeventd`, which then read the counters; an event per error
+  would keep them busy while a failing drive floods the driver with errors. A new table starts over.
+- `check_crc` checks every sector of a read, so `crc_mismatches` counts damaged sectors: the size of the damage,
+  not how often it was read.
+- `dm_copy_name_and_uuid` takes only a mutex of device mapper that guards the name, never held while waiting for
+  I/O, so it is safe from the workers; the completion of a bio cannot take it, so a failed read is logged by
+  `complete_work` and a failed write back by the cache. `dm_table_event` takes a mutex too, so the event is
+  raised from a work item.

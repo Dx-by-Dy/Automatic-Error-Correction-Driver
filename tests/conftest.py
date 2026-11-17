@@ -79,6 +79,11 @@ STATUS_FIELDS = (
     "refused_writes",
     "discards",
     "discarded_chunks",
+    "read_errors",
+    "crc_mismatches",
+    "write_errors",
+    "metadata_read_errors",
+    "flush_errors",
 )
 
 
@@ -104,11 +109,30 @@ def device_status(name=UPPER_NAME):
     bitmap_write_errors: copies of blocks of the bitmap that failed to write;
     refused_writes: writes and discards refused in the range of a block invalid in both copies;
     discards: discards that reached the target, those covering no whole chunk among them;
-    discarded_chunks: whole chunks they covered, which read as zeros since.
+    discarded_chunks: whole chunks they covered, which read as zeros since;
+    read_errors: reads of data from the lower device that failed;
+    crc_mismatches: sectors read from the lower device that matched neither CRC of their chunk;
+    write_errors: write backs that failed, at the leading metadata sector or at the data;
+    metadata_read_errors: sectors of a copy of the metadata that failed to read, at each read of it;
+    flush_errors: flushes of the lower device that failed.
     """
     fields = run("dmsetup", "status", name).stdout.split()
     assert fields[2] == "dcorr", fields
     return dict(zip(STATUS_FIELDS, map(int, fields[3:]), strict=True))
+
+
+def device_events(name=UPPER_NAME):
+    """The number of the last device mapper event of the device, as dmsetup wait counts them."""
+    return int(run("dmsetup", "info", "-c", "--noheadings", "-o", "events", name).stdout.strip())
+
+
+def wait_for_event(name=UPPER_NAME, after=0, seconds=10):
+    """Waits until the device has raised an event after the one numbered `after`; False if it does not."""
+    try:
+        subprocess.run(["dmsetup", "wait", name, str(after)], check=True, capture_output=True, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return device_events(name) > after
 
 
 def wait_for_write_back(name=UPPER_NAME, seconds=WRITE_BACK_SECONDS):
@@ -202,6 +226,21 @@ def kernel_messages():
     finally:
         messages.extend(read_kmsg(fd))
         os.close(fd)
+
+
+def warned(action, text, attempts=8):
+    """Whether the driver logs a message with this text when the action runs.
+
+    The messages that I/O can repeat are rate limited, 10 in 5 s for each place in the code, and
+    earlier tests may have used them up, so the action runs again for up to that long.
+    """
+    for _ in range(attempts):
+        with kernel_messages() as messages:
+            action()
+        if any(text in message for message in messages):
+            return True
+        time.sleep(1)
+    return False
 
 
 def read_kmsg(fd):

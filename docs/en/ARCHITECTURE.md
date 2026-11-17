@@ -73,6 +73,7 @@ The terms of the project, in the order they build on each other. The source file
 | Crowded flush | A sync the worker makes by itself when half the areas are held or pinned | Lets pinned areas go, so that a write back never waits for ever |
 | Tree of reads | The reads of the lower device in flight, by chunk | A write back waits for the reads of its chunk, so a read never sees data and CRC of two versions |
 | Unwritten read | A read of a chunk whose bit is clear | Zeros without a read of the lower device |
+| Event of the first error | A device mapper event raised once per table, at the first error counted | Wakes `dmsetup wait` or `dmeventd`, so that the user moves the data off a failing drive |
 
 ## Threat model
 
@@ -88,7 +89,7 @@ code does, "Stage" is where the rest is done.
 | **A lost write**: acknowledged, even flushed, but not on the medium | 0.04% of nearline and 0.007% of enterprise HDDs in 17 months; 8 of 15 SSDs and 1 of 2 HDDs lost or reordered completed writes at a power fault | Data and metadata are separate writes: once the flush after a write back has passed, both copies hold the new CRC | A read error | Detected after that flush, at once for a first write. Not detected before it, nor when both copies of the metadata are lost with the data | Correction: a scrub against the parity may find the rest |
 | **A misdirected write**: the data lands on another sector | Counted with lost writes; not seen under power faults | The CRC of the sector hit; its own place as a lost write; the logical sector and a salt per device in the seed | A read error | Detected unless the data equals that of the sector hit | |
 | **A write fails** | Rare: the drive remaps a bad place first, so an error that reaches the host means its spare is gone or the region is in a bad way | An error of the lower device | The chunk stays in RAM and is retried, every flush fails meanwhile, new writes are refused when such chunks fill the cache, reads go on. No reserved area | Done | |
-| **The drive is near its end** | After the first error 14 to 39 times more likely to fail within 60 days; but over half of failed HDDs gave no warning | Every error and mismatch | Counters in `dmsetup status` and a device mapper event, so that the user moves the data off | Only a line in the kernel log | Device Mapper integration |
+| **The drive is near its end** | After the first error 14 to 39 times more likely to fail within 60 days; but over half of failed HDDs gave no warning | Every error and mismatch | Counters in `dmsetup status` and a device mapper event, so that the user moves the data off | Done | |
 
 The "never written" state comes from the bitmap of written chunks, apart from the data it describes; a discard
 clears its bits. A chunk whose bit is clear reads as zeros without a read of the lower device, as a discarded
@@ -353,10 +354,18 @@ Ordinary load never reaches the limit: 4096 parts are 16 MiB of data.
 
 ## Errors
 
-A failed lower bio or a CRC mismatch fails the part with `BLK_STS_IOERR`; a mismatch prints a line with `pr_err`,
-with no rate limit and without the name of the device. A failed write back fails the flushes until the chunk is
-written. Counters of errors and mismatches in `dmsetup status` and a device mapper event at the first one are
-planned for the stage of device mapper integration: an error is a strong sign that the drive is failing.
+A failed lower bio or a CRC mismatch fails the part with `BLK_STS_IOERR`. A failed write back fails the flushes
+until the chunk is written. An error is a strong sign that the drive is failing (D22), so each is a signal:
+
+- **Counters** in `dmsetup status`, see [Interface](#interface): failed reads of data, sectors that match neither
+  CRC (a read checks all its sectors), failed write backs, sectors of the metadata that fail to read, failed
+  flushes of the lower device; and those of the metadata and the bitmap from before.
+- **A device mapper event** at the first error since the table was created, of any kind counted, from a work
+  item; `dmsetup wait` and `dmeventd` see it, and read the counters. Later errors raise none.
+- **A line in the kernel log**, naming the device as `dmsetup` does and the logical sector, never the physical
+  one; every message that I/O can repeat is rate limited, 10 in 5 s for each place in the code. The messages of
+  a device are printed from process context, as the name is looked up under a mutex of device mapper: a failed
+  read is logged by `complete_work`, not by the completion of its bio.
 
 ## Interface
 
@@ -368,7 +377,7 @@ of a group, a power of two from `16M` to `4G`, `1G` by default. `dump` prints th
 **The table line** is `0 <capacity> dcorr <lower device>`; the length must be the capacity in the superblock.
 `dmsetup table` gives the lower device as major:minor, as every target does, so the line it prints loads again.
 
-**`dmsetup status`** prints 21 counters after `<start> <length> dcorr`, in this order:
+**`dmsetup status`** prints 26 counters after `<start> <length> dcorr`, in this order:
 
 | # | Name in the tests | What it counts |
 | --- | --- | --- |
@@ -393,6 +402,15 @@ of a group, a power of two from `16M` to `4G`, `1G` by default. `dump` prints th
 | 19 | `refused_writes` | Writes and discards refused in a read only range |
 | 20 | `discards` | Discards that reached the target, those covering no whole chunk among them |
 | 21 | `discarded_chunks` | Whole chunks they covered |
+| 22 | `read_errors` | Reads of data from the lower device that failed |
+| 23 | `crc_mismatches` | Sectors read from the lower device that matched neither CRC of their chunk |
+| 24 | `write_errors` | Write backs that failed, at the leading metadata sector or at the data |
+| 25 | `metadata_read_errors` | Sectors of a copy of the metadata that failed to read, counted at each read of the area |
+| 26 | `flush_errors` | Flushes of the lower device that failed |
+
+The first error that any of `trail_errors`, `settle_mismatches`, `read_only_blocks`, `single_blocks`,
+`bad_superblocks`, `bitmap_write_errors` and counters 22 to 26 counts raises a device mapper event, see
+[Errors](#errors).
 
 **Queue limits:** `discard_granularity` 4 KiB and `max_hw_discard_sectors` of `UINT_MAX >> 9`; the device reports
 a write cache with FUA. Nothing else is set, and nothing is inherited from the lower device yet.

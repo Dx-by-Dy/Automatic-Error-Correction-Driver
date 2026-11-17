@@ -91,7 +91,7 @@ Show the counters:
 dmsetup status dcorr
 ```
 
-It prints 21 counters after the usual `<start> <length> dcorr`, described in
+It prints 26 counters after the usual `<start> <length> dcorr`, described in
 [Interface](docs/en/ARCHITECTURE.md#interface).
 
 ## Usage

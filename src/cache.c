@@ -326,8 +326,8 @@ void cache_write(struct cache *cache, struct bio *bio)
         if (!cache->nr_dirty && !cache->nr_writing)
         {
             spin_unlock(&cache->lock);
-            DM_ERR_LIMIT("no entry for chunk %llu: the cache is full of chunks that failed to write back\n",
-                         (unsigned long long)chunk);
+            DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "no entry for the write at sector %llu: the cache is full of chunks that failed to write back\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
             bio_io_error(bio);
             return;
         }
@@ -642,6 +642,9 @@ static void cache_job_end_io(struct bio *bio)
     struct cache *cache = job->cache;
     blk_status_t status = bio->bi_status;
     sector_t chunk = entry->chunk;
+    sector_t sector = job->part.sector;
+    unsigned int nr_sectors = job->part.meta.write.nr_sectors;
+    bool meta_written = job->part.meta_written;
     struct cache_job *next;
 
     bio_uninit(bio);
@@ -672,7 +675,12 @@ static void cache_job_end_io(struct bio *bio)
         queue_work(cache->dm_ctx->transform_wq, &next->part.submit_work);
 
     if (status)
-        DM_ERR_LIMIT("write back of chunk %llu failed, status=%d\n", (unsigned long long)chunk, status);
+    {
+        atomic64_inc(&cache->write_errors);
+        dcorr_error(cache->dm_ctx->ti);
+        DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "write back at sector %llu (%u sectors) failed at its %s, status=%d\n",
+                         (unsigned long long)sector, nr_sectors, meta_written ? "data" : "metadata", status);
+    }
 }
 
 /// @brief Takes a free job, waiting for one if needed
@@ -848,6 +856,20 @@ static bool cache_under_pressure(struct cache *cache)
     return cache->nr_free + cache->nr_writing < CACHE_STOP_FREE;
 }
 
+/// @brief Flushes the device below, counting a failure
+/// @return 0, or the error of the flush
+static int cache_flush_lower(struct cache *cache)
+{
+    int r = blkdev_issue_flush(cache->dm_ctx->dev->bdev);
+
+    if (r)
+    {
+        atomic64_inc(&cache->flush_errors);
+        dcorr_error(cache->dm_ctx->ti);
+    }
+    return r;
+}
+
 /// @brief Flushes the device below, writes the bitmap, completes the flushes from above, then writes the
 /// trailing copies
 /// @details
@@ -875,20 +897,20 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 {
     struct metadata_cache *metadata = cache->dm_ctx->metadata;
     struct written_map *written = cache->dm_ctx->written;
-    struct block_device *bdev = cache->dm_ctx->dev->bdev;
     u64 clears = cache->clears;
     blk_status_t status;
     struct bio *bio;
     int r;
 
-    r = blkdev_issue_flush(bdev);
+    r = cache_flush_lower(cache);
     if (!r)
     {
         r = written_write_first(written);
         if (r > 0)
-            r = blkdev_issue_flush(bdev);
+            r = cache_flush_lower(cache);
         else if (r < 0)
-            DM_ERR_LIMIT("the bitmap of written chunks failed to write, err=%d\n", r);
+            DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "the bitmap of written chunks failed to write, err=%d\n",
+                             r);
     }
     if (!r)
         cache->synced_clears = clears;
@@ -901,7 +923,8 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 
     if (r)
     {
-        DM_ERR_LIMIT("lower flush or bitmap failed, err=%d, trailing metadata not written\n", r);
+        DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "lower flush or bitmap failed, err=%d, trailing metadata not written\n",
+                         r);
         written_abort(written);
         metadata_unpin_all(metadata);
         return r;
@@ -910,9 +933,10 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
     metadata_write_trails(metadata);
     written_write_second(written);
 
-    r = blkdev_issue_flush(bdev);
+    r = cache_flush_lower(cache);
     if (r)
-        DM_ERR_LIMIT("lower flush after the trailing metadata failed, err=%d\n", r);
+        DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "lower flush after the trailing metadata failed, err=%d\n",
+                         r);
 
     return r;
 }
@@ -1057,7 +1081,8 @@ void cache_suspend(struct cache *cache)
     spin_unlock(&cache->lock);
 
     if (failed)
-        DM_ERR("%lu chunks failed to write back on suspend, their data is only in RAM\n", failed);
+        DM_DEV_ERR(cache->dm_ctx->ti, "%lu chunks failed to write back on suspend, their data is only in RAM\n",
+                   failed);
 }
 
 /// @brief Lets the worker schedule itself again after a suspend
@@ -1131,6 +1156,8 @@ struct cache *cache_create(struct dm_context *dm_ctx)
     atomic64_set(&cache->barriers, 0);
     atomic64_set(&cache->nr_discards, 0);
     atomic64_set(&cache->discarded_chunks, 0);
+    atomic64_set(&cache->write_errors, 0);
+    atomic64_set(&cache->flush_errors, 0);
 
     cache->entries = kvcalloc(CACHE_ENTRIES, sizeof(*cache->entries), GFP_KERNEL);
     cache->job_table = kvcalloc(CACHE_JOBS, sizeof(*cache->job_table), GFP_KERNEL);
@@ -1177,11 +1204,14 @@ void cache_destroy(struct cache *cache)
     WARN_ON(cache->nr_writing || !bio_list_empty(&cache->flushes) || !bio_list_empty(&cache->discards) ||
             !RB_EMPTY_ROOT(&cache->reads) || !RB_EMPTY_ROOT(&cache->sectors));
     list_for_each_entry(entry, &cache->dirty, list)
-        DM_ERR_LIMIT("chunk %llu is lost: it was never written back\n", (unsigned long long)entry->chunk);
+        DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "the chunk at sector %llu is lost: it was never written back\n",
+                         (unsigned long long)(entry->chunk * DATA_SIZE_SECTORS));
     list_for_each_entry(entry, &cache->failed, list)
-        DM_ERR_LIMIT("chunk %llu is lost: its write back failed\n", (unsigned long long)entry->chunk);
+        DM_DEV_ERR_LIMIT(cache->dm_ctx->ti, "the chunk at sector %llu is lost: its write back failed\n",
+                         (unsigned long long)(entry->chunk * DATA_SIZE_SECTORS));
     if (cache->nr_dirty || cache->nr_failed)
-        DM_ERR("%lu chunks are lost\n", cache->nr_dirty + cache->nr_failed);
+        DM_DEV_ERR(cache->dm_ctx->ti, "%lu chunks are lost\n",
+                   cache->nr_dirty + cache->nr_failed);
 
     cache_free(cache);
 }

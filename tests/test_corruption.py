@@ -10,7 +10,7 @@ import struct
 
 import pytest
 
-from conftest import UPPER_NAME, dmsetup_remove
+from conftest import UPPER_NAME, device_status, dmsetup_remove, kernel_messages, warned
 from harness import (
     CRC_SIZE,
     DATA_SECTORS,
@@ -335,3 +335,39 @@ def test_a_chunk_from_another_device_is_detected(stack):
         stack.lower.write(sector, contents)
     stack.drop_metadata()
     assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
+
+
+def test_every_damaged_sector_of_a_read_is_counted_and_logged(stack, written):
+    """A read checks all its sectors, past the first damaged one: crc_mismatches counts the damaged
+    sectors, and the log names the device as dmsetup does, the read and its first damaged sector."""
+    for in_chunk in (1, 4, 6):
+        stack.lower.flip_bit(physical_sector(FIRST + in_chunk, stack.lower_sectors), byte=7, bit=1)
+    mismatches = device_status()["crc_mismatches"]
+    assert_read_fails(stack.upper, FIRST, DATA_SECTORS)
+    assert device_status()["crc_mismatches"] == mismatches + 3
+
+    text = (
+        f"dcorr {UPPER_NAME} [check_crc]: CRC mismatch in 3 of {DATA_SECTORS} sectors read at sector {FIRST}, "
+        f"the first at sector {FIRST + 1}"
+    )
+    assert warned(lambda: assert_read_fails(stack.upper, FIRST, DATA_SECTORS), text)
+
+
+# DEFAULT_RATELIMIT_BURST of the kernel: messages of one place in the code in 5 s.
+RATELIMIT_BURST = 10
+
+
+def test_a_flood_of_mismatches_is_counted_whole_and_logged_rate_limited(stack):
+    chunks = 8 * RATELIMIT_BURST
+    stack.upper.write(0, pattern("flood", chunks * DATA_SECTORS))
+    stack.upper.flush_settled()
+    for chunk in range(chunks):
+        stack.lower.flip_bit(physical_sector(chunk * DATA_SECTORS, stack.lower_sectors), byte=0, bit=0)
+    mismatches = device_status()["crc_mismatches"]
+
+    with kernel_messages() as messages:
+        for chunk in range(chunks):
+            assert_read_fails(stack.upper, chunk * DATA_SECTORS, DATA_SECTORS)
+    assert device_status()["crc_mismatches"] == mismatches + chunks
+    logged = [message for message in messages if "CRC mismatch" in message]
+    assert len(logged) <= 2 * RATELIMIT_BURST, f"{len(logged)} messages for {chunks} damaged reads"

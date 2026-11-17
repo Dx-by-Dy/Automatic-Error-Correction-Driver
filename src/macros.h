@@ -1,21 +1,52 @@
+#ifndef DCORR_MACROS_H
+#define DCORR_MACROS_H
+
+#include <linux/printk.h>
+#include <linux/ratelimit.h>
+
 #define DM_MSG_PREFIX "dcorr"
 
 #define DM_ERR(fmt, ...) \
     pr_err("[ERROR] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 
-/// @brief DM_ERR for messages that I/O can repeat, so that a failing device does not flood the log
-#define DM_ERR_LIMIT(fmt, ...) \
-    pr_err_ratelimited("[ERROR] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
-
 #define DM_WARN(fmt, ...) \
     pr_warn("[WARN] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
 
-/// @brief DM_WARN for messages that I/O can repeat
-#define DM_WARN_LIMIT(fmt, ...) \
-    pr_warn_ratelimited("[WARN] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
-
 #define DM_INFO(fmt, ...) \
     pr_info("[INFO] " DM_MSG_PREFIX " [%s]: " fmt, __func__, ##__VA_ARGS__)
+
+struct dm_target;
+
+/// @brief Severity of a message of a device, see dcorr_log
+enum dcorr_level
+{
+    DCORR_LEVEL_ERR,
+    DCORR_LEVEL_WARN,
+    DCORR_LEVEL_INFO,
+};
+
+__printf(4, 5) void dcorr_log(struct dm_target *ti, enum dcorr_level level, const char *func, const char *fmt, ...);
+void dcorr_error(struct dm_target *ti);
+
+/*
+ * Messages of a device name it as dmsetup does, see dcorr_log, so they need
+ * process context and no spinlock held. Those that I/O can repeat are rate
+ * limited, each place on its own, so that a failing device does not flood
+ * the log; the name is looked up only for a message that is printed.
+ */
+#define DCORR_LOG_LIMIT(ti, level, fmt, ...)                                                    \
+    do                                                                                          \
+    {                                                                                           \
+        static DEFINE_RATELIMIT_STATE(_rs, DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST); \
+        if (__ratelimit(&_rs))                                                                  \
+            dcorr_log(ti, level, __func__, fmt, ##__VA_ARGS__);                                 \
+    } while (0)
+
+#define DM_DEV_ERR(ti, fmt, ...) dcorr_log(ti, DCORR_LEVEL_ERR, __func__, fmt, ##__VA_ARGS__)
+#define DM_DEV_WARN(ti, fmt, ...) dcorr_log(ti, DCORR_LEVEL_WARN, __func__, fmt, ##__VA_ARGS__)
+#define DM_DEV_INFO(ti, fmt, ...) dcorr_log(ti, DCORR_LEVEL_INFO, __func__, fmt, ##__VA_ARGS__)
+#define DM_DEV_ERR_LIMIT(ti, fmt, ...) DCORR_LOG_LIMIT(ti, DCORR_LEVEL_ERR, fmt, ##__VA_ARGS__)
+#define DM_DEV_WARN_LIMIT(ti, fmt, ...) DCORR_LOG_LIMIT(ti, DCORR_LEVEL_WARN, fmt, ##__VA_ARGS__)
 
 /// @brief Full enable/disable of DEBUG message embedding
 #ifdef DM_DEBUG_ENABLED
@@ -57,4 +88,6 @@
 #else
 #define DM_DEBUG(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
 #define DM_DEBUG_BIO(bio) ((void)(bio))
+#endif
+
 #endif

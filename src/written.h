@@ -41,6 +41,9 @@ struct written_io
 /// then, and cleared by the worker of the data cache, which runs the syncs.
 struct written_map
 {
+    /// @brief The target, for its name in the log and its errors, see dcorr_error
+    struct dm_target *ti;
+
     /// @brief The layout and the salt, owned by the context of the target
     const struct superblock_info *sb;
 
@@ -97,8 +100,10 @@ struct written_map
     atomic64_t refused_writes;
 };
 
-struct written_map *written_create(struct block_device *bdev, const struct superblock_info *sb, bool writable,
-                                   char **error);
+struct dm_target;
+
+struct written_map *written_create(struct dm_target *ti, struct block_device *bdev, const struct superblock_info *sb,
+                                   bool writable);
 void written_destroy(struct written_map *map);
 int written_load_once(struct written_map *map);
 bool written_test(struct written_map *map, sector_t sector);

@@ -206,6 +206,12 @@ struct cache
 
     /// @brief How many whole chunks discards covered
     atomic64_t discarded_chunks;
+
+    /// @brief How many write back jobs failed, at the leading metadata sector or at the data
+    atomic64_t write_errors;
+
+    /// @brief How many flushes of the lower device failed
+    atomic64_t flush_errors;
 };
 
 struct cache *cache_create(struct dm_context *dm_ctx);

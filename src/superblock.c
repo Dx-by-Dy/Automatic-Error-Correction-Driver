@@ -1,4 +1,5 @@
 #include <linux/bio.h>
+#include <linux/device-mapper.h>
 #include <linux/crc64.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
@@ -123,11 +124,11 @@ static const char *superblock_probe(struct block_device *bdev, struct dcorr_supe
 /// superblock_verify.
 ///
 /// Expected execution context - the constructor of the target, may sleep.
-/// @param bdev  The device below
-/// @param info  What the driver takes from it, filled on success
-/// @param error The reason for the table, set on failure
+/// @param ti   The target, for its name in the log; ti->error is set on failure
+/// @param bdev The device below
+/// @param info What the driver takes from it, filled on success
 /// @return 0, or a negative error code
-int superblock_read(struct block_device *bdev, struct superblock_info *info, char **error)
+int superblock_read(struct dm_target *ti, struct block_device *bdev, struct superblock_info *info)
 {
     struct dcorr_superblock *sb[SUPERBLOCK_COPIES] = {};
     struct dcorr_layout layout[SUPERBLOCK_COPIES];
@@ -141,7 +142,7 @@ int superblock_read(struct block_device *bdev, struct superblock_info *info, cha
         sb[copy] = kmalloc(DCORR_SUPERBLOCK_BYTES, GFP_KERNEL);
         if (!sb[copy])
         {
-            *error = "Cannot allocate the superblock";
+            ti->error = "Cannot allocate the superblock";
             r = -ENOMEM;
             goto out;
         }
@@ -161,8 +162,8 @@ int superblock_read(struct block_device *bdev, struct superblock_info *info, cha
 
     if (reason[0] && reason[1])
     {
-        DM_ERR("no valid superblock: group 0: %s, group 1: %s\n", reason[0], reason[1]);
-        *error = "No valid superblock on the device below, format it with dcorrsetup";
+        DM_DEV_ERR(ti, "no valid superblock: group 0: %s, group 1: %s\n", reason[0], reason[1]);
+        ti->error = "No valid superblock on the device below, format it with dcorrsetup";
         r = -EINVAL;
         goto out;
     }
@@ -173,9 +174,9 @@ int superblock_read(struct block_device *bdev, struct superblock_info *info, cha
         chosen = le64_to_cpu(sb[1]->generation) > le64_to_cpu(sb[0]->generation) ? 1 : 0;
 
     if (reason[1 - chosen])
-        DM_WARN("the superblock of group %u is not valid: %s\n", 1 - chosen, reason[1 - chosen]);
+        DM_DEV_WARN(ti, "the superblock of group %u is not valid: %s\n", 1 - chosen, reason[1 - chosen]);
     else if (sb[0]->generation == sb[1]->generation && !superblock_same(sb[0], sb[1]))
-        DM_WARN("the superblocks of groups 0 and 1 differ in the same generation, taking group 0\n");
+        DM_DEV_WARN(ti, "the superblocks of groups 0 and 1 differ in the same generation, taking group 0\n");
 
     info->layout = layout[chosen];
     memcpy(info->uuid, sb[chosen]->uuid, sizeof(info->uuid));
@@ -183,8 +184,8 @@ int superblock_read(struct block_device *bdev, struct superblock_info *info, cha
     info->salt_crc = data_crc_salt(info->salt, sizeof(info->salt));
     info->group = chosen;
     info->generation = le64_to_cpu(sb[chosen]->generation);
-    DM_INFO("superblock of group %u, generation %llu, groups of %llu sectors\n", chosen,
-            (unsigned long long)info->generation, (unsigned long long)info->layout.group_sectors);
+    DM_DEV_INFO(ti, "superblock of group %u, generation %llu, groups of %llu sectors\n", chosen,
+                (unsigned long long)info->generation, (unsigned long long)info->layout.group_sectors);
 
 out:
     for (copy = 0; copy < SUPERBLOCK_COPIES; copy++)

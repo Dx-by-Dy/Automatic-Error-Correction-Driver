@@ -8,6 +8,65 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alexey Smirnov");
 MODULE_DESCRIPTION("Device mapper target that detects damaged data with a CRC64 per sector");
 
+/// @brief Prints a message of the device, named as dmsetup names it
+/// @details
+/// The name is looked up for each message, so a rename shows at once; if the
+/// device has none, major:minor stands for it. Called through the DM_DEV_
+/// macros of macros.h, from process context with no spinlock held, as the
+/// lookup takes a mutex of device mapper. That mutex guards only the name, so
+/// it never waits for I/O.
+void dcorr_log(struct dm_target *ti, enum dcorr_level level, const char *func, const char *fmt, ...)
+{
+    char name[DM_NAME_LEN];
+    struct va_format vaf;
+    va_list args;
+
+    if (dm_copy_name_and_uuid(dm_table_get_md(ti->table), name, NULL))
+        strscpy(name, dm_table_device_name(ti->table));
+
+    va_start(args, fmt);
+    vaf.fmt = fmt;
+    vaf.va = &args;
+    switch (level)
+    {
+    case DCORR_LEVEL_ERR:
+        pr_err("[ERROR] " DM_MSG_PREFIX " %s [%s]: %pV", name, func, &vaf);
+        break;
+    case DCORR_LEVEL_WARN:
+        pr_warn("[WARN] " DM_MSG_PREFIX " %s [%s]: %pV", name, func, &vaf);
+        break;
+    case DCORR_LEVEL_INFO:
+        pr_info("[INFO] " DM_MSG_PREFIX " %s [%s]: %pV", name, func, &vaf);
+        break;
+    }
+    va_end(args);
+}
+
+/// @brief Raises the device mapper event of the first error
+static void dm_event_work(struct work_struct *work)
+{
+    struct dm_context *dm_ctx = container_of(work, struct dm_context, event_work);
+
+    dm_table_event(dm_ctx->ti->table);
+}
+
+/// @brief Records that the device met an error: of the lower device, or damaged data or metadata
+/// @details
+/// The first one since the table was created raises a device mapper event,
+/// which dmsetup wait and dmeventd see; the counters of dmsetup status tell
+/// what it was. Later errors raise none, so that a failing device does not
+/// keep the waiters busy. Any context: the event is raised from a work item,
+/// as dm_table_event takes a mutex. Before the constructor returns there is
+/// no context yet, and nothing to raise.
+/// @param ti The target of the device
+void dcorr_error(struct dm_target *ti)
+{
+    struct dm_context *dm_ctx = READ_ONCE(ti->private);
+
+    if (dm_ctx && !test_and_set_bit(0, &dm_ctx->errors_seen))
+        schedule_work(&dm_ctx->event_work);
+}
+
 /// @brief Handles incoming bio requests
 /// @details
 /// Called by the DM subsystem for each incoming bio. DM splits requests at chunk
@@ -75,8 +134,8 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         if (written_read_only(dm_ctx->written, bio->bi_iter.bi_sector))
         {
             atomic64_inc(&dm_ctx->written->refused_writes);
-            DM_ERR_LIMIT("write to chunk %llu refused: its block of the bitmap is invalid in both copies\n",
-                         (unsigned long long)(bio->bi_iter.bi_sector / DATA_SIZE_SECTORS));
+            DM_DEV_ERR_LIMIT(ti, "write at sector %llu refused: its block of the bitmap is invalid in both copies\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
             return DM_MAPIO_KILL;
         }
         cache_write(dm_ctx->cache, bio);
@@ -92,15 +151,15 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         if (written_range_read_only(dm_ctx->written, bio->bi_iter.bi_sector, bio_sectors(bio)))
         {
             atomic64_inc(&dm_ctx->written->refused_writes);
-            DM_ERR_LIMIT("discard at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
-                         (unsigned long long)bio->bi_iter.bi_sector);
+            DM_DEV_ERR_LIMIT(ti, "discard at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
             return DM_MAPIO_KILL;
         }
         cache_discard(dm_ctx->cache, bio);
         return DM_MAPIO_SUBMITTED;
 
     default:
-        DM_ERR("unsupported bio op=%u\n", bio_op(bio));
+        DM_DEV_ERR_LIMIT(ti, "unsupported bio op=%u\n", bio_op(bio));
         return DM_MAPIO_KILL;
     }
 
@@ -136,7 +195,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (argc != 1)
     {
         ti->error = "Invalid argument count: expected <device>";
-        DM_ERR("expected 1 argument, got %u\n", argc);
+        DM_DEV_ERR(ti, "expected 1 argument, got %u\n", argc);
         return -EINVAL;
     }
 
@@ -149,7 +208,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (!dm_ctx)
     {
         ti->error = "dm_context alloc failed";
-        DM_ERR("kzalloc dm_context failed\n");
+        DM_DEV_ERR(ti, "kzalloc dm_context failed\n");
         return -ENOMEM;
     }
 
@@ -157,18 +216,22 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (!dm_ctx->transform_wq)
     {
         ti->error = "alloc_workqueue failed";
-        DM_ERR("alloc_workqueue failed\n");
+        DM_DEV_ERR(ti, "alloc_workqueue failed\n");
         r = -ENOMEM;
         goto error_alloc_workqueue;
     }
 
     sema_init(&dm_ctx->parts_in_flight, MAX_PARTS_IN_FLIGHT);
     atomic64_set(&dm_ctx->map_waits, 0);
+    atomic64_set(&dm_ctx->read_errors, 0);
+    atomic64_set(&dm_ctx->crc_mismatches, 0);
+    dm_ctx->ti = ti;
+    INIT_WORK(&dm_ctx->event_work, dm_event_work);
 
     r = dm_set_target_max_io_len(ti, DATA_SIZE_SECTORS);
     if (r)
     {
-        DM_ERR("dm_set_target_max_io_len failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "dm_set_target_max_io_len failed, err=%d\n", r);
         goto error_dm_get_device;
     }
     ti->per_io_data_size = sizeof(struct trn_p_rq);
@@ -181,38 +244,38 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (r)
     {
         ti->error = "dm_get_device failed";
-        DM_ERR("dm_get_device failed, dev=%s err=%d\n", argv[0], r);
+        DM_DEV_ERR(ti, "dm_get_device failed, dev=%s err=%d\n", argv[0], r);
         goto error_dm_get_device;
     }
 
-    r = superblock_read(dm_ctx->dev->bdev, &dm_ctx->sb, &ti->error);
+    r = superblock_read(ti, dm_ctx->dev->bdev, &dm_ctx->sb);
     if (r)
         goto error_metadata;
 
     if (ti->len != dm_ctx->sb.layout.capacity)
     {
         ti->error = "The length must be the capacity in the superblock, see dcorrsetup table";
-        DM_ERR("length %llu, the superblock gives %llu\n", (unsigned long long)ti->len,
+        DM_DEV_ERR(ti, "length %llu, the superblock gives %llu\n", (unsigned long long)ti->len,
                (unsigned long long)dm_ctx->sb.layout.capacity);
         r = -EINVAL;
         goto error_metadata;
     }
 
-    dm_ctx->written = written_create(dm_ctx->dev->bdev, &dm_ctx->sb,
-                                     dm_table_get_mode(ti->table) & BLK_OPEN_WRITE, &ti->error);
+    dm_ctx->written = written_create(ti, dm_ctx->dev->bdev, &dm_ctx->sb,
+                                     dm_table_get_mode(ti->table) & BLK_OPEN_WRITE);
     if (IS_ERR(dm_ctx->written))
     {
         r = PTR_ERR(dm_ctx->written);
-        DM_ERR("written_create failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "written_create failed, err=%d\n", r);
         goto error_metadata;
     }
 
-    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, &dm_ctx->sb.layout, dm_ctx->sb.salt_crc);
+    dm_ctx->metadata = metadata_cache_create(ti, dm_ctx->dev->bdev, &dm_ctx->sb.layout, dm_ctx->sb.salt_crc);
     if (IS_ERR(dm_ctx->metadata))
     {
         ti->error = "metadata cache alloc failed";
         r = PTR_ERR(dm_ctx->metadata);
-        DM_ERR("metadata_cache_create failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "metadata_cache_create failed, err=%d\n", r);
         goto error_written;
     }
 
@@ -221,13 +284,13 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     {
         ti->error = "cache alloc failed";
         r = PTR_ERR(dm_ctx->cache);
-        DM_ERR("cache_create failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "cache_create failed, err=%d\n", r);
         goto error_cache;
     }
 
     ti->private = dm_ctx;
 
-    DM_INFO("mapped on dev=%s, disk capacity=%llu sec, available capacity=%llu sec\n",
+    DM_DEV_INFO(ti, "mapped on dev=%s, disk capacity=%llu sec, available capacity=%llu sec\n",
             argv[0],
             (unsigned long long)get_capacity(dm_ctx->dev->bdev->bd_disk),
             (unsigned long long)ti->len);
@@ -259,6 +322,7 @@ static void dm_dtr(struct dm_target *ti)
 
     DM_DEBUG("dm_ctx=%p\n", dm_ctx);
 
+    cancel_work_sync(&dm_ctx->event_work);
     cache_destroy(dm_ctx->cache);
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
@@ -328,7 +392,7 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
@@ -348,7 +412,12 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                (unsigned long long)atomic64_read(&dm_ctx->written->write_errors),
                (unsigned long long)atomic64_read(&dm_ctx->written->refused_writes),
                (unsigned long long)atomic64_read(&dm_ctx->cache->nr_discards),
-               (unsigned long long)atomic64_read(&dm_ctx->cache->discarded_chunks));
+               (unsigned long long)atomic64_read(&dm_ctx->cache->discarded_chunks),
+               (unsigned long long)atomic64_read(&dm_ctx->read_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->crc_mismatches),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->write_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->read_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->flush_errors));
         break;
     case STATUSTYPE_TABLE:
         DMEMIT("%s", dm_ctx->dev->name);
