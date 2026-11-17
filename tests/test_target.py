@@ -1,5 +1,7 @@
 """The arguments and the table of the device mapper target."""
 
+import os
+
 import pytest
 
 from conftest import LOWER_NAME, UPPER_NAME, dmsetup_remove, make_lower
@@ -42,12 +44,38 @@ def test_a_length_other_than_the_capacity_is_rejected(lower, change):
     assert create(f"0 {capacity(sectors) + change} dcorr {path}").returncode != 0
 
 
-@pytest.mark.xfail(strict=True, reason="TODO.md: dmsetup table does not show the device")
+def major_minor(path):
+    device = os.stat(os.path.realpath(path)).st_rdev
+    return f"{os.major(device)}:{os.minor(device)}"
+
+
 def test_table_shows_the_lower_device(lower):
+    """As every target: the lower device as major:minor."""
     path, sectors = lower
     assert create(f"0 {capacity(sectors)} dcorr {path}").returncode == 0
     fields = run("dmsetup", "table", UPPER_NAME).stdout.split()
-    assert len(fields) == 4, fields
+    assert fields == ["0", str(capacity(sectors)), "dcorr", major_minor(path)]
+
+
+def test_the_table_loads_again_as_dmsetup_gives_it(lower):
+    """A table saved with dmsetup table creates the device again, on the same data."""
+    path, sectors = lower
+    assert create(f"0 {capacity(sectors)} dcorr {path}").returncode == 0
+    data = pattern("saved", DATA_SECTORS)
+    upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+    try:
+        upper.write(0, data)
+        upper.flush()
+    finally:
+        upper.close()
+    saved = run("dmsetup", "table", UPPER_NAME).stdout.strip()
+    dmsetup_remove(UPPER_NAME)
+    assert create(saved).returncode == 0
+    upper = BlockDevice(f"/dev/mapper/{UPPER_NAME}")
+    try:
+        assert upper.read(0, DATA_SECTORS) == data
+    finally:
+        upper.close()
 
 
 def test_target_may_start_after_sector_0(lower):

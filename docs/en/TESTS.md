@@ -1,6 +1,6 @@
 # Driver tests
 
-352 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
+353 tests in pytest. They run as root in the development VM and refuse to run anywhere else,
 as they overwrite `/dev/vdb`. The VM is described in [DEPLOY.md](DEPLOY.md), why the tests work this way in
 [D1](DECISIONS.md#d1-tests-run-in-a-vm-crashes-are-replayed-from-a-log).
 
@@ -9,8 +9,8 @@ Keep this file up to date when adding or removing tests.
 ## Running
 
 ```bash
-deploy/vm.sh test                                     # all 352 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 311 tests
+deploy/vm.sh test                                     # all 353 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 312 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -94,7 +94,7 @@ A `-m` given to pytest replaces the default one, so `-m known_hang` runs those.
 
 **Known bugs.** A test for a known bug is a strict `xfail`, with the title of its `TODO.md` item as the
 reason: when the bug is fixed the test fails until the mark is removed. A bug that hangs the guest
-cannot be `xfail`, as it would end the run, so it gets `known_hang`.
+cannot be `xfail`, as it would end the run, so it gets `known_hang`. None of either is left since stage 5.
 
 ## What is tested
 
@@ -329,14 +329,15 @@ are not checked. The
 tables of the device are small enough for `kmalloc`, so `/proc/vmallocinfo` does not show them; it showed the
 lock table, which is gone.
 
-### `test_target.py`: arguments and table of the target (8 tests)
+### `test_target.py`: arguments and table of the target (9 tests)
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
 | `test_bad_arguments_are_rejected` | 3 | No arguments, too many, a missing device |
 | `test_device_takes_the_usable_length` | 1 | A table with the correct length gives a device of that size |
 | `test_a_length_other_than_the_capacity_is_rejected` | 2 | A chunk longer or shorter than the capacity in the superblock is refused |
-| `test_table_shows_the_lower_device` | 1 | **xfail**: `dmsetup table` does not show the device |
+| `test_table_shows_the_lower_device` | 1 | `dmsetup table` gives the lower device as major:minor, as every target. A strict `xfail` until stage 5 |
+| `test_the_table_loads_again_as_dmsetup_gives_it` | 1 | The line of `dmsetup table`, saved, creates the device again on the same data |
 | `test_target_may_start_after_sector_0` | 1 | With a table that puts the target after sector 0, its first sector lands on sector 0 of the lower device |
 
 ### `test_superblock.py`: the superblock and `dcorrsetup` (78 tests)

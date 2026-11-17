@@ -366,6 +366,7 @@ of a group, a power of two from `16M` to `4G`, `1G` by default. `dump` prints th
 `key=value`, `table` the line for `dmsetup`.
 
 **The table line** is `0 <capacity> dcorr <lower device>`; the length must be the capacity in the superblock.
+`dmsetup table` gives the lower device as major:minor, as every target does, so the line it prints loads again.
 
 **`dmsetup status`** prints 21 counters after `<start> <length> dcorr`, in this order:
 

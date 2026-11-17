@@ -77,10 +77,11 @@ in a run, **From reading** means it was only found in the code.
 
 ## Device Mapper integration
 
-- **`dmsetup table` does not show the device.** Confirmed: it prints `0 14913080 dcorr` with no
-  arguments, as `.status` gives nothing for `STATUSTYPE_TABLE`, so the table cannot be saved and
-  reloaded. `dmsetup status` has only the counters of waits and of dirty and failed entries of the
-  cache; counters such as CRC mismatches do not exist yet.
+- **`dmsetup status` has no counters of errors.** Counters such as CRC mismatches do not exist yet; step 3b of
+  stage 5.
+- **Nothing is measured by IMA.** By decision on 2026-11-16: `STATUSTYPE_IMA` gives nothing, so a table of the
+  driver is measured without its fields. Fix, if IMA is used: the keys and values of the target, as other
+  targets give them.
 - **Queue limits are not inherited.** From reading: there is no `.iterate_devices`; `.io_hints` sets only the
   limits of discard. A lower device with 4K logical blocks is not rejected, although metadata is written
   as single 512-byte sectors. Write zeroes waits for `.iterate_devices` too, see above.
@@ -109,7 +110,6 @@ Moved to [TODO_OPTIMIZATION.md](TODO_OPTIMIZATION.md).
 ## Documentation
 
 - **The README claims functional testing is done**, and does not mention the VM.
-- **`MODULE_DESCRIPTION` says "Linux Kernel 6.16"**, while the driver builds on 7.1 and 7.2.
 
 ## Stages
 

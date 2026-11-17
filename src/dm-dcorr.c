@@ -6,7 +6,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alexey Smirnov");
-MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
+MODULE_DESCRIPTION("Device mapper target that detects damaged data with a CRC64 per sector");
 
 /// @brief Handles incoming bio requests
 /// @details
@@ -307,23 +307,11 @@ static void dm_target_resume(struct dm_target *ti)
 
 /// @brief Reports the state of the target to dmsetup
 /// @details
-/// STATUSTYPE_INFO (dmsetup status) gives the counters, in this order: waits of
-/// reads in dm_map for a place among the parts in flight, waits of writes for a
-/// free entry of the cache, waits of writes for an entry under write back,
-/// reads that waited for the write back of their chunk, entries holding data
-/// not yet on the lower device, entries whose write back failed, metadata
-/// areas read from the lower device, waits for a metadata area when all were
-/// in use, sectors of the trailing copy of the metadata that failed to write,
-/// flushes the worker made because too many metadata areas were busy, flushes
-/// it made before writing back a chunk written back since the last one, chunks
-/// read before a write back as their two copies of the metadata differed, and
-/// sectors so read that matched neither copy or did not read; then, of the
-/// bitmap of written chunks: chunks read as zeros without a read of the device
-/// below, as never written, blocks invalid in both copies when the device was
-/// created, blocks with one valid copy then, copies of the superblock of groups
-/// 2 and on that are invalid or differ, copies of blocks that failed to write,
-/// and writes refused in a read only range.
-/// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
+/// STATUSTYPE_INFO (dmsetup status) gives the counters, positional, in the
+/// order and with the meaning that "Interface" in docs/en/ARCHITECTURE.md
+/// lists; a new counter is added at the end. STATUSTYPE_TABLE (dmsetup table)
+/// gives the lower device as major:minor, so that the line loads again.
+/// STATUSTYPE_IMA gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
 /// @param status_flags Flags of the request, unused
@@ -363,6 +351,8 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                (unsigned long long)atomic64_read(&dm_ctx->cache->discarded_chunks));
         break;
     case STATUSTYPE_TABLE:
+        DMEMIT("%s", dm_ctx->dev->name);
+        break;
     case STATUSTYPE_IMA:
         result[0] = '\0';
         break;
