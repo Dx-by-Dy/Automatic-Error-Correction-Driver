@@ -252,7 +252,7 @@ Zheng et al. отключали питание 15 SSD пяти производ�
   [случайную соль из своего суперблока][int-salt]. Коррекции у него нет.
 
 Так что избыточность на одном устройстве дешевле полной копии, ниже любой файловой системы, никто из них не
-предлагает.
+предлагает; её можно собрать из LVM RAID, см. [Избыточность на одном диске](#избыточность-на-одном-диске).
 
 ### Что из этого следует для драйвера
 
@@ -283,6 +283,48 @@ Zheng et al. отключали питание 15 SSD пяти производ�
    записанных чанков в суперблоке и в RAM, отдельно от данных, которые она описывает.
 9. **SSD с дедупликацией** мог бы хранить две одинаковые копии метаданных один раз. Сегодня редкость; ответом
    было бы подмешать номер копии в её содержимое.
+
+## Избыточность на одном диске
+
+Прочитано 2026-11-17, чтобы найти место драйвера среди того, что есть: что дают другие системы на одном диске и
+какой ценой. В отличие от разделов выше, этот основан на документации, а не на исходниках.
+
+Источники: документация [`dm-integrity`][int-doc], [`dm-verity`][verity-doc] и [целостности данных в блочном
+слое][bi-doc] в Linux v7.2, [`lvmraid(7)`][lvmraid], [`zfsprops(7)`][zfsprops] и [контрольные суммы
+OpenZFS][zfs-sum], [`mkfs.btrfs`][btrfs-mkfs], [integrity streams в ReFS][refs], [par2cmdline][par2].
+
+### Сравнение
+
+| Система | Уровень | Обнаруживает | Исправляет на одном диске | Цена |
+| --- | --- | --- | --- | --- |
+| `dm-integrity`, сам по себе | Блочное устройство | Тег на сектор, [тихая порча на диске или на пути ввода-вывода][int-standalone] | Нет | Теги; [журнал пишет всё дважды][int-modes] |
+| LVM RAID с `--raidintegrity` на разделах одного диска | Блочное устройство | `dm-integrity` под каждым образом | Да: [dm-raid читает другой образ и записывает хорошие данные обратно][lvmraid-int] | Полная копия для raid1, половина сверху для raid5 на трёх разделах; [журнал целостности по умолчанию][lvmraid-mode]; на HDD полоса лежит в далёких друг от друга разделах |
+| `dm-verity` с FEC | Блочное устройство, [только для чтения][verity-ro] | Дерево хешей | Да: [Reed-Solomon, перемежённый по всему устройству, хеши дают места стираний][verity-fec] | [Около 0,8% при `fec_roots=2`][verity-roots] |
+| T10 PI (DIF, DIX) | Диск и HBA | [8 байт на сектор с 16-битным CRC][bi-dif] | Нет | Диски, отформатированные [секторами по 520 или 4104 байта][bi-dif] |
+| ZFS, `copies=2` или 3 | Файловая система | [Контрольная сумма на блок, в его указателе на блок][zfs-sum] | Да, [из другой копии][zfs-sum] | [Место ×2 или ×3; копии идут на разные диски, когда это возможно][zfsprops] |
+| btrfs, данные в `DUP` | Файловая система | По умолчанию crc32c, см. [Другие системы](#другие-системы) | Да, из другой копии | Место ×2; [SSD может хранить две копии один раз или в одном блоке, который умрёт вместе с обеими][btrfs-mkfs] |
+| ReFS, integrity streams | Файловая система | Контрольная сумма данных файла | [Только на зеркальном пространстве или с чётностью; на голом диске — ошибка][refs] | [Каждая запись размещается заново, так что файлы фрагментируются][refs] |
+| par2 | Файлы, вручную | Свои контрольные суммы | Да: [файлы восстановления Reed-Solomon выбранного размера][par2] | Выбранный размер; создаётся и применяется вручную, к файлам, которые больше не меняются |
+| `dm-dcorr` | Блочное устройство | CRC64 на 512-байтный сектор, две копии, с местом и солью | Пока нет: ECC между чанками, на этапе коррекции | Около 3% на метаданные и 6,25% в запасе под чётность |
+
+### Что из этого следует
+
+- **Коррекцию на одном записываемом диске, ниже любой файловой системы, дешевле полной копии** сегодня можно
+  только собрать вручную: LVM raid5 с целостностью на трёх разделах одного диска. Он для этого не сделан: три
+  члена полосы далеко друг от друга на HDD, записи умножены RAID и журналом, а обнаружение работает только после
+  того, как теги всего устройства [инициализированы][lvmraid-init]. Файловые системы дают её ценой полной копии и
+  только для себя.
+- **`dm-verity` — самая близкая модель для этапа коррекции**: он исправляет кодом Reed-Solomon по блокам,
+  перемежённым по устройству, и берёт места стираний из своих хешей, как пункт 1 [раздела
+  выше](#что-из-этого-следует-для-драйвера-1) планирует с CRC. Он только для чтения, так что никогда не обновляет
+  свою чётность, а для нас это самое трудное.
+- **Копии на одном диске разделяют его судьбу.** btrfs предупреждает, что SSD может дедуплицировать копии или
+  держать их в одном блоке, как пункт 9 [раздела выше](#что-из-этого-следует-для-драйвера-1) говорит о наших
+  метаданных; и ничто на одном диске не переживёт потерю всего диска.
+- **Согласованность после краха без журнала** отличает драйвер от `dm-integrity`, который [либо пишет каждую запись
+  в журнал, либо с битмапом теряет обнаружение в регионах, грязных в момент краха][int-bitmap]: две копии CRC и
+  согласование стоят одной записи метаданных с FUA на обратную запись, и ничего не остаётся непроверенным, см.
+  [Запись, оборванная крахом](#запись-оборванная-крахом-два-crc).
 
 [wc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-writecache.c?h=v7.2
 [wc-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/writecache.rst?h=v7.2
@@ -347,3 +389,20 @@ Zheng et al. отключали питание 15 SSD пяти производ�
 [bcachefs]: https://lwn.net/Articles/1040120/
 [int-seed]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-integrity.c?h=v7.2#n1668
 [int-salt]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-integrity.c?h=v7.2#n4170
+[int-standalone]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/dm-integrity.rst?h=v7.2#n23
+[int-bitmap]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/dm-integrity.rst?h=v7.2#n28
+[int-modes]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/dm-integrity.rst?h=v7.2#n75
+[verity-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2
+[verity-ro]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2#n7
+[verity-roots]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2#n119
+[verity-fec]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2#n223
+[bi-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/block/data-integrity.rst?h=v7.2
+[bi-dif]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/block/data-integrity.rst?h=v7.2#n45
+[lvmraid]: https://man7.org/linux/man-pages/man7/lvmraid.7.html
+[lvmraid-int]: https://man7.org/linux/man-pages/man7/lvmraid.7.html#DATA_INTEGRITY
+[lvmraid-mode]: https://man7.org/linux/man-pages/man7/lvmraid.7.html#DATA_INTEGRITY
+[lvmraid-init]: https://man7.org/linux/man-pages/man7/lvmraid.7.html#DATA_INTEGRITY
+[zfsprops]: https://openzfs.github.io/openzfs-docs/man/master/7/zfsprops.7.html
+[zfs-sum]: https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Data%20Storage/Checksums.html
+[refs]: https://learn.microsoft.com/en-us/windows-server/storage/refs/integrity-streams
+[par2]: https://github.com/Parchive/par2cmdline

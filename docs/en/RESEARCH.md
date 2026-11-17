@@ -240,7 +240,8 @@ Zheng et al. cut the power of 15 SSDs of five vendors, and 13 of them failed (5)
 - **`dm-integrity`** [mixes the logical sector into every checksum][int-seed], and with `fix_hmac` also [a
   random salt from its superblock][int-salt]. It has no correction.
 
-So redundancy on one device cheaper than a full copy, below any filesystem, is not offered by any of them.
+So redundancy on one device cheaper than a full copy, below any filesystem, is not offered by any of them;
+LVM RAID can be assembled to give it, see [Redundancy on a single drive](#redundancy-on-a-single-drive).
 
 ### What follows for this driver
 
@@ -271,6 +272,48 @@ So redundancy on one device cheaper than a full copy, below any filesystem, is n
    and in RAM, apart from the data it describes.
 9. **An SSD that deduplicates** could keep the two equal copies of the metadata once. Rare today; mixing the
    number of the copy into its contents would answer it.
+
+## Redundancy on a single drive
+
+Read on 2026-11-17, to place the driver among what exists: what other systems give on one drive, and at what
+cost. Unlike the sections above, this one comes from documentation, not from sources.
+
+Sources: the documentation of [`dm-integrity`][int-doc], [`dm-verity`][verity-doc] and [data integrity in the
+block layer][bi-doc] in Linux v7.2, [`lvmraid(7)`][lvmraid], [`zfsprops(7)`][zfsprops] and [the checksums of
+OpenZFS][zfs-sum], [`mkfs.btrfs`][btrfs-mkfs], [ReFS integrity streams][refs], [par2cmdline][par2].
+
+### Comparison
+
+| System | Level | Detects | Corrects on one drive | Cost |
+| --- | --- | --- | --- | --- |
+| `dm-integrity`, standalone | Block device | A tag per sector, [silent corruption on the disk or in the I/O path][int-standalone] | No | The tags; [the journal writes everything twice][int-modes] |
+| LVM RAID with `--raidintegrity` over partitions of one drive | Block device | `dm-integrity` under each image | Yes: [dm-raid reads another image and writes the good data back][lvmraid-int] | A full copy for raid1, half again for raid5 over three partitions; [the journal of integrity by default][lvmraid-mode]; on an HDD a stripe lies in partitions far apart |
+| `dm-verity` with FEC | Block device, [read only][verity-ro] | A tree of hashes | Yes: [Reed-Solomon interleaved over the whole device, the hashes give the places of the erasures][verity-fec] | [About 0.8% with `fec_roots=2`][verity-roots] |
+| T10 PI (DIF, DIX) | Drive and HBA | [8 bytes per sector with a 16-bit CRC][bi-dif] | No | Drives formatted [with 520 or 4104 byte sectors][bi-dif] |
+| ZFS, `copies=2` or 3 | Filesystem | [A checksum per block, in its block pointer][zfs-sum] | Yes, [from another copy][zfs-sum] | [Space ×2 or ×3; the copies go to different disks when possible][zfsprops] |
+| btrfs, data in `DUP` | Filesystem | crc32c by default, see [Other systems](#other-systems) | Yes, from the other copy | Space ×2; [an SSD may keep the two copies once, or in one unit that dies with both][btrfs-mkfs] |
+| ReFS, integrity streams | Filesystem | A checksum of the data of a file | [Only on a mirror or parity space; on a bare drive an error][refs] | [Every write is allocated anew, so files fragment][refs] |
+| par2 | Files, by hand | Its own checksums | Yes: [Reed-Solomon recovery files of the size chosen][par2] | The size chosen; made and used by hand, over files that no longer change |
+| `dm-dcorr` | Block device | CRC64 per 512 B sector, two copies, with the place and the salt | Not yet: ECC between chunks, in the correction stage | About 3% for the metadata and 6.25% reserved for the parity |
+
+### What follows
+
+- **Correction on one writable drive, below any filesystem, at less than a full copy** can be assembled today
+  only by hand: LVM raid5 with integrity over three partitions of one drive. It is not made for it: three
+  members of a stripe far apart on an HDD, writes multiplied by RAID and by the journal, and detection only after
+  the tags of the whole device are [initialized][lvmraid-init]. Filesystems give it at a full copy, and only for
+  themselves.
+- **`dm-verity` is the closest model for the correction stage**: it corrects with Reed-Solomon over blocks
+  interleaved across the device, and uses its hashes for the places of the erasures, as point 1 of
+  [the section above](#what-follows-for-this-driver-1) plans with the CRCs. It is read only, so it never updates
+  its parity, which is the hard part for us.
+- **Copies on one drive share its fate.** btrfs warns that an SSD may deduplicate the copies or keep them in one
+  unit, as point 9 of [the section above](#what-follows-for-this-driver-1) says for our metadata; and nothing on
+  one drive survives the loss of the whole drive.
+- **Crash consistency without a journal** sets the driver apart from `dm-integrity`, which [either journals
+  every write or, with a bitmap, loses detection in the regions dirty at a crash][int-bitmap]: two copies of the
+  CRCs and the settle cost one FUA metadata write per write back, and nothing is left unchecked, see
+  [A write cut short by a crash](#a-write-cut-short-by-a-crash-two-crcs).
 
 [wc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-writecache.c?h=v7.2
 [wc-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/writecache.rst?h=v7.2
@@ -335,3 +378,20 @@ So redundancy on one device cheaper than a full copy, below any filesystem, is n
 [bcachefs]: https://lwn.net/Articles/1040120/
 [int-seed]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-integrity.c?h=v7.2#n1668
 [int-salt]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/md/dm-integrity.c?h=v7.2#n4170
+[int-standalone]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/dm-integrity.rst?h=v7.2#n23
+[int-bitmap]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/dm-integrity.rst?h=v7.2#n28
+[int-modes]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/dm-integrity.rst?h=v7.2#n75
+[verity-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2
+[verity-ro]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2#n7
+[verity-roots]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2#n119
+[verity-fec]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/admin-guide/device-mapper/verity.rst?h=v7.2#n223
+[bi-doc]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/block/data-integrity.rst?h=v7.2
+[bi-dif]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/block/data-integrity.rst?h=v7.2#n45
+[lvmraid]: https://man7.org/linux/man-pages/man7/lvmraid.7.html
+[lvmraid-int]: https://man7.org/linux/man-pages/man7/lvmraid.7.html#DATA_INTEGRITY
+[lvmraid-mode]: https://man7.org/linux/man-pages/man7/lvmraid.7.html#DATA_INTEGRITY
+[lvmraid-init]: https://man7.org/linux/man-pages/man7/lvmraid.7.html#DATA_INTEGRITY
+[zfsprops]: https://openzfs.github.io/openzfs-docs/man/master/7/zfsprops.7.html
+[zfs-sum]: https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Data%20Storage/Checksums.html
+[refs]: https://learn.microsoft.com/en-us/windows-server/storage/refs/integrity-streams
+[par2]: https://github.com/Parchive/par2cmdline
