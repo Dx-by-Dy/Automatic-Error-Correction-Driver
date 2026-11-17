@@ -1,5 +1,7 @@
 # dm-dcorr
 
+[Русская версия](docs/ru/README.md)
+
 **A Linux device mapper target that keeps the data of a failing drive readable long enough to move it.** It
 checks every sector it reads against a CRC64 of its own, turns damaged data into a read error instead of wrong
 data, and raises an alarm at the first sign of trouble. Correction of damaged data with an error correcting code is
@@ -102,7 +104,7 @@ sudo dmsetup remove dcorr
 | Test base | 368 tests in a VM: data, damage, crashes replayed from a log, failing drives, filesystems, load | Done; the commit before the cache is to be marked for the baseline |
 | Cache | A write back cache of its own, flushes and FUA | Done |
 | Integrity and format | Groups and superblocks, two copies of the CRCs, the bitmap of written chunks, discard | Done |
-| Device mapper integration | Counters, the event, the table, queue limits, write zeroes; this documentation | In progress |
+| Device mapper integration | Counters, the event, the table, queue limits, write zeroes; this documentation | Done |
 | Runs | Neighbouring chunks written back as one request | Next |
 | Baseline | Benchmarks on a non-debug kernel | Planned |
 | Correction | An erasure code across chunks, rebuilding damaged data | Planned |
