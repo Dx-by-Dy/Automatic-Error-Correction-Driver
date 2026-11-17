@@ -97,10 +97,6 @@ The goal of the project; only detection exists today.
 
 Moved to [TODO_OPTIMIZATION.md](TODO_OPTIMIZATION.md).
 
-## Documentation
-
-- **The README claims functional testing is done**, and does not mention the VM.
-
 ## Stages
 
 1. **Test base.** Data, corruption, filesystem, fio, target, durability, crash, lower device error
