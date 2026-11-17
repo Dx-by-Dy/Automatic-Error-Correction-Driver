@@ -1,399 +1,140 @@
 # dm-dcorr
 
-Linux Device Mapper target providing block-level data integrity verification using CRC64 checksums.
+[Русская версия](docs/ru/README.md)
 
-## Overview
+**A Linux device mapper target that keeps the data of a failing drive readable long enough to move it.** It
+checks every sector it reads against a CRC64 of its own, turns damaged data into a read error instead of wrong
+data, and raises an alarm at the first sign of trouble. Correction of damaged data with an error correcting code is
+the next big step: room for its parity is already in the on-disk format.
 
-dm-dcorr, disk correction, is a Linux kernel module implemented as a Device Mapper target. The driver creates a virtual block device on top of an existing storage device and transparently intercepts read and write requests.
+> **Status: in development.** Detection works and is tested in depth; correction and performance work are ahead,
+> see [the stages](#status). Do not trust it with data you have no other copy of yet.
 
-For each data block, the driver calculates a CRC64 checksum and stores it in a dedicated metadata area. During read operations, the checksum is recalculated and compared with the stored value, allowing detection of silent data corruption.
+## Why
 
-The project serves as a foundation for future implementation of Error Correcting Codes (ECC), enabling not only error detection but also automatic data recovery.
+Drives rarely die at once. Sectors stop reading, bits rot silently, writes get lost at a power cut, and after the
+first error a drive is 14 to 39 times more likely to fail within two months
+([the reading behind it](docs/en/RESEARCH.md#drive-failures)). A filesystem trusts what the drive returns, so
+silent damage spreads into backups. dm-dcorr sits between the filesystem and the drive and makes damage visible
+the moment it is read.
 
-## Features
-
-* Device Mapper target implementation
-* Transparent block-level integrity verification
-* CRC64 checksum calculation and validation
-* Dedicated metadata storage
-* Concurrent I/O processing
-* Chunk-level synchronization
-* Compatibility with standard Linux file systems
-* Detection of data corruption caused by media errors or software faults
-
-## Architecture
-
-The threat model, the guarantees to the layer above, the on-disk format and the planned cache are in
-[ARCHITECTURE.md](docs/en/ARCHITECTURE.md). This section describes the driver as it is.
-
-The lower device is a sequence of groups of one size, 1 GiB by default, each with a header of 1 MiB written by
-`dcorrsetup format`: a copy of the superblock and the bitmaps of written chunks. The virtual device is divided
-into chunks of 4 KiB, 8 sectors, and the slots of the chunks on the lower device into regions of 1024, 4 MiB,
-as `dm-integrity` does. The metadata of a chunk is an entry of 8 CRC64 checksums, one per sector, 64 bytes,
-each over the salt of the device, the logical sector and its data, so that data in another place or from another
-device, or zeros with zeroed metadata, do not pass; a
-metadata sector holds the entries of 8 neighbouring chunks. The metadata of a region is kept in two copies: the
-leading one next to its slots, the trailing one in the next region of the group.
-
-### Layout
-
-```text
-lower device
-+---------+---------+-----+-------------+
-| group 0 | group 1 | ... | group G - 1 |    the last group may be short
-+---------+---------+-----+-------------+
-
-group of 1 GiB
-+--------+-----------+-----------+-----+-------------+
-| header | region 0  | region 1  | ... | region 247  |    other sizes leave the end of the group unused
-| 1 MiB  | 4.125 MiB | 4.125 MiB |     | 4.125 MiB   |
-+--------+-----------+-----------+-----+-------------+
- slots of the group in 32 columns: 30 of data, in order, then 2 kept for parity
-
-region i of a group
-+------------+------------+-------------+
-| trailing   | leading    | slots       |
-| region i-1 | region i   | 1024 chunks |    region 0 holds the trailing copy of the last region of the group
-| 128 sect.  | 128 sect.  | 8192 sect.  |
-+------------+------------+-------------+
+```mermaid
+flowchart TD
+    fs["Filesystem or any user of a block device"] --> dcorr
+    subgraph dcorr["dm-dcorr"]
+        cache["Write back cache in RAM"]
+        crc["CRC64 per 512-byte sector, two copies"]
+        bitmap["Bitmap of written chunks"]
+        signal["Counters and an event at the first error"]
+    end
+    dcorr --> drive[("The drive")]
 ```
 
-The header of a group holds the superblock, 4 KiB, with the version of the format, the number of the group, a
-generation, a UUID, a random salt, the size of the lower device, all parameters of the layout and a CRC64; then
-the leading copy of the bitmap of the group and the trailing copy of the one of the group before, 4 KiB blocks
-of 32512 bits each, and room for the dirty stripes of the parity. The driver reads the superblocks of groups 0
-and 1 when the target is created, takes the valid one with the larger generation, and refuses a device with
-neither, or of another size than it was formatted for; with group 0 damaged it looks for group 1 at each size
-of a group. Then it reads the header of every group, checks its superblock, counting and naming one that is not
-valid or differs, and takes each block of the bitmap from its valid copy with the larger generation; this on
-the first resume of the table, so that on a reload the old table has written its bitmap first. The parity
-columns are reserved, not written. The layout is computed by `src/dcorr-format.h`, which the driver and
-`dcorrsetup` share.
+## What it gives today
 
-The logical chunks of a group take the first 30/32 of its slots in order, so the leading copy of a region and its
-data stay one contiguous range, aligned to 128 KiB. About 930 MiB of a group of 1 GiB hold data: the header
-0.1%, the metadata 3%, the parity 6.25%.
+- **Silent damage is caught.** Every sector read is checked against its CRC; a sector that does not match fails
+  with `EIO`, and only that sector. The CRC covers the salt of the device and the place of the sector, so data
+  written to the wrong place, taken from another device or read back as zeros is caught too.
+  [Threat model](docs/en/ARCHITECTURE.md#threat-model)
+- **A crash leaves old or new data, never a false error.** The CRCs are kept in two copies, written in an order
+  that survives a write cut short, so the driver never mistakes an interrupted write for damage.
+  [Contract](docs/en/ARCHITECTURE.md#contract-with-the-layer-above)
+- **Lost writes are caught.** A write the drive acknowledged and dropped fails its CRC once the next flush has
+  passed. [Diagram](docs/en/DIAGRAMS.md#lost-writes)
+- **A failing drive keeps working where it can.** A sector that does not read fails only the requests over it; a
+  write that fails stays in RAM and is retried, and flushes fail until it is written.
+  [Errors](docs/en/ARCHITECTURE.md#errors)
+- **Every error is a signal.** `dmsetup status` counts failed reads, writes and flushes and damaged sectors, the
+  first error raises a device mapper event for `dmsetup wait` or `dmeventd`, and the kernel log names the device
+  and the sector. [Interface](docs/en/ARCHITECTURE.md#interface)
+- **An ordinary block device.** Filesystems run on it unchanged: flushes and FUA writes are honoured, discard
+  and write zeroes work in chunks of 4 KiB, and about 91% of the drive holds data, with groups of 1 GiB; the rest
+  is metadata, about 3%, and room reserved for parity, 6.25%. [On-disk format](docs/en/ARCHITECTURE.md#on-disk-format)
 
-The leading copy is written with each write back of a chunk, the trailing one after the lower device has
-flushed that write back, so once everything is flushed both copies hold the same. A read takes the checksum of
-a sector from either copy, so a metadata sector lost in one copy costs nothing; it is lost only when both are.
+What happens on a read:
 
-### Bitmap of Written Chunks
+```mermaid
+flowchart LR
+    read(["A read"]) --> cached{"In the cache?"}
+    cached -- yes --> data["Data from RAM"]
+    cached -- no --> written{"Ever written?"}
+    written -- no --> zeros["Zeros, without a read of the drive"]
+    written -- yes --> lower["Read the drive"] --> check{"Matches its CRC?"}
+    check -- yes --> data2["Data"]
+    check -- no --> eio["EIO for that sector, counted, logged, an event if first"]
+```
 
-One bit per slot, the whole bitmap in RAM, 32 MiB per TiB. A chunk whose bit is clear has never been written
-back since the format: it reads as zeros, without a read of the lower device or its metadata, so a device is
-formatted, never zeroed. The first write back of such a chunk writes it whole, the sectors not written from
-above as zeros, and sets its bit in RAM once it succeeds; the bit reaches the device with the next flush, see
-[Flushes](#flushes). A copy of a block is valid with its CRC, which starts from the salt, its group, its index
-and its role. A block valid in one copy is repaired by the next flush, unless the table is read only. A block
-invalid in both makes its range read only: its chunks are read as written, so their CRC decides, and writes
-and discards there fail. The code is in `src/written.c`.
+More situations, each with the tests that cover it, are in [DIAGRAMS.md](docs/en/DIAGRAMS.md).
 
-### Discard
+## Quick start
 
-The device offers discard in whole chunks (`discard_granularity` 4 KiB, no limit of its own on the length) and
-does not pass it down. Device mapper does not split a discard at the chunks, only the block layer by these
-limits. The worker of the cache carries it out: it waits for the write backs in flight, drops the entries of
-the whole chunks of the range with their data, clears their bits and completes the bio; the partial chunks at
-the ends are left as they are. The worker does it, not `dm_map`, as a sync writes the blocks of the bitmap from
-RAM and no bit may change under it. The cleared bits reach the device with the next flush, so the discarded
-chunks may hold their old data after a crash before it. Until then the bit of such a chunk is still set on the
-device, so its first write back, which writes it whole and does not settle its metadata, syncs first, counted
-as a barrier. Write zeroes is not offered: device mapper offers it only through `iterate_devices` with every
-device below capable, so the kernel zeroes with writes.
-
-### Cache
-
-Every write goes through a write back cache of 64 MiB per device, allocated when the target is created: one
-entry per chunk of data, with a page, a mask of the sectors written into it, a place in a tree ordered by chunk
-and a place in a list ordered by age. Device mapper splits requests at chunk boundaries, so each piece of a
-write is copied into the entry of its chunk and completes at once. The code is in `src/cache.c`.
-
-A worker writes the entries back: those older than 1 second, as many as keep at least 55% of the entries
-free once more than half are in use, and all of them for a flush, a FUA write or a suspend. Writes to an
-entry under write back, and writes that find no free entry, wait in `dm_map`. Reads of the clean sectors of an entry under write back wait there too,
-so that a stream of them cannot hold the write back off. An entry whose write back
-failed keeps its data and is tried again on the next flush, suspend or write to it. If every entry has failed,
-new writes fail.
-
-### Write Path
-
-1. Splitting the request into chunks;
-2. Copying each piece into the entry of its chunk in the cache, and completing it;
-3. Writing back the entry later, once no read of the chunk is in flight. If the chunk was written back since
-   the last flush of the lower device, the worker flushes first: its data could otherwise be any of three
-   versions. If the two copies of its metadata differ in the sectors to be written, after a crash or a failed
-   write back, the chunk is read, and a sector that matches the leading copy gets that checksum in the trailing
-   copy, written with FUA. A chunk never written is not read: it is written whole, with zeros around what was
-   written from above.
-4. One lower write per run of its dirty sectors, each of which calculates the checksums, puts them into the
-   leading copy of the metadata of the region in RAM, writes the leading metadata sector of the chunk from
-   there with FUA, and only then the data.
-5. After the next flush of the lower device, writing the trailing copy of the metadata sectors of the chunks
-   written back, and flushing again. Until then the trailing copy has the checksums of the old data and the
-   leading one those of the new, so after a crash each sector reads its old or its new data.
-
-### Read Path
-
-1. Splitting the request into chunks;
-2. Copying the sectors held in the cache, and completing them;
-3. Completing with zeros the chunks never written, see the bitmap;
-4. For the others: registering the read in the cache, copying both entries of the chunk from the metadata of
-   its region in RAM, reading the data, unregistering it, calculating the checksums and accepting a sector that
-   matches either entry, completing the request.
-
-### Metadata in RAM
-
-The driver keeps the metadata of the regions it used in RAM: 32 areas, each with both copies of 64 KiB, 4 MiB
-per device, which cover 128 MiB of data. The first read or write back that needs a region reads both copies,
-one request each, on a workqueue of its own; whoever needs it meanwhile waits, `dm_map` included. Then reads
-and write backs of the region take the checksums from RAM, and a write back changes the leading copy there in
-place before it writes the sector. The trailing copy in RAM changes only when it is written.
-
-An area with chunks written back since the last flush is pinned until their trailing copy is written. When
-another region needs a place, the area used longest ago that nobody holds is dropped. When half the areas are
-held or pinned, the worker of the cache flushes the lower device and writes the trailing copies by itself,
-before it writes back the next chunk. A suspend writes them and then drops every area, as the lower device may
-change before the device is resumed; damage done to metadata on the lower device is not seen until then.
-
-If the read of a copy fails, its sectors are read one at a time. A sector that failed in one copy is taken from
-the other in RAM, and a rate-limited warning names each chunk read or written with one copy; the next write of
-that sector puts it right. Only the chunks whose entries are in a sector failed in both copies fail, and an area
-with such sectors is read again by the next request that finds it unused. A trailing sector that fails to write
-is counted, and its chunks go on with the leading copy.
-
-### Flushes
-
-The device reports a write cache with FUA. An empty flush and a FUA write go to the worker of the cache, which
-writes back everything dirty, waits for it, and flushes the lower device. Then it writes the first copy of each
-block of the bitmap with new bits, and flushes again, so a bit on the device means its data is durable. The
-flush completes then, and fails while any entry has failed to write back, or when a block of the bitmap failed
-to write, as it would promise data that is not on the device. After that the worker writes the trailing copies
-of the metadata and the other copies of the blocks, and flushes the lower device again, so that both copies are
-durable before the chunks are written back again. A suspend writes back everything
-too, so a table reload or a removal loses nothing, except chunks that still fail to write: they are named
-in the kernel log. A discard goes to the worker too, see [Discard](#discard); any other operation is refused.
-
-### Synchronization
-
-Only reads from the lower device and write backs of the cache reach the lower device, and the cache keeps
-them apart, the way `dm-integrity` keeps its ranges in flight:
-
-* A read from the lower device is put into a tree of reads in flight of the cache, ordered by chunk, before it
-  is sent, and taken out when it completes. The node is in the per-bio data of the read, so this allocates
-  nothing.
-* A write back of an entry waits in the worker of the cache until no read of its chunk is in flight. A read
-  that met it could get the data of one version of a sector and the checksum of another, and fail.
-* New reads of the clean sectors of an entry under write back wait in `dm_map`, so the reads of a chunk end.
-  Reads of its dirty sectors are copied from the cache.
-* The lower writes of the chunks of one metadata sector go one at a time, those of one entry and of its
-  neighbours alike, as each writes that sector from the same memory: a second one would change it under the
-  first, which could then carry the checksums of data not yet written. The end of one starts the next,
-  without a worker waiting.
-
-The cache has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O. Every
-read from the lower device takes it twice.
-
-### Memory
-
-Nothing on the I/O path allocates memory. The cache, with its pages and 256 write back jobs, and the metadata in RAM, with its 32 areas and a scratch area where the trailing sectors are built, are allocated when the target is created. A part lives in the per-bio data of its bio, or in a write back job, with its metadata structure and its metadata bio embedded in it: a read keeps a copy of both entries of its chunk, a write writes its leading metadata sector from the area in RAM. `dm_map` and the worker of the cache wait for an area to be read, or to be let go when all are in use; the workers of `transform_wq` never wait, as they run the completions that let areas go.
-
-At most 4096 parts, reads and write back jobs, are in flight per device. A bio-based device has no request queue with tags, so `dm_map` and the worker wait for a place instead, which slows down the submitter as a full disk queue would. Ordinary load never reaches the limit: 4096 parts are 16 MiB of data, far more than the lower disk queues.
-
-## Building
-
-### Requirements
-
-* Linux kernel headers
-* GNU Make
-* GCC or Clang
-
-### Build
+It is built and tested with Linux 7.1 and 7.2. You need the headers of your kernel, `make` and a C compiler.
 
 ```bash
-make
-```
-
-This builds the module and the utility:
-
-```text
-dm-dcorr.ko
-tools/dcorrsetup
-```
-
-## Installation
-
-Load the module:
-
-```bash
+make                                   # dm-dcorr.ko and tools/dcorrsetup
+sudo modprobe dm-mod
 sudo insmod dm-dcorr.ko
 ```
 
-Verify that the module is loaded:
+Format a device and put the driver on it. **Formatting overwrites the headers of the device**, so take one
+whose data you do not need:
 
 ```bash
-lsmod | grep dm_dcorr
+sudo tools/dcorrsetup format /dev/sdX
+sudo tools/dcorrsetup table /dev/sdX | sudo dmsetup create dcorr
+sudo mkfs.ext4 /dev/mapper/dcorr
 ```
 
-## Device Mapper Setup
+`dcorrsetup format` refuses a device in use or one that already holds a valid superblock, unless given
+`--force`; `--group-size` chooses the size of a group, `1G` by default. The device need not be zeroed: chunks
+never written read as zeros. The lower device must have logical blocks of 512 bytes.
 
-Format the underlying device, then create the target with the line `dcorrsetup table` prints, as its length
-must be the capacity recorded in the superblock:
+Watch it:
 
 ```bash
-tools/dcorrsetup format <underlying_device>
-tools/dcorrsetup table <underlying_device> | dmsetup create dcorr
+sudo dmsetup status dcorr              # 26 counters, see Interface
+sudo dmsetup wait dcorr                # returns once an event is raised, as at the first error
+sudo dmsetup remove dcorr
 ```
 
-`dcorrsetup format` refuses a device in use, one smaller than two groups, and one that already holds a valid
-superblock unless given `--force`. `--group-size SIZE` chooses the size of a group, a power of two from `16M`
-to `4G`, `1G` by default. `dcorrsetup dump <underlying_device>` prints the superblock and the layout. The
-underlying device need not be zeroed: chunks never written read as zeros.
+## Status
 
-Verify device creation:
+| Stage | What | State |
+| --- | --- | --- |
+| Test base | 368 tests in a VM: data, damage, crashes replayed from a log, failing drives, filesystems, load | Done; the commit before the cache is to be marked for the baseline |
+| Cache | A write back cache of its own, flushes and FUA | Done |
+| Integrity and format | Groups and superblocks, two copies of the CRCs, the bitmap of written chunks, discard | Done |
+| Device mapper integration | Counters, the event, the table, queue limits, write zeroes; this documentation | Done |
+| Runs | Neighbouring chunks written back as one request | Next |
+| Baseline | Benchmarks on a non-debug kernel | Planned |
+| Correction | An erasure code across chunks, rebuilding damaged data | Planned |
+| Optimization | What was left simple for correctness first | Planned |
 
-```bash
-ls -l /dev/mapper/dcorr
-```
+Performance has not been measured on this version yet; the numbers of the first version, which had no cache, are
+in [its documentation](docs/ru/archive/full_docs.pdf), in Russian. The details of every stage are in
+[TODO.md](docs/en/TODO.md#stages).
 
-Show the counters:
+## Documentation
 
-```bash
-dmsetup status dcorr
-```
+| Document | What is in it |
+| --- | --- |
+| [ARCHITECTURE.md](docs/en/ARCHITECTURE.md) | How it works: a glossary, the threat model, the contract, the format, the I/O path, the interface |
+| [DIAGRAMS.md](docs/en/DIAGRAMS.md) | Its situations as pictures, with the tests that cover them |
+| [DECISIONS.md](docs/en/DECISIONS.md) | Why it is built this way: each choice, the options, the reasons |
+| [RESEARCH.md](docs/en/RESEARCH.md) | The reading behind it: how drives fail, how other targets do it |
+| [TESTS.md](docs/en/TESTS.md) | What the tests check, and how they were shown to catch bugs |
+| [DEPLOY.md](docs/en/DEPLOY.md) | The development VM, where the driver is built, loaded and tested |
+| [TODO.md](docs/en/TODO.md) | What is not done yet, and the stages |
+| [TODO_OPTIMIZATION.md](docs/en/TODO_OPTIMIZATION.md) | What was left simple, to be measured and improved |
 
-After the usual `<start> <length> dcorr`, it prints nineteen counters: how many times a read waited in `dm_map` for a place among the parts in flight, how many times a write waited for a free entry of the cache, how many times a write waited for an entry under write back, how many reads waited for the write back of their chunk, the entries holding data not yet on the lower device, the entries whose write back failed, how many metadata areas were read from the lower device, how many times anything waited for a metadata area as all were in use, how many sectors of the trailing copy of the metadata failed to write, how many times the worker flushed and wrote the trailing copies by itself as too many metadata areas were busy, how many times it flushed before writing back a chunk written back since the last flush, how many chunks it read before a write back as their two copies of the metadata differed, how many sectors so read matched neither copy or did not read, how many chunks were read as zeros as never written, how many blocks of the bitmap were invalid in both copies and how many had one valid copy when the target was created, how many copies of the superblock of groups 2 and on are not valid or differ, how many copies of blocks of the bitmap failed to write, and how many writes were refused in a read only range.
+## Development
 
-## Usage
-
-Create a filesystem:
-
-```bash
-mkfs.ext4 /dev/mapper/dcorr
-```
-
-Mount:
-
-```bash
-mount /dev/mapper/dcorr /mnt/test
-```
-
-Unmount:
-
-```bash
-umount /mnt/test
-```
-
-Remove Device Mapper target:
-
-```bash
-dmsetup remove dcorr
-```
-
-## Testing
-
-The driver is built, loaded and tested only in a development VM with a debug kernel, never on the host:
-see [deploy/README.md](deploy/README.md). The tests are described in
-[tests/README.md](tests/README.md).
-
-### Write and Read Benchmarks
-
-Uncompetitive write benchmark:
-
-```bash
-fio --name=test                               \
-    --filename=/dev/mapper/dcorr             \
-    --rw=write                                \
-    --bs=16k                                  \
-    --direct=1                                \
-    --ioengine=libaio                         \
-    --iodepth=1                               \
-    --numjobs=1                               \
-    --time_based                              \
-    --runtime=30
-```
-
-Competitive write benchmark:
-
-```bash
-fio --name=test                               \
-    --filename=/dev/mapper/dcorr             \
-    --rw=write                                \
-    --bs=16k                                  \
-    --direct=1                                \
-    --ioengine=libaio                         \
-    --iodepth=32                              \
-    --numjobs=8                               \
-    --time_based                              \
-    --runtime=30
-```
-
-Uncompetitive read benchmark:
-
-```bash
-fio --name=test                               \
-    --filename=/dev/mapper/dcorr             \
-    --rw=read                                 \
-    --bs=16k                                  \
-    --direct=1                                \
-    --ioengine=libaio                         \
-    --iodepth=1                               \
-    --numjobs=1                               \
-    --time_based                              \
-    --runtime=30
-```
-
-Competitive read benchmark:
-
-```bash
-fio --name=test                               \
-    --filename=/dev/mapper/dcorr             \
-    --rw=read                                 \
-    --bs=16k                                  \
-    --direct=1                                \
-    --ioengine=libaio                         \
-    --iodepth=32                              \
-    --numjobs=8                               \
-    --time_based                              \
-    --runtime=30
-```
-
-## Performance Characteristics
-
-See [docs](docs/ru/full_docs.pdf).
-
-## Current Status
-
-### Implemented
-
-* CRC64 integrity verification
-* Metadata storage subsystem
-* Read path
-* Write path
-* Concurrent request synchronization
-* Device Mapper integration
-* Functional testing
-* Performance evaluation
-
-### Planned
-
-* Error Correcting Codes (ECC)
-* Automatic error recovery
-* Metadata caching
-* Improved synchronization mechanisms
-* Reduced I/O amplification
-* Architecture optimizations
+The driver is built, loaded and tested only in a QEMU VM with a debug kernel (KASAN, lockdep, kmemleak), never on
+the host of the developer: `deploy/vm.sh test` runs the tests there, `deploy/vm.sh check` the compiler warnings,
+sparse and checkpatch. Crashes are replayed from a log of the writes, failing drives are made with `dm-dust` and
+`dm-flakey`, and every new test is shown to fail on a deliberately broken driver. See
+[DEPLOY.md](docs/en/DEPLOY.md) and [TESTS.md](docs/en/TESTS.md).
 
 ## License
 
-GPL-2.0
-
-## Author
-
-Alexey Smirnov
-
-## Research Context
-
-This project was developed as part of a research effort focused on block-level data integrity mechanisms for Linux storage subsystems.
-
-The current implementation provides integrity verification and serves as a foundation for future ECC-based error correction capabilities.
+GPL-2.0. Author: Alexey Smirnov. Developed as part of research into block-level data integrity for Linux storage.

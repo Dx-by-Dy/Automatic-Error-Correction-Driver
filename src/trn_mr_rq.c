@@ -36,9 +36,11 @@ blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
 /// of the bio reading the data, completed via trn_p_rq_end_io.
 ///
 /// Computes CRC64 for each data sector of bio, from the seed of its logical
-/// sector, see data_crc.h, comparing the result with both copies of the entry of the chunk: a sector
-/// passes if it matches either. On CRC mismatch, sets the status of the part
-/// and outputs error to the log.
+/// sector, see data_crc.h, comparing the result with both copies of the entry
+/// of the chunk: a sector passes if it matches either. Every sector of the bio
+/// is checked, so that crc_mismatches counts the damaged sectors, not the
+/// reads. On a mismatch, sets the status of the part and logs the first
+/// damaged sector and how many there are.
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure
@@ -56,7 +58,8 @@ void check_crc(struct trn_mr_rq *meta)
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = data_crc_seed(salt_crc, sector);
     unsigned int in_sector_pos = 0;
-    bool crc_error = false;
+    unsigned int mismatches = 0;
+    sector_t first_mismatch = 0;
     struct bvec_iter iter = meta->saved_iter;
 
     while (iter.bi_size)
@@ -77,7 +80,7 @@ void check_crc(struct trn_mr_rq *meta)
             if (in_sector_pos == SECTOR_SIZE)
             {
                 DM_DEBUG("sector=%llu, sector_idx=%u, lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
-                         (unsigned long long)(meta->part->index + sector_idx),
+                         (unsigned long long)sector,
                          sector_idx,
                          (unsigned long long)le64_to_cpu(lead->crc[sector_idx]),
                          (unsigned long long)le64_to_cpu(trail->crc[sector_idx]),
@@ -86,10 +89,9 @@ void check_crc(struct trn_mr_rq *meta)
                 if (lead->crc[sector_idx] != cpu_to_le64(current_crc) &&
                     trail->crc[sector_idx] != cpu_to_le64(current_crc))
                 {
-                    crc_error = true;
-                    sector_idx++;
-                    kunmap_local(addr);
-                    goto out;
+                    if (!mismatches)
+                        first_mismatch = sector;
+                    mismatches++;
                 }
                 sector_idx++;
                 current_crc = data_crc_seed(salt_crc, ++sector);
@@ -101,15 +103,13 @@ void check_crc(struct trn_mr_rq *meta)
         bio_advance_iter_single(part->bio, &iter, bvec.bv_len);
     }
 
-out:
-    if (crc_error)
+    if (mismatches)
     {
-        DM_ERR("CRC mismatch at sector %llu (+%u on chunk): lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
-               (unsigned long long)(meta->part->index + sector_idx - 1),
-               sector_idx - 1,
-               (unsigned long long)le64_to_cpu(lead->crc[sector_idx - 1]),
-               (unsigned long long)le64_to_cpu(trail->crc[sector_idx - 1]),
-               (unsigned long long)current_crc);
+        atomic64_add(mismatches, &part->dm_ctx->crc_mismatches);
+        dcorr_error(part->dm_ctx->ti);
+        DM_DEV_ERR_LIMIT(part->dm_ctx->ti, "CRC mismatch in %u of %u sectors read at sector %llu, the first at sector %llu\n",
+                         mismatches, meta->nr_sectors, (unsigned long long)part->sector,
+                         (unsigned long long)first_mismatch);
 
         part->status = BLK_STS_IOERR;
 

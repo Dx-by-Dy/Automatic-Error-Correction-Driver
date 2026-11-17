@@ -1,14 +1,15 @@
 # Research
 
-What the decisions in [ARCHITECTURE.md](ARCHITECTURE.md) are based on: how others solved the same problems, what
-it costs, and what follows for this driver. Decisions live in `ARCHITECTURE.md`; this file holds the reasons.
+What the decisions in [DECISIONS.md](DECISIONS.md) are based on: how others solved the same problems, what it
+costs, and what follows for this driver. The decisions live in `DECISIONS.md`, the driver as it is in
+[ARCHITECTURE.md](ARCHITECTURE.md); this file holds the reading.
 
 Unless said otherwise, the findings come from reading the sources of Linux v7.2. Nothing here was run or
 measured, so there are no performance numbers of our own.
 
 ## Caches and integrity in device mapper
 
-Read on 2026-11-11, to answer the open points of [Cache](ARCHITECTURE.md#cache).
+Read on 2026-11-11, to answer the open points of the cache, decided as [D4](DECISIONS.md#d4-a-write-back-cache-of-our-own-in-ram).
 
 Sources: [`dm-writecache.c`][wc] and [its documentation][wc-doc], [`dm-integrity.c`][int] and
 [its documentation][int-doc], [`dm-bufio.c`][buf] and [`dm-bufio.h`][buf-h], [`dm-ebs-target.c`][ebs].
@@ -57,7 +58,7 @@ Sources: [`dm-writecache.c`][wc] and [its documentation][wc-doc], [`dm-integrity
 ## A write cut short by a crash: two CRCs
 
 Discussed on 2026-11-11, for point 3 of the [contract](ARCHITECTURE.md#contract-with-the-layer-above) and the
-options in [Cache](ARCHITECTURE.md#cache). The metadata holds the old and the new CRC of each sector and is made
+options of [D5](DECISIONS.md#d5-a-write-cut-short-by-a-crash-two-crcs). The metadata holds the old and the new CRC of each sector and is made
 durable before the data; a read accepts either. A drive is atomic per sector, so after a crash each sector
 holds its old or its new contents, and one of the two matches.
 

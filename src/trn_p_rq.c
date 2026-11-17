@@ -8,7 +8,8 @@
 /// part failed before any I/O.
 ///
 /// TRANSFORM_READ: leaves the tree of reads of the cache and on a successful
-/// read verifies the CRCs with check_crc.
+/// read verifies the CRCs with check_crc; a failed one is logged here, as the
+/// name of the device cannot be looked up in the completion of the bio.
 ///
 /// TRANSFORM_WRITE: releases the metadata bio.
 ///
@@ -31,6 +32,9 @@ static void complete_work(struct work_struct *work)
         cache_read_done(part->dm_ctx->cache, &part->range);
         if (!part->status)
             check_crc(&part->meta.read);
+        else if (part->read_failed)
+            DM_DEV_ERR_LIMIT(part->dm_ctx->ti, "read at sector %llu (%u sectors) failed on the lower device, status=%d\n",
+                             (unsigned long long)part->sector, part->meta.read.nr_sectors, part->status);
         break;
     case TRANSFORM_WRITE:
         bio_uninit(&part->meta_bio);
@@ -112,6 +116,7 @@ void trn_p_rq_init(struct trn_p_rq *part,
     part->dm_ctx = dm_ctx;
     part->bio = bio;
     part->type = type;
+    part->read_failed = false;
 
     switch (part->type)
     {
@@ -140,7 +145,9 @@ void trn_p_rq_init(struct trn_p_rq *part,
 
 /// @brief Handler for completion of the data bio
 /// @details
-/// On bio error, captures status in the part, then starts complete_work.
+/// On bio error, captures status in the part, then starts complete_work. A
+/// failed read is counted here; a failed write back is counted and logged by
+/// the cache, and a failed read logged by complete_work.
 ///
 /// Expected execution context - softirq.
 /// @param bio Completed bio
@@ -152,9 +159,13 @@ void trn_p_rq_end_io(struct bio *bio)
 
     if (bio->bi_status != BLK_STS_OK)
     {
-        DM_ERR_LIMIT("bio failed, bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
-
         WRITE_ONCE(part->status, bio->bi_status);
+        if (part->type == TRANSFORM_READ)
+        {
+            part->read_failed = true;
+            atomic64_inc(&part->dm_ctx->read_errors);
+            dcorr_error(part->dm_ctx->ti);
+        }
     }
 
     queue_work(part->dm_ctx->transform_wq, &part->complete_work);
@@ -165,6 +176,7 @@ void trn_p_rq_end_io(struct bio *bio)
 /// On success the leading sector is durable, so submit_work runs again to
 /// send the data. On error the data is not sent and the part completes with
 /// the error: the device keeps the old data, which the trailing copy matches.
+/// The cache counts and logs the failed write back.
 ///
 /// Expected execution context - softirq.
 /// @param bio Completed metadata bio
@@ -174,8 +186,6 @@ void trn_p_rq_meta_end_io(struct bio *bio)
 
     if (bio->bi_status != BLK_STS_OK)
     {
-        DM_ERR_LIMIT("metadata write failed, status=%d, sector=%llu\n", bio->bi_status,
-                     (unsigned long long)part->metadata_sector);
         WRITE_ONCE(part->status, bio->bi_status);
         queue_work(part->dm_ctx->transform_wq, &part->complete_work);
         return;

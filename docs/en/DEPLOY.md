@@ -16,6 +16,9 @@ deploy/vm.sh reset        # power off and start again, for a stuck kernel
 deploy/vm.sh stop
 ```
 
+The driver is developed, built and checked only in the VM. On the host `make check` stops with an error, as it
+would leave objects in the tree and check without the sparse of the VM; plain `make` is left for users.
+
 `deploy/vm.sh help` lists all commands and the settings, which are environment variables.
 
 ## Where things are
@@ -24,7 +27,7 @@ deploy/vm.sh stop
   the kernel console in `serial.log`, the console of the boot before in `serial.prev.log`.
 - The working tree is copied to `~/corrdm` in the VM, including uncommitted changes. Edit on the host, not in
   the VM: the next sync overwrites the copy.
-- The tests are described in [tests/README.md](../tests/README.md).
+- The tests are described in [TESTS.md](TESTS.md).
 
 ## The test disk
 
@@ -95,4 +98,16 @@ deploy/vm.sh test --no-sync -m "not slow"
 deploy/vm.sh sync                      # restore the copy
 ```
 
-The results so far are in the last section of the tests README.
+The results so far are in the last section of [TESTS.md](TESTS.md#do-the-tests-catch-bugs).
+
+## Checking the documentation
+
+The documents live in `docs/en/`, and in Russian in `docs/ru/`. Before a commit, run on the host:
+
+```bash
+tools/check-docs.py              # links and anchors, tests named, pairs of languages, mermaid diagrams
+tools/check-docs.py --no-mermaid # without the mermaid CLI, which npx fetches on its first run
+```
+
+It needs Python 3 and, for the diagrams, Node.js with `npx`. That the documents say the same as the code and as
+each other is checked by hand.

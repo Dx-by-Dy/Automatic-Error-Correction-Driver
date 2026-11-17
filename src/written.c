@@ -1,4 +1,5 @@
 #include <linux/bitmap.h>
+#include <linux/device-mapper.h>
 #include <linux/crc64.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
@@ -167,8 +168,8 @@ static void written_choose(struct written_map *map, u64 group, const unsigned lo
             if (le64_to_cpu(other->generation) > le64_to_cpu(lead->generation))
                 written_take(map, idx, trail[i]);
             else if (other->generation == lead->generation && memcmp(other->bits, lead->bits, sizeof(lead->bits)))
-                DM_WARN("block %u of the bitmap of group %llu: copies of one generation differ, taking the leading\n",
-                        i, (unsigned long long)group);
+                DM_DEV_WARN(map->ti, "block %u of the bitmap of group %llu: copies of one generation differ, taking the leading\n",
+                            i, (unsigned long long)group);
             continue;
         }
 
@@ -177,8 +178,9 @@ static void written_choose(struct written_map *map, u64 group, const unsigned lo
             memset(lead->bits, 0xff, sizeof(lead->bits));
             set_bit(idx, map->read_only);
             atomic64_inc(&map->read_only_blocks);
-            DM_ERR("block %u of the bitmap of group %llu is invalid in both copies, its chunks are read only\n",
-                   i, (unsigned long long)group);
+            dcorr_error(map->ti);
+            DM_DEV_ERR(map->ti, "block %u of the bitmap of group %llu is invalid in both copies, its chunks are read only\n",
+                       i, (unsigned long long)group);
             continue;
         }
 
@@ -189,8 +191,9 @@ static void written_choose(struct written_map *map, u64 group, const unsigned lo
         if (map->writable)
             set_bit(idx, map->dirty);
         atomic64_inc(&map->single_blocks);
-        DM_WARN("block %u of the bitmap of group %llu has only its %s copy valid, the next sync writes the other\n",
-                i, (unsigned long long)group, tv ? "trailing" : "leading");
+        dcorr_error(map->ti);
+        DM_DEV_WARN(map->ti, "block %u of the bitmap of group %llu has only its %s copy valid, the next sync writes the other\n",
+                    i, (unsigned long long)group, tv ? "trailing" : "leading");
     }
 }
 
@@ -238,8 +241,9 @@ static void written_read_header(struct written_map *map, u64 group, struct page 
                           DCORR_BITMAP_BLOCK_BYTES, REQ_OP_READ))
             __set_bit(p, read);
     }
-    DM_ERR("the header of group %llu failed to read, err=%d, %u of its %u blocks fail\n",
-           (unsigned long long)group, r, pieces - bitmap_weight(read, pieces), pieces);
+    dcorr_error(map->ti);
+    DM_DEV_ERR(map->ti, "the header of group %llu failed to read, err=%d, %u of its %u blocks fail\n",
+               (unsigned long long)group, r, pieces - bitmap_weight(read, pieces), pieces);
 }
 
 /// @brief Reads the bitmap of every group, and checks the superblock of every group but 0 and 1
@@ -286,7 +290,10 @@ static int written_load(struct written_map *map)
             if (reason)
             {
                 atomic64_inc(&map->bad_superblocks);
-                DM_WARN("the superblock of group %llu is not valid: %s\n", (unsigned long long)group, reason);
+                dcorr_error(map->ti);
+                DM_DEV_WARN(map->ti, "the superblock of group %llu is not valid: %s\n",
+                            (unsigned long long)group,
+                            reason);
             }
         }
 
@@ -304,8 +311,9 @@ static int written_load(struct written_map *map)
     }
     written_choose(map, layout->groups - 1, lead_ok, first_trail, first_read);
 
-    DM_INFO("bitmap of %llu groups read in %lld ms\n", (unsigned long long)layout->groups,
-            ktime_ms_delta(ktime_get(), begin));
+    DM_DEV_INFO(map->ti, "bitmap of %llu groups read in %lld ms\n",
+                (unsigned long long)layout->groups,
+                ktime_ms_delta(ktime_get(), begin));
     r = 0;
 
 out:
@@ -351,19 +359,20 @@ void written_destroy(struct written_map *map)
 /// @brief Allocates the bitmap, to be read from the device below by written_load_once
 /// @details
 /// Expected execution context - dm_ctr, may sleep.
+/// @param ti       The target, for its name in the log; ti->error is set on failure
 /// @param bdev     The device below
 /// @param sb       The superblock taken, which must outlive the bitmap
 /// @param writable Whether the table may write, so that blocks with one valid copy may be repaired
-/// @param error    The reason for the table, set on failure
 /// @return The bitmap, or an ERR_PTR
-struct written_map *written_create(struct block_device *bdev, const struct superblock_info *sb, bool writable,
-                                   char **error)
+struct written_map *written_create(struct dm_target *ti, struct block_device *bdev, const struct superblock_info *sb,
+                                   bool writable)
 {
     struct written_map *map = kzalloc_obj(*map, GFP_KERNEL);
 
     if (!map)
         goto nomem;
 
+    map->ti = ti;
     map->sb = sb;
     map->bdev = bdev;
     map->writable = writable;
@@ -399,7 +408,7 @@ struct written_map *written_create(struct block_device *bdev, const struct super
 nomem_map:
     written_destroy(map);
 nomem:
-    *error = "Cannot allocate the bitmap of written chunks";
+    ti->error = "Cannot allocate the bitmap of written chunks";
     return ERR_PTR(-ENOMEM);
 }
 
@@ -424,7 +433,8 @@ int written_load_once(struct written_map *map)
     r = written_load(map);
     if (r)
     {
-        DM_ERR("the bitmap of written chunks cannot be read for want of memory, err=%d\n", r);
+        DM_DEV_ERR(map->ti, "the bitmap of written chunks cannot be read for want of memory, err=%d\n",
+                   r);
         return r;
     }
     map->loaded = true;
@@ -504,9 +514,10 @@ int written_write_first(struct written_map *map)
         clear_bit(idx, map->pending);
         set_bit(idx, map->dirty);
         atomic64_inc(&map->write_errors);
-        DM_ERR_LIMIT("block %llu of the bitmap of group %llu failed to write, err=%d\n",
-                     (unsigned long long)(idx % map->sb->layout.bitmap_blocks),
-                     (unsigned long long)(idx / map->sb->layout.bitmap_blocks), map->ios[idx].error);
+        dcorr_error(map->ti);
+        DM_DEV_ERR_LIMIT(map->ti, "block %llu of the bitmap of group %llu failed to write, err=%d\n",
+                         (unsigned long long)(idx % map->sb->layout.bitmap_blocks),
+                         (unsigned long long)(idx / map->sb->layout.bitmap_blocks), map->ios[idx].error);
     }
 
     return r ? r : written;
@@ -542,9 +553,10 @@ void written_write_second(struct written_map *map)
         if (!io->error)
             continue;
         atomic64_inc(&map->write_errors);
-        DM_ERR_LIMIT("%s copy of block %llu of the bitmap of group %llu failed to write, err=%d\n",
-                     trail ? "trailing" : "leading", (unsigned long long)(idx % map->sb->layout.bitmap_blocks),
-                     (unsigned long long)(idx / map->sb->layout.bitmap_blocks), io->error);
+        dcorr_error(map->ti);
+        DM_DEV_ERR_LIMIT(map->ti, "%s copy of block %llu of the bitmap of group %llu failed to write, err=%d\n",
+                         trail ? "trailing" : "leading", (unsigned long long)(idx % map->sb->layout.bitmap_blocks),
+                         (unsigned long long)(idx / map->sb->layout.bitmap_blocks), io->error);
     }
 }
 

@@ -206,11 +206,18 @@ struct cache
 
     /// @brief How many whole chunks discards covered
     atomic64_t discarded_chunks;
+
+    /// @brief How many write back jobs failed, at the leading metadata sector or at the data
+    atomic64_t write_errors;
+
+    /// @brief How many flushes of the lower device failed
+    atomic64_t flush_errors;
 };
 
 struct cache *cache_create(struct dm_context *dm_ctx);
 void cache_destroy(struct cache *cache);
 void cache_write(struct cache *cache, struct bio *bio);
+void cache_write_zeroes(struct cache *cache, struct bio *bio);
 bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range);
 void cache_read_done(struct cache *cache, struct cache_range *range);
 void cache_flush(struct cache *cache, struct bio *bio);

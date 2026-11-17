@@ -6,7 +6,66 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alexey Smirnov");
-MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
+MODULE_DESCRIPTION("Device mapper target that detects damaged data with a CRC64 per sector");
+
+/// @brief Prints a message of the device, named as dmsetup names it
+/// @details
+/// The name is looked up for each message, so a rename shows at once; if the
+/// device has none, major:minor stands for it. Called through the DM_DEV_
+/// macros of macros.h, from process context with no spinlock held, as the
+/// lookup takes a mutex of device mapper. That mutex guards only the name, so
+/// it never waits for I/O.
+void dcorr_log(struct dm_target *ti, enum dcorr_level level, const char *func, const char *fmt, ...)
+{
+    char name[DM_NAME_LEN];
+    struct va_format vaf;
+    va_list args;
+
+    if (dm_copy_name_and_uuid(dm_table_get_md(ti->table), name, NULL))
+        strscpy(name, dm_table_device_name(ti->table));
+
+    va_start(args, fmt);
+    vaf.fmt = fmt;
+    vaf.va = &args;
+    switch (level)
+    {
+    case DCORR_LEVEL_ERR:
+        pr_err("[ERROR] " DM_MSG_PREFIX " %s [%s]: %pV", name, func, &vaf);
+        break;
+    case DCORR_LEVEL_WARN:
+        pr_warn("[WARN] " DM_MSG_PREFIX " %s [%s]: %pV", name, func, &vaf);
+        break;
+    case DCORR_LEVEL_INFO:
+        pr_info("[INFO] " DM_MSG_PREFIX " %s [%s]: %pV", name, func, &vaf);
+        break;
+    }
+    va_end(args);
+}
+
+/// @brief Raises the device mapper event of the first error
+static void dm_event_work(struct work_struct *work)
+{
+    struct dm_context *dm_ctx = container_of(work, struct dm_context, event_work);
+
+    dm_table_event(dm_ctx->ti->table);
+}
+
+/// @brief Records that the device met an error: of the lower device, or damaged data or metadata
+/// @details
+/// The first one since the table was created raises a device mapper event,
+/// which dmsetup wait and dmeventd see; the counters of dmsetup status tell
+/// what it was. Later errors raise none, so that a failing device does not
+/// keep the waiters busy. Any context: the event is raised from a work item,
+/// as dm_table_event takes a mutex. Before the constructor returns there is
+/// no context yet, and nothing to raise.
+/// @param ti The target of the device
+void dcorr_error(struct dm_target *ti)
+{
+    struct dm_context *dm_ctx = READ_ONCE(ti->private);
+
+    if (dm_ctx && !test_and_set_bit(0, &dm_ctx->errors_seen))
+        schedule_work(&dm_ctx->event_work);
+}
 
 /// @brief Handles incoming bio requests
 /// @details
@@ -37,11 +96,17 @@ MODULE_DESCRIPTION("DM target for Linux Kernel 6.16");
 /// its ends are left as they are, and one with no whole chunk completes at
 /// once. It is refused if it touches a read only range, and never passed down.
 ///
+/// A write zeroes is not split at chunks either: its partial chunks are
+/// written as zeros through the cache, its whole chunks cleared as by a
+/// discard, see cache_write_zeroes. Device mapper sends it only while the
+/// device below has write zeroes, see dm_io_hints. It is refused if it
+/// touches a read only range.
+///
 /// Other operations are refused: device mapper sends none of them, as the
 /// target does not offer them, and remapping one would bypass the CRC.
 /// @param ti  DM target
 /// @param bio Incoming bio request
-/// @return DM_MAPIO_SUBMITTED for READ, WRITE, DISCARD and an empty flush.
+/// @return DM_MAPIO_SUBMITTED for READ, WRITE, DISCARD, WRITE_ZEROES and an empty flush.
 ///         DM_MAPIO_KILL for anything else.
 static int dm_map(struct dm_target *ti, struct bio *bio)
 {
@@ -75,8 +140,8 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         if (written_read_only(dm_ctx->written, bio->bi_iter.bi_sector))
         {
             atomic64_inc(&dm_ctx->written->refused_writes);
-            DM_ERR_LIMIT("write to chunk %llu refused: its block of the bitmap is invalid in both copies\n",
-                         (unsigned long long)(bio->bi_iter.bi_sector / DATA_SIZE_SECTORS));
+            DM_DEV_ERR_LIMIT(ti, "write at sector %llu refused: its block of the bitmap is invalid in both copies\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
             return DM_MAPIO_KILL;
         }
         cache_write(dm_ctx->cache, bio);
@@ -92,15 +157,26 @@ static int dm_map(struct dm_target *ti, struct bio *bio)
         if (written_range_read_only(dm_ctx->written, bio->bi_iter.bi_sector, bio_sectors(bio)))
         {
             atomic64_inc(&dm_ctx->written->refused_writes);
-            DM_ERR_LIMIT("discard at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
-                         (unsigned long long)bio->bi_iter.bi_sector);
+            DM_DEV_ERR_LIMIT(ti, "discard at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
             return DM_MAPIO_KILL;
         }
         cache_discard(dm_ctx->cache, bio);
         return DM_MAPIO_SUBMITTED;
 
+    case REQ_OP_WRITE_ZEROES:
+        if (written_range_read_only(dm_ctx->written, bio->bi_iter.bi_sector, bio_sectors(bio)))
+        {
+            atomic64_inc(&dm_ctx->written->refused_writes);
+            DM_DEV_ERR_LIMIT(ti, "write zeroes at sector %llu refused: it touches a block of the bitmap invalid in both copies\n",
+                             (unsigned long long)bio->bi_iter.bi_sector);
+            return DM_MAPIO_KILL;
+        }
+        cache_write_zeroes(dm_ctx->cache, bio);
+        return DM_MAPIO_SUBMITTED;
+
     default:
-        DM_ERR("unsupported bio op=%u\n", bio_op(bio));
+        DM_DEV_ERR_LIMIT(ti, "unsupported bio op=%u\n", bio_op(bio));
         return DM_MAPIO_KILL;
     }
 
@@ -136,7 +212,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (argc != 1)
     {
         ti->error = "Invalid argument count: expected <device>";
-        DM_ERR("expected 1 argument, got %u\n", argc);
+        DM_DEV_ERR(ti, "expected 1 argument, got %u\n", argc);
         return -EINVAL;
     }
 
@@ -149,7 +225,7 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (!dm_ctx)
     {
         ti->error = "dm_context alloc failed";
-        DM_ERR("kzalloc dm_context failed\n");
+        DM_DEV_ERR(ti, "kzalloc dm_context failed\n");
         return -ENOMEM;
     }
 
@@ -157,18 +233,22 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     if (!dm_ctx->transform_wq)
     {
         ti->error = "alloc_workqueue failed";
-        DM_ERR("alloc_workqueue failed\n");
+        DM_DEV_ERR(ti, "alloc_workqueue failed\n");
         r = -ENOMEM;
         goto error_alloc_workqueue;
     }
 
     sema_init(&dm_ctx->parts_in_flight, MAX_PARTS_IN_FLIGHT);
     atomic64_set(&dm_ctx->map_waits, 0);
+    atomic64_set(&dm_ctx->read_errors, 0);
+    atomic64_set(&dm_ctx->crc_mismatches, 0);
+    dm_ctx->ti = ti;
+    INIT_WORK(&dm_ctx->event_work, dm_event_work);
 
     r = dm_set_target_max_io_len(ti, DATA_SIZE_SECTORS);
     if (r)
     {
-        DM_ERR("dm_set_target_max_io_len failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "dm_set_target_max_io_len failed, err=%d\n", r);
         goto error_dm_get_device;
     }
     ti->per_io_data_size = sizeof(struct trn_p_rq);
@@ -176,43 +256,53 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     ti->flush_supported = true;
     ti->num_discard_bios = 1;
     ti->discards_supported = true;
+    ti->num_write_zeroes_bios = 1;
 
     r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dm_ctx->dev);
     if (r)
     {
         ti->error = "dm_get_device failed";
-        DM_ERR("dm_get_device failed, dev=%s err=%d\n", argv[0], r);
+        DM_DEV_ERR(ti, "dm_get_device failed, dev=%s err=%d\n", argv[0], r);
         goto error_dm_get_device;
     }
 
-    r = superblock_read(dm_ctx->dev->bdev, &dm_ctx->sb, &ti->error);
+    if (bdev_logical_block_size(dm_ctx->dev->bdev) != SECTOR_SIZE)
+    {
+        ti->error = "The device below must have logical blocks of 512 bytes";
+        DM_DEV_ERR(ti, "the device below has logical blocks of %u bytes, the metadata is written in sectors of 512\n",
+                   bdev_logical_block_size(dm_ctx->dev->bdev));
+        r = -EINVAL;
+        goto error_metadata;
+    }
+
+    r = superblock_read(ti, dm_ctx->dev->bdev, &dm_ctx->sb);
     if (r)
         goto error_metadata;
 
     if (ti->len != dm_ctx->sb.layout.capacity)
     {
         ti->error = "The length must be the capacity in the superblock, see dcorrsetup table";
-        DM_ERR("length %llu, the superblock gives %llu\n", (unsigned long long)ti->len,
+        DM_DEV_ERR(ti, "length %llu, the superblock gives %llu\n", (unsigned long long)ti->len,
                (unsigned long long)dm_ctx->sb.layout.capacity);
         r = -EINVAL;
         goto error_metadata;
     }
 
-    dm_ctx->written = written_create(dm_ctx->dev->bdev, &dm_ctx->sb,
-                                     dm_table_get_mode(ti->table) & BLK_OPEN_WRITE, &ti->error);
+    dm_ctx->written = written_create(ti, dm_ctx->dev->bdev, &dm_ctx->sb,
+                                     dm_table_get_mode(ti->table) & BLK_OPEN_WRITE);
     if (IS_ERR(dm_ctx->written))
     {
         r = PTR_ERR(dm_ctx->written);
-        DM_ERR("written_create failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "written_create failed, err=%d\n", r);
         goto error_metadata;
     }
 
-    dm_ctx->metadata = metadata_cache_create(dm_ctx->dev->bdev, &dm_ctx->sb.layout, dm_ctx->sb.salt_crc);
+    dm_ctx->metadata = metadata_cache_create(ti, dm_ctx->dev->bdev, &dm_ctx->sb.layout, dm_ctx->sb.salt_crc);
     if (IS_ERR(dm_ctx->metadata))
     {
         ti->error = "metadata cache alloc failed";
         r = PTR_ERR(dm_ctx->metadata);
-        DM_ERR("metadata_cache_create failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "metadata_cache_create failed, err=%d\n", r);
         goto error_written;
     }
 
@@ -221,13 +311,13 @@ static int dm_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     {
         ti->error = "cache alloc failed";
         r = PTR_ERR(dm_ctx->cache);
-        DM_ERR("cache_create failed, err=%d\n", r);
+        DM_DEV_ERR(ti, "cache_create failed, err=%d\n", r);
         goto error_cache;
     }
 
     ti->private = dm_ctx;
 
-    DM_INFO("mapped on dev=%s, disk capacity=%llu sec, available capacity=%llu sec\n",
+    DM_DEV_INFO(ti, "mapped on dev=%s, disk capacity=%llu sec, available capacity=%llu sec\n",
             argv[0],
             (unsigned long long)get_capacity(dm_ctx->dev->bdev->bd_disk),
             (unsigned long long)ti->len);
@@ -259,6 +349,7 @@ static void dm_dtr(struct dm_target *ti)
 
     DM_DEBUG("dm_ctx=%p\n", dm_ctx);
 
+    cancel_work_sync(&dm_ctx->event_work);
     cache_destroy(dm_ctx->cache);
     flush_workqueue(dm_ctx->transform_wq);
     destroy_workqueue(dm_ctx->transform_wq);
@@ -307,23 +398,11 @@ static void dm_target_resume(struct dm_target *ti)
 
 /// @brief Reports the state of the target to dmsetup
 /// @details
-/// STATUSTYPE_INFO (dmsetup status) gives the counters, in this order: waits of
-/// reads in dm_map for a place among the parts in flight, waits of writes for a
-/// free entry of the cache, waits of writes for an entry under write back,
-/// reads that waited for the write back of their chunk, entries holding data
-/// not yet on the lower device, entries whose write back failed, metadata
-/// areas read from the lower device, waits for a metadata area when all were
-/// in use, sectors of the trailing copy of the metadata that failed to write,
-/// flushes the worker made because too many metadata areas were busy, flushes
-/// it made before writing back a chunk written back since the last one, chunks
-/// read before a write back as their two copies of the metadata differed, and
-/// sectors so read that matched neither copy or did not read; then, of the
-/// bitmap of written chunks: chunks read as zeros without a read of the device
-/// below, as never written, blocks invalid in both copies when the device was
-/// created, blocks with one valid copy then, copies of the superblock of groups
-/// 2 and on that are invalid or differ, copies of blocks that failed to write,
-/// and writes refused in a read only range.
-/// STATUSTYPE_TABLE (dmsetup table) gives nothing yet.
+/// STATUSTYPE_INFO (dmsetup status) gives the counters, positional, in the
+/// order and with the meaning that "Interface" in docs/en/ARCHITECTURE.md
+/// lists; a new counter is added at the end. STATUSTYPE_TABLE (dmsetup table)
+/// gives the lower device as major:minor, so that the line loads again.
+/// STATUSTYPE_IMA gives nothing yet.
 /// @param ti           DM target
 /// @param type         What to report
 /// @param status_flags Flags of the request, unused
@@ -340,7 +419,7 @@ static void dm_status(struct dm_target *ti, status_type_t type,
     {
     case STATUSTYPE_INFO:
         cache_counters(dm_ctx->cache, &dirty, &failed);
-        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+        DMEMIT("%llu %llu %llu %llu %lu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                (unsigned long long)atomic64_read(&dm_ctx->map_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->free_waits),
                (unsigned long long)atomic64_read(&dm_ctx->cache->busy_waits),
@@ -360,26 +439,67 @@ static void dm_status(struct dm_target *ti, status_type_t type,
                (unsigned long long)atomic64_read(&dm_ctx->written->write_errors),
                (unsigned long long)atomic64_read(&dm_ctx->written->refused_writes),
                (unsigned long long)atomic64_read(&dm_ctx->cache->nr_discards),
-               (unsigned long long)atomic64_read(&dm_ctx->cache->discarded_chunks));
+               (unsigned long long)atomic64_read(&dm_ctx->cache->discarded_chunks),
+               (unsigned long long)atomic64_read(&dm_ctx->read_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->crc_mismatches),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->write_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->metadata->read_errors),
+               (unsigned long long)atomic64_read(&dm_ctx->cache->flush_errors));
         break;
     case STATUSTYPE_TABLE:
+        DMEMIT("%s", dm_ctx->dev->name);
+        break;
     case STATUSTYPE_IMA:
         result[0] = '\0';
         break;
     }
 }
 
-/// @brief Sets the limits of the queue the target needs
+/// @brief Gives device mapper the device below, the part of it the layout uses
 /// @details
-/// Discards in whole chunks, of any length: device mapper does not split them
-/// at max_io_len, only the block layer by these limits. No write zeroes: device
-/// mapper offers them only with every device below capable, through
-/// iterate_devices, which the target does not have; the kernel zeroes with
-/// writes then.
+/// Device mapper stacks the limits of the device below into those of the
+/// target through it, before dm_io_hints, checks that the area lies on the
+/// device, and offers write zeroes only if the device below has it.
+static int dm_iterate_devices(struct dm_target *ti, iterate_devices_callout_fn fn, void *data)
+{
+    struct dm_context *dm_ctx = ti->private;
+
+    return fn(ti, dm_ctx->dev, 0, dm_ctx->sb.layout.lower_sectors, data);
+}
+
+/// @brief Sets the limits of the queue the target needs, over those of the device below
+/// @details
+/// What the target does itself replaces what it took from the device below:
+/// - a chunk of 4 KiB is the smallest write that does not make the cache
+///   merge, and the unit of the CRC work, so it is the physical block and the
+///   minimal I/O, unless the device below has larger ones; the optimal I/O and
+///   the alignment of the device below say nothing of the layout on top;
+/// - discards in whole chunks, of any length: device mapper does not split
+///   them at max_io_len, only the block layer by these limits; they are not
+///   passed down, so whatever the device below allows does not matter;
+/// - write zeroes of any length, carried out in the cache, see
+///   cache_write_zeroes; device mapper turns it off when the device below has
+///   none, as then nothing says that zeroing is cheap there;
+/// - no polling, as every request completes from a workqueue, and no stable
+///   pages, as a write is copied into the cache.
+///
+/// A device below with logical blocks other than 512 bytes is refused by the
+/// constructor; a zoned one by device mapper, as the target is not zoned.
 static void dm_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
+    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, DATA_SIZE_SECTORS << SECTOR_SHIFT);
+    limits->io_min = max_t(unsigned int, limits->io_min, DATA_SIZE_SECTORS << SECTOR_SHIFT);
+    limits->io_opt = 0;
+    limits->alignment_offset = 0;
+
     limits->discard_granularity = DATA_SIZE_SECTORS << SECTOR_SHIFT;
+    limits->discard_alignment = 0;
     limits->max_hw_discard_sectors = UINT_MAX >> SECTOR_SHIFT;
+
+    limits->max_write_zeroes_sectors = UINT_MAX >> SECTOR_SHIFT;
+    limits->max_hw_wzeroes_unmap_sectors = 0;
+
+    limits->features &= ~(BLK_FEAT_POLL | BLK_FEAT_STABLE_WRITES);
 }
 
 static struct target_type target = {
@@ -393,6 +513,7 @@ static struct target_type target = {
     .preresume = dm_target_preresume,
     .resume = dm_target_resume,
     .status = dm_status,
+    .iterate_devices = dm_iterate_devices,
     .io_hints = dm_io_hints,
 };
 

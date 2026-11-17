@@ -215,6 +215,13 @@ def metadata_offset(logical):
     return logical // DATA_SECTORS % CHUNKS_PER_METADATA_SECTOR * METADATA_ENTRY_SIZE
 
 
+def queue_limit(path, name):
+    """A limit of the queue of a block device, from sysfs, as an integer."""
+    device = os.path.basename(os.path.realpath(path))
+    with open(f"/sys/block/{device}/queue/{name}") as limit:
+        return int(limit.read())
+
+
 def format_device(path, force=False, group_sectors=GROUP_SECTORS):
     """Writes a fresh superblock to a device with dcorrsetup, with groups of the size given."""
     run(TOOL, "format", *(["--force"] if force else []), "--group-size", f"{group_sectors // 2048}M", path)
@@ -369,6 +376,7 @@ def fio(path, timeout=FIO_SECONDS, **options):
 
 
 BLKDISCARD = 0x1277  # _IO(0x12, 119) of <linux/fs.h>
+BLKZEROOUT = 0x127F  # _IO(0x12, 127) of <linux/fs.h>
 
 
 class BlockDevice:
@@ -407,6 +415,11 @@ class BlockDevice:
     def discard(self, sector, count):
         """Discards sectors with the BLKDISCARD ioctl, as blkdiscard does; raises OSError if it fails."""
         fcntl.ioctl(self.fd, BLKDISCARD, struct.pack("QQ", sector * SECTOR_SIZE, count * SECTOR_SIZE))
+
+    def zeroout(self, sector, count):
+        """Zeroes sectors with the BLKZEROOUT ioctl, as blkdiscard -z does: write zeroes where the device
+        has it, ordinary writes of zeros otherwise; raises OSError if it fails."""
+        fcntl.ioctl(self.fd, BLKZEROOUT, struct.pack("QQ", sector * SECTOR_SIZE, count * SECTOR_SIZE))
 
     def flush(self):
         """Makes the writes so far durable; only then are they sure to be on the device below."""

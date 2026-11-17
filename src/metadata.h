@@ -190,6 +190,9 @@ struct metadata_cache
     /// @brief Workqueue of the loads, which wait for their reads
     struct workqueue_struct *wq;
 
+    /// @brief The target, for its name in the log and its errors, see dcorr_error
+    struct dm_target *ti;
+
     /// @brief The device below
     struct block_device *bdev;
 
@@ -213,10 +216,15 @@ struct metadata_cache
 
     /// @brief How many sectors so read matched neither copy, or did not read
     atomic64_t settle_mismatches;
+
+    /// @brief How many sectors of a copy of an area failed to read, counted at each read of the area
+    atomic64_t read_errors;
 };
 
-struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout,
-                                             u64 salt_crc);
+struct dm_target;
+
+struct metadata_cache *metadata_cache_create(struct dm_target *ti, struct block_device *bdev,
+                                             const struct dcorr_layout *layout, u64 salt_crc);
 void metadata_cache_destroy(struct metadata_cache *cache);
 struct metadata_area *metadata_get(struct metadata_cache *cache, sector_t sector);
 void metadata_put(struct metadata_cache *cache, struct metadata_area *area);

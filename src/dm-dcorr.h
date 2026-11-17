@@ -61,6 +61,21 @@ struct dm_context
 
     /// @brief How many times a read in dm_map had to wait for a place, shown by dmsetup status
     atomic64_t map_waits;
+
+    /// @brief Reads of data from the lower device that failed, shown by dmsetup status
+    atomic64_t read_errors;
+
+    /// @brief Sectors read from the lower device that matched neither CRC of their chunk, shown by dmsetup status
+    atomic64_t crc_mismatches;
+
+    /// @brief The target, for its name in the log and its table
+    struct dm_target *ti;
+
+    /// @brief Bit 0 is set by the first error of the device, see dcorr_error
+    unsigned long errors_seen;
+
+    /// @brief Raises the device mapper event of the first error, from process context
+    struct work_struct event_work;
 };
 
 #endif

@@ -10,7 +10,6 @@ fails to read makes the driver forget it first, as a suspend does. The metadata 
 """
 
 import errno
-import time
 
 import pytest
 
@@ -19,11 +18,14 @@ from conftest import (
     LOWER_NAME,
     UPPER_NAME,
     create_dcorr,
+    device_events,
     device_status,
     dmsetup_remove,
     drop_metadata,
     kernel_messages,
     make_lower,
+    wait_for_event,
+    warned,
 )
 from harness import (
     CHUNKS_PER_METADATA_SECTOR,
@@ -35,6 +37,7 @@ from harness import (
     metadata_sectors,
     pattern,
     physical_sector,
+    queue_limit,
     region_sector,
     run,
 )
@@ -125,21 +128,6 @@ def chunk_sectors(chunk):
 def copies(chunk):
     """The lower sectors of both copies of the metadata sector of a chunk."""
     return metadata_sectors(chunk * DATA_SECTORS, LOWER_MIB * 2048)
-
-
-def warned(action, text, attempts=8):
-    """Whether the driver logs a warning with this text when the action runs.
-
-    The warnings are rate limited, 10 in 5 s, and earlier tests may have used them up, so the
-    action runs again for up to that long.
-    """
-    for _ in range(attempts):
-        with kernel_messages() as messages:
-            action()
-        if any(text in message for message in messages):
-            return True
-        time.sleep(1)
-    return False
 
 
 def metadata_sector_chunks(chunk):
@@ -289,12 +277,16 @@ def test_write_fails_when_its_metadata_sector_does_not_read(faulty, chunk, start
 def test_failed_write_is_reported(faulty, lower_sector, start, sectors):
     """A write whose data or metadata fails to reach the lower device reports it, and the device goes on.
 
+    The failed write back is counted in write_errors.
+
     The error may come from the write or from the flush after it. The metadata of the region is in
     RAM since the fixture wrote it, so a write back does not read the metadata sector, which dm-dust
     would fail as well.
     """
+    errors = device_status()["write_errors"]
     faulty.fail(lower_sector, writes=1)
     assert fails_with_eio(lambda: flushed_write(faulty.upper, start, pattern("after", sectors)))
+    assert device_status()["write_errors"] > errors
 
     faulty.heal()
     new = pattern("again", sectors)
@@ -351,3 +343,70 @@ def test_a_cache_full_of_failed_chunks_refuses_writes():
             assert faulty.upper.read(mib * 2048, 2048) == pattern(mib, 2048), f"MiB {mib}"
     finally:
         faulty.remove()
+
+
+def test_a_failed_read_is_counted_and_logged_with_the_device(faulty):
+    """read_errors counts it, and the log names the device as dmsetup does and the logical sector."""
+    bad = BAD_CHUNK * DATA_SECTORS + 3
+    faulty.fail(physical_sector(bad, LOWER_MIB * 2048))
+    errors = device_status()["read_errors"]
+    assert fails_with_eio(lambda: faulty.upper.read(bad))
+    assert device_status()["read_errors"] == errors + 1
+    text = f"dcorr {UPPER_NAME} [complete_work]: read at sector {bad} (1 sectors) failed on the lower device"
+    assert warned(lambda: fails_with_eio(lambda: faulty.upper.read(bad)), text)
+
+
+def test_a_failed_metadata_read_is_counted_in_sectors(faulty):
+    """Three sectors of the leading copy fail: each read of the area counts all three, and the reads go on.
+
+    udev reads the area of region 0 again after the resume, so how many reads there are is not known;
+    a count of copies instead of sectors would give that number, rarely a multiple of three.
+    """
+    for chunk in range(BAD_CHUNK, BAD_CHUNK + 3 * CHUNKS_PER_METADATA_SECTOR, CHUNKS_PER_METADATA_SECTOR):
+        faulty.fail(copies(chunk)[0])
+    errors = device_status()["metadata_read_errors"]
+    drop_metadata()
+    assert faulty.upper.read(0, AREA) == pattern("before", AREA)
+    counted = device_status()["metadata_read_errors"] - errors
+    assert counted >= 3 and counted % 3 == 0, counted
+
+
+def test_a_failed_flush_is_counted(faulty):
+    """dm-flakey fails the flush of the lower device with nothing to write back: flush_errors counts it."""
+    status = device_status()
+    faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
+    assert fails_with_eio(faulty.upper.flush)
+    after = device_status()
+    assert after["flush_errors"] == status["flush_errors"] + 1
+    assert after["write_errors"] == status["write_errors"]
+
+    faulty.load(f"linear {faulty.lower} 0")
+    faulty.upper.flush()
+    assert device_status()["flush_errors"] == after["flush_errors"]
+
+
+def test_the_first_error_raises_one_device_mapper_event(faulty):
+    """dmsetup wait sees an event at the first error of the table, and none at the errors after it."""
+    events = device_events()
+    bad = BAD_CHUNK * DATA_SECTORS
+    faulty.fail(physical_sector(bad, LOWER_MIB * 2048))
+    assert fails_with_eio(lambda: faulty.upper.read(bad))
+    assert wait_for_event(after=events), "no event after the first error"
+    assert device_events() == events + 1
+
+    for _ in range(3):
+        assert fails_with_eio(lambda: faulty.upper.read(bad))
+    assert not wait_for_event(after=events + 1, seconds=2), "a later error raised an event"
+
+
+def test_write_zeroes_is_not_offered_over_a_lower_device_without_it(faulty):
+    """dm-dust has no write zeroes, so the driver offers none: the kernel zeroes with ordinary writes, which
+    set the bits of the chunks, so they read from the lower device afterwards."""
+    assert queue_limit(f"/dev/mapper/{FAULTY_NAME}", "write_zeroes_max_bytes") == 0
+    assert queue_limit(faulty.upper.path, "write_zeroes_max_bytes") == 0
+    first = BAD_CHUNK * DATA_SECTORS
+    faulty.upper.zeroout(first, 2 * DATA_SECTORS)
+    faulty.upper.flush_settled()
+    unwritten = device_status()["unwritten_reads"]
+    assert faulty.upper.read(first, 2 * DATA_SECTORS) == bytes(2 * DATA_SECTORS * 512)
+    assert device_status()["unwritten_reads"] == unwritten

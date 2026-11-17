@@ -93,6 +93,8 @@ struct trn_p_rq
 
     /// @brief (TRANSFORM_WRITE only) meta_bio completed, so submit_work sends the data
     bool meta_written;
+    /// @brief (TRANSFORM_READ only) the data bio failed on the lower device
+    bool read_failed;
 
     /// @brief Transformation type: read or write
     enum trn_p_type type;

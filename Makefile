@@ -9,6 +9,15 @@ endif
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
+# The checks run only in the development VM, through deploy/vm.sh check: on the host they would leave
+# objects in the tree and check without the sparse the VM has. A user builds the driver with plain make.
+IN_VM := $(shell systemd-detect-virt --vm --quiet 2>/dev/null && echo yes)
+ifneq ($(IN_VM),yes)
+ifneq ($(filter check,$(MAKECMDGOALS)),)
+$(error Not in the VM: run deploy/vm.sh check)
+endif
+endif
+
 # dcorrsetup, in userspace. The layout comes from src/dcorr-format.h, shared with the driver.
 TOOL := tools/dcorrsetup
 TOOL_CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc

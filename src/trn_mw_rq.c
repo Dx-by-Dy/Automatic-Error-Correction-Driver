@@ -101,8 +101,8 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
         return BLK_STS_IOERR;
 
     if (metadata_sector_single(area, part->sector))
-        DM_WARN_LIMIT("chunk %llu is written with one copy of its metadata\n",
-                      (unsigned long long)(part->sector / DATA_SIZE_SECTORS));
+        DM_DEV_WARN_LIMIT(part->dm_ctx->ti, "the chunk at sector %llu is written with one copy of its metadata\n",
+                          (unsigned long long)(part->sector - part->sector % DATA_SIZE_SECTORS));
 
     return BLK_STS_OK;
 }

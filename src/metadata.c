@@ -1,5 +1,6 @@
 #include <linux/blkdev.h>
 #include <linux/crc64.h>
+#include <linux/device-mapper.h>
 #include <linux/slab.h>
 
 #include "data_crc.h"
@@ -124,8 +125,10 @@ static unsigned int metadata_load_copy(struct metadata_area *area, enum metadata
         }
     }
 
-    DM_ERR_LIMIT("%s copy of the metadata of region %llu failed to read, err=%d, %u of its sectors fail\n",
-                 copy == METADATA_LEAD ? "leading" : "trailing", (unsigned long long)area->region, r, failed);
+    atomic64_add(failed, &area->cache->read_errors);
+    dcorr_error(area->cache->ti);
+    DM_DEV_ERR_LIMIT(area->cache->ti, "%s copy of the metadata of region %llu failed to read, err=%d, %u of its sectors fail\n",
+                     copy == METADATA_LEAD ? "leading" : "trailing", (unsigned long long)area->region, r, failed);
 
     return failed;
 }
@@ -361,8 +364,8 @@ blk_status_t metadata_copy_entries(struct metadata_cache *cache, sector_t sector
     metadata_put(cache, area);
 
     if (single)
-        DM_WARN_LIMIT("chunk %llu is read with one copy of its metadata\n",
-                      (unsigned long long)(sector / DATA_SIZE_SECTORS));
+        DM_DEV_WARN_LIMIT(cache->ti, "the chunk at sector %llu is read with one copy of its metadata\n",
+                          (unsigned long long)(sector - sector % DATA_SIZE_SECTORS));
 
     return status;
 }
@@ -486,8 +489,9 @@ static void metadata_trail_done(struct metadata_cache *cache, struct metadata_ar
     if (r)
     {
         atomic64_add(end - first, &cache->trail_errors);
-        DM_WARN_LIMIT("trailing metadata of region %llu failed to write at sector %u, err=%d\n",
-                      (unsigned long long)area->region, first, r);
+        dcorr_error(cache->ti);
+        DM_DEV_WARN_LIMIT(cache->ti, "trailing metadata of region %llu failed to write at sector %u, err=%d\n",
+                          (unsigned long long)area->region, first, r);
     }
 }
 
@@ -639,7 +643,9 @@ void metadata_settle(struct metadata_cache *cache, struct metadata_area *area, s
     if (metadata_read_chunk(cache, sector))
     {
         atomic64_add(hweight8(differ), &cache->settle_mismatches);
-        DM_WARN_LIMIT("chunk %llu did not read before its write back\n", (unsigned long long)(sector / DATA_SIZE_SECTORS));
+        dcorr_error(cache->ti);
+        DM_DEV_WARN_LIMIT(cache->ti, "the chunk at sector %llu did not read before its write back\n",
+                          (unsigned long long)(sector - sector % DATA_SIZE_SECTORS));
         return;
     }
 
@@ -662,8 +668,9 @@ void metadata_settle(struct metadata_cache *cache, struct metadata_area *area, s
     if (mismatches)
     {
         atomic64_add(mismatches, &cache->settle_mismatches);
-        DM_WARN_LIMIT("chunk %llu: %u sectors match neither copy of the metadata before its write back\n",
-                      (unsigned long long)(sector / DATA_SIZE_SECTORS), mismatches);
+        dcorr_error(cache->ti);
+        DM_DEV_WARN_LIMIT(cache->ti, "the chunk at sector %llu: %u sectors match neither copy of the metadata before its write back\n",
+                          (unsigned long long)(sector - sector % DATA_SIZE_SECTORS), mismatches);
     }
 
     if (to_trail)
@@ -765,12 +772,13 @@ static void metadata_cache_free(struct metadata_cache *cache)
 /// @brief Allocates the metadata cache whole: areas, their pages and the workqueue of loads
 /// @details
 /// Expected execution context - dm_ctr, may sleep.
+/// @param ti      The target, for its name in the log and its errors, see dcorr_error
 /// @param bdev    The device below
 /// @param layout  Layout of the device, which must outlive the cache
 /// @param salt_crc Where the CRC of every data sector starts, see data_crc.h
 /// @return The cache, or ERR_PTR(-ENOMEM)
-struct metadata_cache *metadata_cache_create(struct block_device *bdev, const struct dcorr_layout *layout,
-                                             u64 salt_crc)
+struct metadata_cache *metadata_cache_create(struct dm_target *ti, struct block_device *bdev,
+                                             const struct dcorr_layout *layout, u64 salt_crc)
 {
     struct metadata_cache *cache = kzalloc_obj(*cache, GFP_KERNEL);
 
@@ -783,6 +791,7 @@ struct metadata_cache *metadata_cache_create(struct block_device *bdev, const st
     INIT_LIST_HEAD(&cache->lru);
     INIT_LIST_HEAD(&cache->pinned);
     init_waitqueue_head(&cache->wait);
+    cache->ti = ti;
     cache->bdev = bdev;
     cache->layout = layout;
     cache->salt_crc = salt_crc;
@@ -791,6 +800,7 @@ struct metadata_cache *metadata_cache_create(struct block_device *bdev, const st
     atomic64_set(&cache->trail_errors, 0);
     atomic64_set(&cache->settle_reads, 0);
     atomic64_set(&cache->settle_mismatches, 0);
+    atomic64_set(&cache->read_errors, 0);
 
     cache->areas = kvcalloc(METADATA_AREAS, sizeof(*cache->areas), GFP_KERNEL);
     cache->wq = alloc_workqueue("dcorr_metadata", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
