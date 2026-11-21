@@ -51,8 +51,8 @@ Sources: [`dm-writecache.c`][wc] and [its documentation][wc-doc], [`dm-integrity
 - **Flush.** Unlike `dm-writecache`, a flush has to reach the lower device, so `fsync` waits for the write back of
   everything dirty before it.
 - **Reads.** Only dirty data is served from the cache for now, as in both analogues.
-- **Waiting.** The rule "all waiting happens in `dm_map`" of [I/O path](ARCHITECTURE.md#io-path) needs one
-  limit: `dm_map` may wait for a free page, but never for a lower bio of its own, which
+- **Waiting.** The rule "all waiting happens in `dcorr_map`" of [I/O path](ARCHITECTURE.md#io-path) needs one
+  limit: `dcorr_map` may wait for a free page, but never for a lower bio of its own, which
   [stays on `current->bio_list` until `map` returns][int-sleep]. Both modules give flushes to a worker of their own.
 
 ## A write cut short by a crash: two CRCs
@@ -145,7 +145,7 @@ read only, when none are left.
 
 What counts as a priority write:
 
-- **Refusal has to happen in `dm_map`.** A plain write is acknowledged before its write back, so by the time the
+- **Refusal has to happen in `dcorr_map`.** A plain write is acknowledged before its write back, so by the time the
   write back fails it can no longer be refused.
 - **FUA alone is not enough.** [Journal blocks of `jbd2`][jbd2-log] carry [`REQ_META | REQ_SYNC | REQ_IDLE`][jbd2-flags]
   and no FUA; only [the commit block][jbd2-commit] has `REQ_PREFLUSH | REQ_FUA`. Refusing them

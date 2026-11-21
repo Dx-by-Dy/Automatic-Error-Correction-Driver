@@ -404,7 +404,7 @@ def test_a_failed_read_is_counted_and_logged_with_the_device(faulty):
     errors = device_status()["read_errors"]
     assert fails_with_eio(lambda: faulty.upper.read(bad))
     assert device_status()["read_errors"] == errors + 1
-    text = f"dcorr {UPPER_NAME} [complete_work]: read at sector {bad} (1 sectors) failed on the lower device"
+    text = f"dcorr {UPPER_NAME}: read at sector {bad} (1 sectors) failed on the lower device"
     assert warned(lambda: fails_with_eio(lambda: faulty.upper.read(bad)), text)
 
 

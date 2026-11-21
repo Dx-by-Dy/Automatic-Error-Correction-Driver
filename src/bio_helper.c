@@ -1,6 +1,7 @@
 #include "bio_helper.h"
 #include "dm-dcorr.h"
-#include "macros.h"
+#include "trn_p_rq.h"
+#include "log.h"
 
 /// @brief Sets up the metadata bio of a part
 /// @details
@@ -23,9 +24,9 @@ void metadata_bio_init(struct trn_p_rq *part,
 {
     struct bio *bio = &part->meta_bio;
 
-    DM_DEBUG("part=%p page=%p offset=%u opf=0x%x\n", part, page, offset, opf);
+    DCORR_DEBUG("part=%p page=%p offset=%u opf=0x%x\n", part, page, offset, opf);
 
-    bio_init(bio, part->dm_ctx->dev->bdev, &part->meta_bvec, 1, opf);
+    bio_init(bio, part->dc->lower->bdev, &part->meta_bvec, 1, opf);
     bio->bi_iter.bi_sector = part->metadata_sector;
     bio->bi_end_io = trn_p_rq_meta_end_io;
     bio->bi_private = part;

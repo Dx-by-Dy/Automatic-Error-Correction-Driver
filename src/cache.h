@@ -9,13 +9,15 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
-#include "alignment.h"
+#include "events.h"
+#include "layout.h"
+#include "stats.h"
 
-/// @brief Size of the data the cache holds, allocated whole in dm_ctr
+/// @brief Size of the data the cache holds, allocated whole in dcorr_ctr
 #define CACHE_SIZE_BYTES (64UL << 20)
 
 /// @brief Number of entries, one chunk of data each
-#define CACHE_ENTRIES (CACHE_SIZE_BYTES / (DATA_SIZE_SECTORS * SECTOR_SIZE))
+#define CACHE_ENTRIES (CACHE_SIZE_BYTES / (DCORR_CHUNK_SECTORS * SECTOR_SIZE))
 
 /// @brief Write back starts when this share of the entries is in use
 #define CACHE_START_PERCENT 50
@@ -29,7 +31,7 @@
 /// @brief Number of write back jobs, so of lower writes of the cache, in flight at once
 #define CACHE_JOBS 256
 
-struct dm_context;
+struct dcorr_ctx;
 struct cache_job;
 
 /// @brief State of a cache entry
@@ -53,7 +55,7 @@ enum cache_state
 /// @details
 /// The page holds the data sectors of the chunk at their place in the chunk.
 /// Only the sectors in mask hold data written from above; the others were
-/// never read, so the device below has their contents. Protected by the lock
+/// never read, so the lower device has their contents. Protected by the lock
 /// of the cache.
 struct cache_entry
 {
@@ -63,7 +65,7 @@ struct cache_entry
     /// @brief Node in the free, dirty or failed list; empty while CACHE_WRITING
     struct list_head list;
 
-    /// @brief Number of the chunk: its first logical sector divided by DATA_SIZE_SECTORS
+    /// @brief Number of the chunk: its first logical sector divided by DCORR_CHUNK_SECTORS
     sector_t chunk;
 
     /// @brief Time in jiffies when the entry became dirty
@@ -85,12 +87,12 @@ struct cache_entry
     blk_status_t status;
 };
 
-/// @brief A read of the device below in flight, in the tree of reads of the cache
+/// @brief A read of the lower device in flight, in the tree of reads of the cache
 /// @details
 /// Lives in the per-bio data of the read, so registering it allocates nothing.
 /// A write back of the chunk waits until no read of it is in flight, so that
 /// a read never sees the data of one version and the CRC of another.
-struct cache_range
+struct cache_lower_read
 {
     /// @brief Node in the tree of reads, ordered by chunk; chunks may repeat
     struct rb_node node;
@@ -102,12 +104,12 @@ struct cache_range
 /// @brief Write back cache of a device
 /// @details
 /// Writes are copied into entries and complete at once; a worker writes them
-/// back to the device below. Everything that can be needed on the I/O path is
+/// back to the lower device. Everything that can be needed on the I/O path is
 /// allocated in cache_create.
 ///
 /// The spinlock protects the trees, the lists, the counters and the entries.
 /// It is held only for a lookup and a copy of at most one chunk, never across
-/// I/O or a wait. Whoever has to wait (dm_map for an entry, the worker for a
+/// I/O or a wait. Whoever has to wait (dcorr_map for an entry, the worker for a
 /// job) records events, drops the lock and waits for events to change.
 struct cache
 {
@@ -117,7 +119,7 @@ struct cache
     /// @brief Entries that are not free, by chunk
     struct rb_root tree;
 
-    /// @brief Reads of the device below in flight, struct cache_range by chunk
+    /// @brief Reads of the lower device in flight, struct cache_lower_read by chunk
     struct rb_root reads;
 
     /// @brief Write back jobs in flight, at most one per metadata sector, by the number of the sector
@@ -133,7 +135,7 @@ struct cache
     struct list_head failed;
 
     /// @brief Free write back jobs
-    struct list_head jobs;
+    struct list_head free_jobs;
 
     unsigned long nr_free;
     unsigned long nr_dirty;
@@ -162,12 +164,10 @@ struct cache
     /// @brief The device is suspended: the worker does not schedule itself
     bool suspended;
 
-    /// @brief Changes whenever an entry or a job is given back or changes state, and when a
-    /// read of a chunk under write back completes
-    u64 events;
-
-    /// @brief Woken when events changes
-    wait_queue_head_t wait;
+    /// @brief An event whenever an entry or a job is given back or changes state, and when a
+    /// read of a chunk under write back completes; the waits for no write back in flight are on its
+    /// queue too
+    struct dcorr_events events;
 
     /// @brief CACHE_ENTRIES entries
     struct cache_entry *entries;
@@ -179,47 +179,21 @@ struct cache
     struct workqueue_struct *wq;
 
     /// @brief The worker: write back by age and pressure, flushes, suspend
-    struct delayed_work write_back;
+    struct delayed_work worker;
 
-    /// @brief Driver context, for the device below and the parts
-    struct dm_context *dm_ctx;
+    /// @brief The context of the target, for the lower device and the parts
+    struct dcorr_ctx *dc;
 
-    /// @brief How many times dm_map waited for a free entry
-    atomic64_t free_waits;
-
-    /// @brief How many times a write in dm_map waited for an entry under write back
-    atomic64_t busy_waits;
-
-    /// @brief How many reads in dm_map waited for the write back of their chunk
-    atomic64_t read_waits;
-
-    /// @brief How many times the worker flushed and wrote the trailing copies of the metadata
-    /// because too many metadata areas were busy, see metadata_crowded
-    atomic64_t crowded_flushes;
-
-    /// @brief How many times the worker flushed before a write back, as the chunk had been written
-    /// back since the last flush, or its bit had been cleared since, see cache_prepare_metadata
-    atomic64_t barriers;
-
-    /// @brief How many discards reached the target, the ones that cover no whole chunk among them
-    atomic64_t nr_discards;
-
-    /// @brief How many whole chunks discards covered
-    atomic64_t discarded_chunks;
-
-    /// @brief How many write back jobs failed, at the leading metadata sector or at the data
-    atomic64_t write_errors;
-
-    /// @brief How many flushes of the lower device failed
-    atomic64_t flush_errors;
+    /// @brief The counters of the device, owned by its context
+    struct dcorr_stats *stats;
 };
 
-struct cache *cache_create(struct dm_context *dm_ctx);
+struct cache *cache_create(struct dcorr_ctx *dc);
 void cache_destroy(struct cache *cache);
 void cache_write(struct cache *cache, struct bio *bio);
 void cache_write_zeroes(struct cache *cache, struct bio *bio);
-bool cache_read(struct cache *cache, struct bio *bio, struct cache_range *range);
-void cache_read_done(struct cache *cache, struct cache_range *range);
+bool cache_read(struct cache *cache, struct bio *bio, struct cache_lower_read *lower);
+void cache_read_done(struct cache *cache, struct cache_lower_read *lower);
 void cache_flush(struct cache *cache, struct bio *bio);
 void cache_discard(struct cache *cache, struct bio *bio);
 void cache_suspend(struct cache *cache);

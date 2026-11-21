@@ -58,7 +58,7 @@ The terms of the project, in the order they build on each other. The source file
 | --- | --- | --- |
 | Cache | 64 MiB of RAM per device, an entry per chunk, a tree by chunk and a list by age | Every write is copied there and completes at once; aggregation, and pages that cannot change under their CRC |
 | Entry of the cache | A chunk in the cache: a page, a mask of the sectors written, a state (dirty, writing, failed) | Holds the data until it is written back |
-| Worker | The work item of the cache, on an ordered workqueue of its own | Writes back, carries out flushes and discards; the only place besides `dm_map` that waits |
+| Worker | The work item of the cache, on an ordered workqueue of its own | Writes back, carries out flushes and discards; the only place besides `dcorr_map` that waits |
 | Write back | Writing an entry to the lower device: the leading metadata sector with FUA, then the data | Moves data from RAM to the device so that a crash leaves each sector old or new |
 | Job | One lower write of a write back, a run of dirty sectors of one entry | The unit the worker sends; the jobs of one metadata sector go one at a time |
 | Part | `struct trn_p_rq`: a read of the lower device, or the lower write of a job, with its CRC work | Lives in per-bio data or in a job, so nothing on the I/O path allocates |
@@ -228,10 +228,10 @@ bitmap by then.
 
 - Nothing on the I/O path allocates in a way that can fail: per-bio data, embedded structures, pools allocated
   when the target is created.
-- All waiting happens in `dm_map`, which slows down the submitter as a full disk queue would, or in the worker of
+- All waiting happens in `dcorr_map`, which slows down the submitter as a full disk queue would, or in the worker of
   the cache, which runs on a workqueue of its own. The workers of `transform_wq` never wait for memory, a limit or
   a lock, as they run the completions that give those back.
-- `dm_map` never waits for a lower bio of its own: it stays on `current->bio_list` until `map` returns.
+- `dcorr_map` never waits for a lower bio of its own: it stays on `current->bio_list` until `map` returns.
 - A part never holds one element of a pool while waiting for another from the same pool.
 - The number of requests in flight is bounded.
 
@@ -240,7 +240,7 @@ one chunk. A discard is not split at chunks, only by the limits of the queue.
 
 ### Write path
 
-1. A write is copied into the entry of its chunk in the cache and completes at once. It waits in `dm_map` while
+1. A write is copied into the entry of its chunk in the cache and completes at once. It waits in `dcorr_map` while
    the entry is under write back, or while no entry is free. A write to a read only range fails.
 2. The worker writes the entry back later: by age, under pressure, or for a flush, a FUA write or a suspend. It
    waits first until no read of the chunk is in flight.
@@ -278,7 +278,7 @@ nothing, except chunks that still fail to write: they are named in the kernel lo
 
 The driver keeps the metadata of the regions it used in RAM: 32 areas, each with both copies of 64 KiB, 4 MiB per
 device, covering 128 MiB of data (`src/metadata.c`). The first read or write back that needs a region reads both
-copies, one request each, on a workqueue of its own; whoever needs it meanwhile waits, `dm_map` included. Then
+copies, one request each, on a workqueue of its own; whoever needs it meanwhile waits, `dcorr_map` included. Then
 reads and write backs of the region take the CRCs from RAM, and a write back changes the leading copy there in
 place before it writes the sector. The trailing copy in RAM changes only when it is written.
 
@@ -314,7 +314,7 @@ The device offers discard in whole chunks (`discard_granularity` 4 KiB, no limit
 never passes it down. A discard of no whole chunk completes at once; one that touches a read only range fails. The
 rest goes to the worker, which waits for the write backs in flight, drops the entries of the whole chunks of the
 range with their data, clears their bits and completes the bio; the partial chunks at the ends are left as they
-are. The worker does it, not `dm_map`, as a sync writes the blocks of the bitmap from RAM and no bit may change
+are. The worker does it, not `dcorr_map`, as a sync writes the blocks of the bitmap from RAM and no bit may change
 under it.
 
 The cleared bits reach the device with the next sync, so after a crash before it the chunks may hold their old
@@ -337,7 +337,7 @@ Only reads from the lower device and write backs reach the lower device, and the
   it completes. The node is in the per-bio data of the read, so this allocates nothing.
 - A write back of an entry waits until no read of its chunk is in flight: a read that met it could get the data of
   one version of a sector and the CRC of another, and fail.
-- New reads of the clean sectors of an entry under write back wait in `dm_map`, so the reads of a chunk end. Reads
+- New reads of the clean sectors of an entry under write back wait in `dcorr_map`, so the reads of a chunk end. Reads
   of its dirty sectors are copied from the cache.
 - The jobs of the chunks of one metadata sector go one at a time, as each writes that sector from the same memory:
   a second one would change it under the first. The end of one starts the next, without a worker waiting.
@@ -349,11 +349,11 @@ The cache has one spinlock, held only for a lookup and a copy of at most one chu
 Nothing on the I/O path allocates memory. The cache, with its pages and 256 write back jobs, the metadata in RAM,
 with its 32 areas and a scratch area where the trailing sectors are built, and the bitmap, 32 MiB per TiB, are
 allocated when the target is created. A part lives in the per-bio data of its bio, or in a job, with its metadata
-structure and its metadata bio embedded in it. `dm_map` and the worker wait for an area to be read, or let go when
+structure and its metadata bio embedded in it. `dcorr_map` and the worker wait for an area to be read, or let go when
 all are in use; the workers of `transform_wq` never wait.
 
 At most 4096 parts, reads and jobs, are in flight per device. A bio-based device has no request queue with tags,
-so `dm_map` and the worker wait for a place instead, which slows down the submitter as a full disk queue would.
+so `dcorr_map` and the worker wait for a place instead, which slows down the submitter as a full disk queue would.
 Ordinary load never reaches the limit: 4096 parts are 16 MiB of data.
 
 ## Errors
@@ -381,11 +381,13 @@ of a group, a power of two from `16M` to `4G`, `1G` by default. `dump` prints th
 **The table line** is `0 <capacity> dcorr <lower device>`; the length must be the capacity in the superblock.
 `dmsetup table` gives the lower device as major:minor, as every target does, so the line it prints loads again.
 
-**`dmsetup status`** prints 26 counters after `<start> <length> dcorr`, in this order:
+**`dmsetup status`** prints 26 counters after `<start> <length> dcorr`, in this order. In the driver they are the
+fields of `struct dcorr_stats` (`src/stats.h`), with the same names, but `dirty` and `failed`, which are states of
+the cache; `dcorr_status` prints them:
 
 | # | Name in the tests | What it counts |
 | --- | --- | --- |
-| 1 | `map_waits` | Reads that waited in `dm_map` for a place among the parts in flight |
+| 1 | `map_waits` | Reads that waited in `dcorr_map` for a place among the parts in flight |
 | 2 | `free_waits` | Writes that waited for a free entry of the cache |
 | 3 | `busy_waits` | Writes that waited for an entry under write back |
 | 4 | `read_waits` | Reads of the lower device that waited for the write back of their chunk |

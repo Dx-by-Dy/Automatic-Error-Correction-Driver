@@ -1,9 +1,9 @@
 obj-m := dm-dcorr.o
 
-dm-dcorr-objs := src/dm-dcorr.o src/superblock.o src/bio_helper.o src/trn_p_rq.o src/trn_mw_rq.o src/trn_mr_rq.o src/cache.o src/metadata.o src/written.o
+dm-dcorr-objs := src/dm-dcorr.o src/log.o src/superblock.o src/bio_helper.o src/trn_p_rq.o src/trn_mw_rq.o src/trn_mr_rq.o src/cache.o src/metadata.o src/written.o
 
-ifdef DM_DEBUG_ENABLED
-    ccflags-y += -DDM_DEBUG_ENABLED
+ifdef DCORR_DEBUG_ENABLED
+    ccflags-y += -DDCORR_DEBUG_ENABLED
 endif
 
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -31,7 +31,7 @@ $(TOOL): tools/dcorrsetup.c src/dcorr-format.h
 	cc $(TOOL_CFLAGS) -o $@ tools/dcorrsetup.c
 
 debug: $(TOOL)
-	$(MAKE) -C $(KDIR) M=$(PWD) modules DM_DEBUG_ENABLED=1
+	$(MAKE) -C $(KDIR) M=$(PWD) modules DCORR_DEBUG_ENABLED=1
 
 # Compiler warnings at W=1, sparse and checkpatch. The project indents with 4 spaces and puts
 # opening braces on their own line, so checkpatch's complaints about that are turned off.

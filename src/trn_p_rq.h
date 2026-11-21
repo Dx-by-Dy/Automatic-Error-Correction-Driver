@@ -5,11 +5,13 @@
 #include <linux/workqueue.h>
 #include <linux/list.h>
 
-#include "dm-dcorr.h"
 #include "cache.h"
-#include "alignment.h"
+#include "layout.h"
 #include "trn_mw_rq.h"
 #include "trn_mr_rq.h"
+
+struct dcorr_ctx;
+struct metadata_area;
 
 /// @brief Chunk transformation type
 /// @details Defines the direction of the I/O operation:
@@ -32,7 +34,7 @@ union trn_m_rq
 /// @brief Structure for single chunk transformation
 /// @details
 /// Represents a processing unit for a single chunk. Device mapper splits
-/// requests at chunk boundaries (ti->max_io_len), so each bio passed to dm_map
+/// requests at chunk boundaries (ti->max_io_len), so each bio passed to dcorr_map
 /// stays within one data chunk.
 ///
 /// Lives in the per-bio data of that bio (ti->per_io_data_size), so it cannot
@@ -65,10 +67,10 @@ struct trn_p_rq
     ///          CRCs (check_crc). For both: completes bio.
     struct work_struct complete_work;
 
-    /// @brief Driver context
-    struct dm_context *dm_ctx;
+    /// @brief The context of the target
+    struct dcorr_ctx *dc;
 
-    /// @brief bio containing chunk data (excluding metadata), the one passed to dm_map
+    /// @brief bio containing chunk data (excluding metadata), the one passed to dcorr_map
     struct bio *bio;
 
     /// @brief bi_end_io of bio set by device mapper, restored to complete it
@@ -89,7 +91,7 @@ struct trn_p_rq
     sector_t metadata_sector;
 
     /// @brief (TRANSFORM_READ only) the read in the tree of reads of the cache, see cache_read
-    struct cache_range range;
+    struct cache_lower_read lower_read;
 
     /// @brief (TRANSFORM_WRITE only) meta_bio completed, so submit_work sends the data
     bool meta_written;
@@ -112,7 +114,7 @@ struct trn_p_rq
 
 void trn_p_rq_init(struct trn_p_rq *part,
                    struct bio *bio,
-                   struct dm_context *dm_ctx,
+                   struct dcorr_ctx *dc,
                    enum trn_p_type type,
                    struct metadata_area *area);
 void trn_p_rq_end_io(struct bio *bio);

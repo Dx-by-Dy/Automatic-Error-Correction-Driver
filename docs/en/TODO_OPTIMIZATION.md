@@ -63,8 +63,8 @@ statement, the cause, what it costs, and a way to fix it if known; it is removed
 
 ## Metadata in RAM
 
-- **A read of a region whose metadata is not in RAM blocks `dm_map`.** By decision, for simplicity: the read of
-  the metadata area is waited for in `dm_map`, so a submitter with many requests in flight stalls for one lower
+- **A read of a region whose metadata is not in RAM blocks `dcorr_map`.** By decision, for simplicity: the read of
+  the metadata area is waited for in `dcorr_map`, so a submitter with many requests in flight stalls for one lower
   read each time a request comes to a new region. Fix: a list of the parts waiting for an area, started by the
   end of its read.
 - **When half the metadata areas are busy, the worker flushes by itself.** A write back pins its area until the

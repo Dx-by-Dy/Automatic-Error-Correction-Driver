@@ -11,13 +11,16 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
-#include "alignment.h"
+#include "events.h"
+#include "layout.h"
+#include "stats.h"
+#include "superblock.h"
 
-/// @brief Size of the metadata kept in RAM, allocated whole in dm_ctr
+/// @brief Size of the metadata kept in RAM, allocated whole in dcorr_ctr
 #define METADATA_CACHE_BYTES (4UL << 20)
 
 /// @brief Bytes of one copy of the metadata area of a region
-#define METADATA_AREA_BYTES (REGION_METADATA_SECTORS * SECTOR_SIZE)
+#define METADATA_AREA_BYTES (DCORR_REGION_METADATA_SECTORS * SECTOR_SIZE)
 
 /// @brief Pages of one copy of an area in RAM
 #define METADATA_AREA_PAGES DIV_ROUND_UP(METADATA_AREA_BYTES, PAGE_SIZE)
@@ -48,13 +51,13 @@ static_assert(PAGE_SIZE % SECTOR_SIZE == 0, "a metadata sector must not cross a 
 /// The entry of a chunk in the metadata area of its region, next to the
 /// entries of its neighbours. Contains CRC64 for each data sector, computed in
 /// order of increasing sector index. Both copies of the area hold it.
-struct chunk_metadata
+struct metadata_entry
 {
     /// @brief CRC64 for each data sector of the chunk
-    __le64 crc[DATA_SIZE_SECTORS];
+    __le64 crc[DCORR_CHUNK_SECTORS];
 };
 
-static_assert(sizeof(struct chunk_metadata) == METADATA_ENTRY_SIZE, "the entry of a chunk has a fixed size");
+static_assert(sizeof(struct metadata_entry) == DCORR_METADATA_ENTRY_BYTES, "the entry of a chunk has a fixed size");
 
 /// @brief State of an area in RAM
 enum metadata_state
@@ -62,7 +65,7 @@ enum metadata_state
     /// @brief On the free list, not in the tree
     METADATA_FREE,
 
-    /// @brief Being read from the device below; whoever needs it waits
+    /// @brief Being read from the lower device; whoever needs it waits
     METADATA_LOADING,
 
     /// @brief Holds the metadata of its region, except the sectors in bad
@@ -73,7 +76,7 @@ struct metadata_cache;
 
 /// @brief The metadata of one region, both copies, kept in RAM
 /// @details
-/// Its contents follow the device below: both copies are read from it, and
+/// Its contents follow the lower device: both copies are read from it, and
 /// after that only a write back changes the leading entries of its chunks, in
 /// place, and writes the changed sector with FUA before the data. The trailing
 /// copy keeps the CRCs of the data that is durable, so after a crash each
@@ -88,7 +91,7 @@ struct metadata_cache;
 /// written back, so that the trailing copy holds the CRC of what is there.
 ///
 /// A sector that failed to read in one copy is filled from the other in RAM,
-/// so the area holds what one copy of the device below does. Protected by the
+/// so the area holds what one copy of the lower device does. Protected by the
 /// lock of the metadata cache, except for the leading entries: such an entry is
 /// read or changed only by whom the data cache keeps other I/O of that chunk
 /// away from, or by metadata_write_trails, when no write back is in flight.
@@ -122,38 +125,38 @@ struct metadata_area
 
     /// @brief Sectors of each copy that failed to read, and of the trailing copy that failed to write;
     /// reads take such a sector from the other copy
-    DECLARE_BITMAP(bad[METADATA_COPIES], REGION_METADATA_SECTORS);
+    DECLARE_BITMAP(bad[METADATA_COPIES], DCORR_REGION_METADATA_SECTORS);
 
     /// @brief Chunks with a write back since the last flush of the lower device, failed or not.
     /// Their data may not be durable, so they are not written back again before a flush.
-    DECLARE_BITMAP(written, REGION_CHUNKS);
+    DECLARE_BITMAP(written, DCORR_REGION_CHUNKS);
 
     /// @brief Of the written chunks, those with a write back that failed: their data is not known,
     /// and their trailing copy stays
-    DECLARE_BITMAP(write_failed, REGION_CHUNKS);
+    DECLARE_BITMAP(write_failed, DCORR_REGION_CHUNKS);
 
     /// @brief Sectors of each written chunk whose write back succeeded, which the trailing copy takes
-    u8 sectors[REGION_CHUNKS];
+    u8 sectors[DCORR_REGION_CHUNKS];
 
     /// @brief The metadata, METADATA_AREA_BYTES of each copy
     struct page *pages[METADATA_COPIES][METADATA_AREA_PAGES];
 
-    /// @brief Reads the area from the device below
+    /// @brief Reads the area from the lower device
     struct work_struct load_work;
 
     /// @brief The cache of the area
-    struct metadata_cache *cache;
+    struct metadata_cache *mc;
 };
 
 /// @brief The metadata areas of a device kept in RAM
 /// @details
 /// Everything is allocated in metadata_cache_create. An area is read from the
-/// device below the first time a chunk of its region needs it, and stays until
+/// lower device the first time a chunk of its region needs it, and stays until
 /// it is the least recently used one that nobody holds and another region needs
 /// a place, or the device is suspended.
 struct metadata_cache
 {
-    /// @brief Protects everything below but the counters, the areas and their trailing copies in RAM,
+    /// @brief Protects everything below, the areas and their trailing copies in RAM,
     /// not the leading copies, see struct metadata_area
     spinlock_t lock;
 
@@ -172,11 +175,8 @@ struct metadata_cache
     /// @brief Areas someone holds, the loading and the pinned among them
     unsigned int nr_busy;
 
-    /// @brief Changes whenever an area is loaded or let go
-    u64 events;
-
-    /// @brief Woken when events changes
-    wait_queue_head_t wait;
+    /// @brief An event whenever an area is loaded or let go
+    struct dcorr_events events;
 
     /// @brief METADATA_AREAS areas
     struct metadata_area *areas;
@@ -193,62 +193,44 @@ struct metadata_cache
     /// @brief The target, for its name in the log and its errors, see dcorr_error
     struct dm_target *ti;
 
-    /// @brief The device below
+    /// @brief The lower device
     struct block_device *bdev;
 
-    /// @brief Layout of the device, owned by the context of the target
-    const struct dcorr_layout *layout;
+    /// @brief The layout and the salt, owned by the context of the target
+    const struct superblock_info *sb;
 
-    /// @brief Where the CRC of every data sector starts, see data_crc.h
-    u64 salt_crc;
-
-    /// @brief How many areas were read from the device below
-    atomic64_t loads;
-
-    /// @brief How many times anyone waited for an area to be let go, as all were in use
-    atomic64_t waits;
-
-    /// @brief How many sectors of the trailing copies failed to write
-    atomic64_t trail_errors;
-
-    /// @brief How many chunks were read before a write back, as their copies differed
-    atomic64_t settle_reads;
-
-    /// @brief How many sectors so read matched neither copy, or did not read
-    atomic64_t settle_mismatches;
-
-    /// @brief How many sectors of a copy of an area failed to read, counted at each read of the area
-    atomic64_t read_errors;
+    /// @brief The counters of the device, owned by the context of the target
+    struct dcorr_stats *stats;
 };
 
 struct dm_target;
 
 struct metadata_cache *metadata_cache_create(struct dm_target *ti, struct block_device *bdev,
-                                             const struct dcorr_layout *layout, u64 salt_crc);
-void metadata_cache_destroy(struct metadata_cache *cache);
-struct metadata_area *metadata_get(struct metadata_cache *cache, sector_t sector);
-void metadata_put(struct metadata_cache *cache, struct metadata_area *area);
-blk_status_t metadata_copy_entries(struct metadata_cache *cache, sector_t sector,
-                                   struct chunk_metadata md[METADATA_COPIES]);
-void metadata_written(struct metadata_cache *cache, struct metadata_area *area, sector_t sector,
+                                             const struct superblock_info *sb, struct dcorr_stats *stats);
+void metadata_cache_destroy(struct metadata_cache *mc);
+struct metadata_area *metadata_get(struct metadata_cache *mc, sector_t sector);
+void metadata_put(struct metadata_cache *mc, struct metadata_area *area);
+blk_status_t metadata_copy_entries(struct metadata_cache *mc, sector_t sector,
+                                   struct metadata_entry md[METADATA_COPIES]);
+void metadata_written(struct metadata_cache *mc, struct metadata_area *area, sector_t sector,
                       u8 mask, bool ok);
-bool metadata_written_since_flush(struct metadata_cache *cache, struct metadata_area *area, sector_t sector);
-void metadata_settle(struct metadata_cache *cache, struct metadata_area *area, sector_t sector, u8 mask);
-bool metadata_crowded(struct metadata_cache *cache);
-void metadata_write_trails(struct metadata_cache *cache);
-void metadata_unpin_all(struct metadata_cache *cache);
-void metadata_drop(struct metadata_cache *cache);
+bool metadata_written_since_flush(struct metadata_cache *mc, struct metadata_area *area, sector_t sector);
+void metadata_settle(struct metadata_cache *mc, struct metadata_area *area, sector_t sector, u8 mask);
+bool metadata_crowded(struct metadata_cache *mc);
+void metadata_write_trails(struct metadata_cache *mc);
+void metadata_unpin_all(struct metadata_cache *mc);
+void metadata_drop(struct metadata_cache *mc);
 
 /// @brief Index of the chunk of a logical sector in the area of its region
 static inline unsigned int metadata_area_chunk(const struct metadata_area *area, sector_t sector)
 {
-    return region_chunk(area->cache->layout, sector);
+    return layout_region_chunk(&area->mc->sb->layout, sector);
 }
 
 /// @brief Index of the metadata sector of the chunk of a logical sector in the area of its region
 static inline unsigned int metadata_area_sector(const struct metadata_area *area, sector_t sector)
 {
-    return metadata_area_chunk(area, sector) / CHUNKS_PER_METADATA_SECTOR;
+    return metadata_area_chunk(area, sector) / DCORR_CHUNKS_PER_METADATA_SECTOR;
 }
 
 /// @brief Whether the metadata sector of the chunk of a logical sector failed to read in both copies
@@ -283,10 +265,10 @@ static inline struct page *metadata_sector_page(const struct metadata_area *area
 
 /// @brief The entry of the chunk of a logical sector in a copy of the area of its region
 /// @details The pages of an area come from the direct map, so the address stays valid.
-static inline struct chunk_metadata *metadata_entry(const struct metadata_area *area, enum metadata_copy copy,
-                                                    sector_t sector)
+static inline struct metadata_entry *metadata_area_entry(const struct metadata_area *area, enum metadata_copy copy,
+                                                         sector_t sector)
 {
-    unsigned int byte = metadata_area_chunk(area, sector) * METADATA_ENTRY_SIZE;
+    unsigned int byte = metadata_area_chunk(area, sector) * DCORR_METADATA_ENTRY_BYTES;
 
     return page_address(area->pages[copy][byte / PAGE_SIZE]) + byte % PAGE_SIZE;
 }

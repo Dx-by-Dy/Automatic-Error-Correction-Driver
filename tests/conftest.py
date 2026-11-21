@@ -92,9 +92,9 @@ STATUS_FIELDS = (
 
 
 def device_status(name=UPPER_NAME):
-    """The counters of the driver in dmsetup status, see dm_status in dm-dcorr.c.
+    """The counters of the driver in dmsetup status, see dcorr_status in dm-dcorr.c.
 
-    map_waits: reads that waited in dm_map for a place among the parts in flight;
+    map_waits: reads that waited in dcorr_map for a place among the parts in flight;
     free_waits: writes that waited for a free entry of the cache;
     busy_waits: writes that waited for an entry under write back;
     read_waits: reads of the lower device that waited for the write back of their chunk;

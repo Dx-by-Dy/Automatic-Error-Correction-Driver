@@ -1,5 +1,6 @@
+#include "dm-dcorr.h"
 #include "trn_p_rq.h"
-#include "macros.h"
+#include "log.h"
 
 /// @brief Function completing the structure lifecycle
 /// @details
@@ -24,24 +25,24 @@ static void complete_work(struct work_struct *work)
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, complete_work);
     struct bio *bio = part->bio;
 
-    DM_DEBUG("part=%p, type=%d, index=%lu\n", part, part->type, part->index);
+    DCORR_DEBUG("part=%p, type=%d, index=%lu\n", part, part->type, part->index);
 
     switch (part->type)
     {
     case TRANSFORM_READ:
-        cache_read_done(part->dm_ctx->cache, &part->range);
+        cache_read_done(part->dc->cache, &part->lower_read);
         if (!part->status)
             check_crc(&part->meta.read);
         else if (part->read_failed)
-            DM_DEV_ERR_LIMIT(part->dm_ctx->ti, "read at sector %llu (%u sectors) failed on the lower device, status=%d\n",
-                             (unsigned long long)part->sector, part->meta.read.nr_sectors, part->status);
+            DCORR_DEV_ERR_LIMIT(part->dc->ti, "read at sector %llu (%u sectors) failed on the lower device, status=%d\n",
+                                (unsigned long long)part->sector, part->meta.read.nr_sectors, part->status);
         break;
     case TRANSFORM_WRITE:
         bio_uninit(&part->meta_bio);
         break;
     }
 
-    up(&part->dm_ctx->parts_in_flight);
+    up(&part->dc->parts_in_flight);
 
     bio->bi_end_io = part->orig_end_io;
     bio->bi_status = part->status;
@@ -65,7 +66,7 @@ static void submit_work(struct work_struct *work)
 {
     struct trn_p_rq *part = container_of(work, struct trn_p_rq, submit_work);
 
-    DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
+    DCORR_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
 
     if (part->status)
     {
@@ -98,22 +99,22 @@ static void submit_work(struct work_struct *work)
 /// area of its region is read, see metadata_get. Never fails to allocate.
 /// @param part   Structure to initialize, the per-bio data of bio
 /// @param bio    Bio with chunk data, bi_sector relative to the start of the target
-/// @param dm_ctx Driver context
+/// @param dc     The context of the target
 /// @param type   Transformation type (TRANSFORM_READ or TRANSFORM_WRITE)
 /// @param area   For TRANSFORM_WRITE, the metadata area of the region of the chunk,
 ///               held by the caller until the part completes; NULL for TRANSFORM_READ
 void trn_p_rq_init(struct trn_p_rq *part,
                    struct bio *bio,
-                   struct dm_context *dm_ctx,
+                   struct dcorr_ctx *dc,
                    enum trn_p_type type,
                    struct metadata_area *area)
 {
-    DM_DEBUG("part=%p, bio=%p, type=%d\n", part, bio, type);
+    DCORR_DEBUG("part=%p, bio=%p, type=%d\n", part, bio, type);
 
     part->sector = bio->bi_iter.bi_sector;
-    part->index = start_data_sector(&dm_ctx->sb.layout, bio->bi_iter.bi_sector);
-    part->metadata_sector = metadata_sector(&dm_ctx->sb.layout, bio->bi_iter.bi_sector);
-    part->dm_ctx = dm_ctx;
+    part->index = layout_slot_start(&dc->sb.layout, bio->bi_iter.bi_sector);
+    part->metadata_sector = layout_lead_metadata_sector(&dc->sb.layout, bio->bi_iter.bi_sector);
+    part->dc = dc;
     part->bio = bio;
     part->type = type;
     part->read_failed = false;
@@ -121,7 +122,7 @@ void trn_p_rq_init(struct trn_p_rq *part,
     switch (part->type)
     {
     case TRANSFORM_READ:
-        part->status = trn_mr_rq_init(&part->meta.read, part, dm_ctx);
+        part->status = trn_mr_rq_init(&part->meta.read, part, dc);
         part->meta.read.saved_iter = bio->bi_iter;
         break;
     case TRANSFORM_WRITE:
@@ -136,11 +137,11 @@ void trn_p_rq_init(struct trn_p_rq *part,
     part->orig_end_io = bio->bi_end_io;
     bio->bi_end_io = trn_p_rq_end_io;
     bio->bi_private = part;
-    bio->bi_iter.bi_sector = align_data_sector(&dm_ctx->sb.layout, bio->bi_iter.bi_sector);
-    bio_set_dev(bio, dm_ctx->dev->bdev);
+    bio->bi_iter.bi_sector = layout_data_sector(&dc->sb.layout, bio->bi_iter.bi_sector);
+    bio_set_dev(bio, dc->lower->bdev);
 
-    DM_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
-    DM_DEBUG_BIO(bio);
+    DCORR_DEBUG("part=%p type=%d, index=%lu\n", part, part->type, part->index);
+    DCORR_DEBUG_BIO(bio);
 }
 
 /// @brief Handler for completion of the data bio
@@ -155,7 +156,7 @@ void trn_p_rq_end_io(struct bio *bio)
 {
     struct trn_p_rq *part = bio->bi_private;
 
-    DM_DEBUG("bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
+    DCORR_DEBUG("bio=%p, status=%d, sector=%llu\n", bio, bio->bi_status, (unsigned long long)bio->bi_iter.bi_sector);
 
     if (bio->bi_status != BLK_STS_OK)
     {
@@ -163,12 +164,12 @@ void trn_p_rq_end_io(struct bio *bio)
         if (part->type == TRANSFORM_READ)
         {
             part->read_failed = true;
-            atomic64_inc(&part->dm_ctx->read_errors);
-            dcorr_error(part->dm_ctx->ti);
+            atomic64_inc(&part->dc->stats.read_errors);
+            dcorr_error(part->dc->ti);
         }
     }
 
-    queue_work(part->dm_ctx->transform_wq, &part->complete_work);
+    queue_work(part->dc->transform_wq, &part->complete_work);
 }
 
 /// @brief Handler for completion of the metadata bio of a write
@@ -187,10 +188,10 @@ void trn_p_rq_meta_end_io(struct bio *bio)
     if (bio->bi_status != BLK_STS_OK)
     {
         WRITE_ONCE(part->status, bio->bi_status);
-        queue_work(part->dm_ctx->transform_wq, &part->complete_work);
+        queue_work(part->dc->transform_wq, &part->complete_work);
         return;
     }
 
     part->meta_written = true;
-    queue_work(part->dm_ctx->transform_wq, &part->submit_work);
+    queue_work(part->dc->transform_wq, &part->submit_work);
 }

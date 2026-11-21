@@ -1,26 +1,17 @@
 #ifndef DM_DCORR_H
 #define DM_DCORR_H
 
-#include <linux/module.h>
 #include <linux/device-mapper.h>
-#include <linux/bio.h>
-#include <linux/blkdev.h>
-#include <linux/slab.h>
-#include <linux/err.h>
-#include <linux/types.h>
-#include <linux/bvec.h>
-#include <linux/crc64.h>
-#include <linux/workqueue.h>
 #include <linux/semaphore.h>
-#include <linux/atomic.h>
+#include <linux/types.h>
+#include <linux/workqueue.h>
 
-#include "bio_helper.h"
+#include "stats.h"
 #include "superblock.h"
-#include "trn_p_rq.h"
 
 /// @brief Number of parts that may be in flight at once
 /// @details
-/// Reads from the device below and write back jobs of the cache are parts. A
+/// Reads from the lower device and write back jobs of the cache are parts. A
 /// bio-based device has no request queue with tags, so without a limit the
 /// submitters fill memory with parts. 4096 parts are 16 MiB of data, far more
 /// than a disk queue of 256 requests takes, so ordinary load never reaches it.
@@ -30,23 +21,23 @@ struct cache;
 struct metadata_cache;
 struct written_map;
 
-/// @brief DM target context
+/// @brief The context of a target
 /// @details
-/// Created in dm_ctr and stored in ti->private.
-/// Contains all resources necessary for request processing:
-/// lower-level device, work queue, the metadata cache and the data cache.
-struct dm_context
+/// Created in dcorr_ctr and stored in ti->private. Holds everything the I/O
+/// of the device needs: the lower device, the workqueue of the parts, the
+/// cache, the metadata cache, the bitmap of written chunks and the counters.
+struct dcorr_ctx
 {
     /// @brief Write back cache that every write goes through
     struct cache *cache;
 
-    /// @brief Lower-level device
-    struct dm_dev *dev;
+    /// @brief The lower device
+    struct dm_dev *lower;
 
-    /// @brief The layout and the salt, from the superblock of the device below
+    /// @brief The layout and the salt, from the superblock of the lower device
     struct superblock_info sb;
 
-    /// @brief Work queue for asynchronous bio processing
+    /// @brief Work queue where the parts are submitted and completed
     struct workqueue_struct *transform_wq;
 
     /// @brief Metadata areas of the regions kept in RAM
@@ -56,17 +47,11 @@ struct dm_context
     struct written_map *written;
 
     /// @brief Free places for parts in flight, MAX_PARTS_IN_FLIGHT at most
-    /// @details Taken in dm_map, given back in complete_work before bio_endio.
+    /// @details Taken in dcorr_map, given back in complete_work before bio_endio.
     struct semaphore parts_in_flight;
 
-    /// @brief How many times a read in dm_map had to wait for a place, shown by dmsetup status
-    atomic64_t map_waits;
-
-    /// @brief Reads of data from the lower device that failed, shown by dmsetup status
-    atomic64_t read_errors;
-
-    /// @brief Sectors read from the lower device that matched neither CRC of their chunk, shown by dmsetup status
-    atomic64_t crc_mismatches;
+    /// @brief The counters of dmsetup status
+    struct dcorr_stats stats;
 
     /// @brief The target, for its name in the log and its table
     struct dm_target *ti;

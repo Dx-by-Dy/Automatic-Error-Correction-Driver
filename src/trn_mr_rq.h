@@ -5,11 +5,11 @@
 #include <linux/crc64.h>
 #include <linux/bio.h>
 
-#include "alignment.h"
+#include "layout.h"
 #include "metadata.h"
 
 struct trn_p_rq;
-struct dm_context;
+struct dcorr_ctx;
 
 /// @brief Structure representing chunk metadata transformation on read
 /// @details
@@ -30,7 +30,7 @@ struct trn_mr_rq
 
     /// @brief Copies of the entry of the chunk, by enum metadata_copy; a sector passes if it
     /// matches either
-    struct chunk_metadata md[METADATA_COPIES];
+    struct metadata_entry md[METADATA_COPIES];
 
     /// @brief Saved iter for bio from struct trn_p_rq
     /// @details Used to extract data from bio after its return
@@ -41,7 +41,7 @@ struct trn_mr_rq
 
 blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
                             struct trn_p_rq *part,
-                            struct dm_context *dm_ctx);
+                            struct dcorr_ctx *dc);
 void check_crc(struct trn_mr_rq *meta);
 
 #endif

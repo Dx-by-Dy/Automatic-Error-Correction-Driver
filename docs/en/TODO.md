@@ -133,6 +133,12 @@ in a run, **From reading** means it was only found in the code.
 - **Nothing tells the user in person of a failing drive.** By decision (D22): the driver counts the errors and
   raises a device mapper event at the first one, but something has to wait for it. An idea of the user, to think
   over: a daemon that reads SMART and the counters of the driver and warns.
+- **`dmsetup status` gives the counters as 26 bare numbers.** Their meaning is only their place in the line,
+  described in [the interface](ARCHITECTURE.md#interface). An idea of the user on 2026-11-17: a command of
+  `dcorrsetup`, as `dcorrsetup status NAME`, that reads the status of the device and prints each counter with
+  its name, grouped (waits, cache, metadata, bitmap, errors), the errors that are not zero first. Until then
+  [DEMO.md](../../DEMO.md) does it with a shell function. The order of the counters is then kept in the driver,
+  the utility and the tests, so a test has to check that they agree.
 
 ## Correction
 

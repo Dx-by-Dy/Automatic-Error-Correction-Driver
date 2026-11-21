@@ -190,7 +190,7 @@ def slow_reads():
     """The driver on dm-delay, which holds every read of the lower device back READ_DELAY_MS.
 
     The chunks read are written first, as a chunk never written reads as zeros without the lower device.
-    The metadata of the regions read is in RAM first: a read waits in dm_map for the metadata of its
+    The metadata of the regions read is in RAM first: a read waits in dcorr_map for the metadata of its
     region, so with it read late the load would come to the limit only after it.
     """
     sectors = LIMIT_LOWER_MIB * 2048
@@ -213,7 +213,7 @@ def slow_reads():
 def parts_in_flight():
     """Parts of the driver in flight, from the statistics of its device in sysfs.
 
-    Device mapper counts a part from the end of dm_map, once it has its place, to its completion. The
+    Device mapper counts a part from the end of dcorr_map, once it has its place, to its completion. The
     statistics of dm-delay cannot be used: it counts a bio only once it is sent on after the delay.
     """
     name = os.path.basename(os.path.realpath(f"/dev/mapper/{UPPER_NAME}"))
@@ -225,7 +225,7 @@ def parts_in_flight():
 def test_parts_in_flight_stay_under_the_limit(slow_reads):
     """fio asks for 32 reads of 1 MiB at a time, 8192 parts, from a lower device that answers late.
 
-    The parts in flight come up to the limit and never pass it, and dm_map waits for places. How much memory the driver takes under load is measured with the baseline, on a kernel
+    The parts in flight come up to the limit and never pass it, and dcorr_map waits for places. How much memory the driver takes under load is measured with the baseline, on a kernel
     without KASAN and kmemleak, which hold freed bios back.
     """
     with ThreadPoolExecutor(max_workers=1) as executor:

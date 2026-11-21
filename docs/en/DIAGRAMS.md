@@ -11,7 +11,7 @@ today, each case a strict `xfail`, is drawn at the end, in [Cases that fail toda
 flowchart TB
     fs["Filesystem or application"]
     subgraph driver["dm-dcorr"]
-        map["dm_map: waits if it must, never for its own lower bio"]
+        map["dcorr_map: waits if it must, never for its own lower bio"]
         cache["Cache: 64 MiB of dirty chunks"]
         worker["Worker: write back, flushes, discards"]
         meta["Metadata in RAM: 32 areas, both copies"]
@@ -98,7 +98,7 @@ data](#the-probe-takes-a-copy-stored-as-data).
 ```mermaid
 sequenceDiagram
     participant Up as Layer above
-    participant Map as dm_map
+    participant Map as dcorr_map
     participant Cache as Cache
     participant W as Worker
     participant Meta as Metadata area in RAM
@@ -168,7 +168,7 @@ stateDiagram-v2
     FAILED --> FREE: discard of the chunk
     note right of WRITING
         writes to it and reads of its
-        clean sectors wait in dm_map
+        clean sectors wait in dcorr_map
     end note
     note right of FAILED
         every flush fails while one is left
@@ -303,7 +303,7 @@ zeroed before: [A zeroed chunk in a read only range](#a-zeroed-chunk-in-a-read-o
 ```mermaid
 sequenceDiagram
     participant Up as Layer above
-    participant Map as dm_map
+    participant Map as dcorr_map
     participant W as Worker
     participant Low as Lower device
     Up->>Map: discard

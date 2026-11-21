@@ -7,7 +7,7 @@
 
 #include "data_crc.h"
 #include "superblock.h"
-#include "macros.h"
+#include "log.h"
 
 #define SUPERBLOCK_CRC_END (offsetof(struct dcorr_superblock, crc) + sizeof_field(struct dcorr_superblock, crc))
 
@@ -25,10 +25,10 @@ static u64 superblock_crc(const struct dcorr_superblock *sb)
     return crc64_be(crc, (const u8 *)sb + SUPERBLOCK_CRC_END, DCORR_SUPERBLOCK_BYTES - SUPERBLOCK_CRC_END);
 }
 
-/// @brief Checks a copy of the superblock against version 1 and against the device below
+/// @brief Checks a copy of the superblock against version 1 and against the lower device
 /// @param sb            The copy as read
 /// @param group         The group whose header it was read from
-/// @param lower_sectors The size of the device below
+/// @param lower_sectors The size of the lower device
 /// @param group_sectors The size of a group that put the copy where it was read, 0 for group 0, where
 ///                      every size does
 /// @param layout        Filled with the layout of the size of a group it records, if it is valid
@@ -125,7 +125,7 @@ static const char *superblock_probe(struct block_device *bdev, struct dcorr_supe
 ///
 /// Expected execution context - the constructor of the target, may sleep.
 /// @param ti   The target, for its name in the log; ti->error is set on failure
-/// @param bdev The device below
+/// @param bdev The lower device
 /// @param info What the driver takes from it, filled on success
 /// @return 0, or a negative error code
 int superblock_read(struct dm_target *ti, struct block_device *bdev, struct superblock_info *info)
@@ -162,8 +162,8 @@ int superblock_read(struct dm_target *ti, struct block_device *bdev, struct supe
 
     if (reason[0] && reason[1])
     {
-        DM_DEV_ERR(ti, "no valid superblock: group 0: %s, group 1: %s\n", reason[0], reason[1]);
-        ti->error = "No valid superblock on the device below, format it with dcorrsetup";
+        DCORR_DEV_ERR(ti, "no valid superblock: group 0: %s, group 1: %s\n", reason[0], reason[1]);
+        ti->error = "No valid superblock on the lower device, format it with dcorrsetup";
         r = -EINVAL;
         goto out;
     }
@@ -174,9 +174,9 @@ int superblock_read(struct dm_target *ti, struct block_device *bdev, struct supe
         chosen = le64_to_cpu(sb[1]->generation) > le64_to_cpu(sb[0]->generation) ? 1 : 0;
 
     if (reason[1 - chosen])
-        DM_DEV_WARN(ti, "the superblock of group %u is not valid: %s\n", 1 - chosen, reason[1 - chosen]);
+        DCORR_DEV_WARN(ti, "the superblock of group %u is not valid: %s\n", 1 - chosen, reason[1 - chosen]);
     else if (sb[0]->generation == sb[1]->generation && !superblock_same(sb[0], sb[1]))
-        DM_DEV_WARN(ti, "the superblocks of groups 0 and 1 differ in the same generation, taking group 0\n");
+        DCORR_DEV_WARN(ti, "the superblocks of groups 0 and 1 differ in the same generation, taking group 0\n");
 
     info->layout = layout[chosen];
     memcpy(info->uuid, sb[chosen]->uuid, sizeof(info->uuid));
@@ -184,8 +184,8 @@ int superblock_read(struct dm_target *ti, struct block_device *bdev, struct supe
     info->salt_crc = data_crc_salt(info->salt, sizeof(info->salt));
     info->group = chosen;
     info->generation = le64_to_cpu(sb[chosen]->generation);
-    DM_DEV_INFO(ti, "superblock of group %u, generation %llu, groups of %llu sectors\n", chosen,
-                (unsigned long long)info->generation, (unsigned long long)info->layout.group_sectors);
+    DCORR_DEV_INFO(ti, "superblock of group %u, generation %llu, groups of %llu sectors\n", chosen,
+                   (unsigned long long)info->generation, (unsigned long long)info->layout.group_sectors);
 
 out:
     for (copy = 0; copy < SUPERBLOCK_COPIES; copy++)
@@ -195,7 +195,7 @@ out:
 
 /// @brief Checks the copy of the superblock of another group against the one the driver took
 /// @details
-/// The copy must be valid for its place and the size of the device below, and
+/// The copy must be valid for its place and the size of the lower device, and
 /// belong to the same device and generation: the same UUID, salt and generation.
 /// @param sb    The copy as read
 /// @param group The group whose header it was read from

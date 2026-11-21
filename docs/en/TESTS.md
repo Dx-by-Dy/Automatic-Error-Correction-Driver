@@ -335,14 +335,14 @@ The fio tests, on more than 500 MiB, drop and read areas again all the time.
 
 | Test | Cases | Checks |
 | ---- | ----- | ------ |
-| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds. Whether writes wait in `dm_map` for a free entry depends on the speed of the write back and is checked in `test_cache.py` instead |
+| `test_suspend_and_resume_under_load` | 1 | `slow`: `dmsetup suspend` and `resume` over and over while fio writes and verifies 4 areas with 1 MiB requests, far more than the cache holds. Whether writes wait in `dcorr_map` for a free entry depends on the speed of the write back and is checked in `test_cache.py` instead |
 | `test_table_reload_under_load` | 1 | `slow`: the same with `dmsetup reload` and `resume`, which builds a new target and destroys the old one |
 | `test_module_unloads_only_without_devices` | 1 | `rmmod` fails while a device exists, succeeds without one; loaded again, the device works |
 | `test_nothing_leaks` | 1 | `slow`: a device that did I/O, then removed: the rescuer threads of its three workqueues are gone (and were there while it existed), and `kmemleak` reports nothing allocated by the driver |
 
-`kmemleak` does not catch everything here. A context left behind by `dm_dtr` was not reported in a minute of
+`kmemleak` does not catch everything here. A context left behind by `dcorr_dtr` was not reported in a minute of
 scans, and showed up only after more devices had come and gone. The likely reason: per-bio data is not cleared
-when a bio is allocated again, so bios in the reserves of the bio pools still hold the old `part->dm_ctx`, and
+when a bio is allocated again, so bios in the reserves of the bio pools still hold the old `part->dc`, and
 `kmemleak` takes that for a reference. It also reports a leak only a few scans after it, so a leak from an
 earlier test of the same boot may show up in this one. The workqueues are checked directly for that reason.
 The pages of the cache and of the metadata in RAM come from `alloc_page`, which `kmemleak` does not track, and
@@ -428,7 +428,7 @@ pool of metadata pages were removed with the pool: the I/O path takes no page an
 | `test_io_takes_nothing_from_slab_in_the_driver` | 2 | `read`, `write` and flush of 64 chunks while every slab allocation through the driver fails, for a write in any task, as the write back runs in the worker of the cache: no error and correct data |
 | `test_write_goes_on_with_only_the_bio_reserve` | 1 | `slow`: all new bios of the thread fail, and a write of 1 MiB must finish in 15 seconds |
 | `test_ordinary_load_does_not_wait` | 1 | `fio` `randrw` with `bs=128k`, `iodepth=16`, at most 512 parts: `dmsetup status` shows no wait for a place among the parts in flight |
-| `test_parts_in_flight_stay_under_the_limit` | 1 | `slow`: over `dm-delay` holding every lower read back 100 ms, with the chunks written and the metadata of the regions read first, `fio` asks for 32 reads of 1 MiB at a time, 8192 parts: the parts in flight, by `/sys/block/<device>/inflight` of the driver, come above half the limit of 4096 and not above it (with 64 for parts completing), and reads waited in `dm_map`. 4096 at most in a run. The statistics of `dm-delay` count a bio only once it is sent on after the delay, so they cannot be used |
+| `test_parts_in_flight_stay_under_the_limit` | 1 | `slow`: over `dm-delay` holding every lower read back 100 ms, with the chunks written and the metadata of the regions read first, `fio` asks for 32 reads of 1 MiB at a time, 8192 parts: the parts in flight, by `/sys/block/<device>/inflight` of the driver, come above half the limit of 4096 and not above it (with 64 for parts completing), and reads waited in `dcorr_map`. 4096 at most in a run. The statistics of `dm-delay` count a bio only once it is sent on after the delay, so they cannot be used |
 
 The memory a load takes through the driver against the lower device was measured here until 2026-11-14, and
 dropped: on the debug kernel the difference, 100 to 535 MiB, is freed DM clones, one per 4 KiB, that KASAN and
@@ -450,7 +450,7 @@ logs nothing of a write until it completes, so a reorder inside one flush never 
 
 Two things of discard are not tested. The cache rounds the start of a discard up to a chunk, but
 `__blkdev_issue_discard` always ends the first bio of a range at the boundary of the granularity, so an unaligned
-head reaches the target as a bio with no whole chunk, completed in `dm_map`, and the rounding is never needed
+head reaches the target as a bio with no whole chunk, completed in `dcorr_map`, and the rounding is never needed
 from userspace: discarding the head chunk too passed every test. And the settle of a chunk whose bit is clear
 when the sync before its write back failed needs a flush that fails at that moment.
 
@@ -510,13 +510,13 @@ Flushes and FUA, with `test_durability.py`:
 | The driver before flushes were enabled (`f130fb4`) | 3 | Every test of the device, the controls passed |
 | Before the cache: the metadata write of a whole chunk without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 4k blocks]` |
 | Before the cache: the metadata write of a partial write without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 1k blocks]` |
-| An empty flush completed in `dm_map` without reaching the lower device | 3 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
+| An empty flush completed in `dcorr_map` without reaching the lower device | 3 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
 
 Crash consistency, with `test_crash.py`:
 
 | Change | Failed | Where |
 | ------ | ------ | ----- |
-| An empty flush completed in `dm_map` without reaching the lower device | 2 | `test_flushed_writes_survive_a_crash`, `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
+| An empty flush completed in `dcorr_map` without reaching the lower device | 2 | `test_flushed_writes_survive_a_crash`, `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
 | Before the cache: the metadata write of a partial write without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[1k blocks]` |
 | Before the cache: the metadata write of a whole chunk without FUA | 1 | `test_ext4_survives_a_crash_after_each_fsync[4k blocks]`; the case with 1 KiB blocks does not catch it |
 
@@ -530,11 +530,11 @@ Lifecycle, with `test_lifecycle.py`:
 
 | Change | Result | Where |
 | ------ | ------ | ----- |
-| `dm_exit` does not unregister the target | Failed, `insmod` gives an error; the kernel then oopses in `get_target_type`, as the target list points into the unloaded module, and needs `deploy/vm.sh reset` | `test_module_unloads_only_without_devices` |
-| `dm_dtr` does not free the lock table, before it was removed | Failed, one vmalloc area more | `test_nothing_leaks` |
+| `dcorr_exit` does not unregister the target | Failed, `insmod` gives an error; the kernel then oopses in `get_target_type`, as the target list points into the unloaded module, and needs `deploy/vm.sh reset` | `test_module_unloads_only_without_devices` |
+| `dcorr_dtr` does not free the lock table, before it was removed | Failed, one vmalloc area more | `test_nothing_leaks` |
 | `cache_free` does not destroy the workqueue of the write back | Failed, one rescuer thread more | `test_nothing_leaks` |
-| `dm_dtr` does not destroy the workqueue | Failed, one rescuer thread more | `test_nothing_leaks` |
-| `dm_dtr` does not free the context | **Not caught**, see above | `test_nothing_leaks` |
+| `dcorr_dtr` does not destroy the workqueue | Failed, one rescuer thread more | `test_nothing_leaks` |
+| `dcorr_dtr` does not free the context | **Not caught**, see above | `test_nothing_leaks` |
 
 Metadata in RAM:
 

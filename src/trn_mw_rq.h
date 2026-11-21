@@ -5,11 +5,11 @@
 #include <linux/crc64.h>
 #include <linux/bio.h>
 
-#include "alignment.h"
+#include "layout.h"
 #include "metadata.h"
 
 struct trn_p_rq;
-struct dm_context;
+struct dcorr_ctx;
 
 /// @brief Structure representing chunk metadata transformation on write
 /// @details
@@ -41,7 +41,7 @@ struct trn_mw_rq
     struct metadata_area *area;
 
     /// @brief CRCs of the written sectors, at their index in the chunk
-    __le64 crc[DATA_SIZE_SECTORS];
+    __le64 crc[DCORR_CHUNK_SECTORS];
 };
 
 /// @brief Operation and flags of the bio that writes the leading metadata sector of a chunk

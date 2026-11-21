@@ -187,7 +187,7 @@ def slow_writes():
 def test_writes_larger_than_the_cache_wait_for_free_entries(slow_writes):
     """More data than the cache holds, written without a flush faster than the lower device takes it.
 
-    A quarter of the cache in, no write has waited; past its size, writes wait in dm_map for free
+    A quarter of the cache in, no write has waited; past its size, writes wait in dcorr_map for free
     entries, and all the data arrives.
     """
     blocks = [os.urandom(1 << 20) for _ in range(3 * CACHE_MIB // 2)]

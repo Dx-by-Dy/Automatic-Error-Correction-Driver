@@ -1,6 +1,8 @@
+#include "dm-dcorr.h"
+#include "bio_helper.h"
 #include "trn_mw_rq.h"
 #include "trn_p_rq.h"
-#include "macros.h"
+#include "log.h"
 #include "data_crc.h"
 
 /// @brief Calculates CRC64 for each bio sector and keeps the results in meta->crc
@@ -12,13 +14,13 @@
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure for write
-/// @param bio  Bio with data for CRC calculation, not yet redirected to the device below
+/// @param bio  Bio with data for CRC calculation, not yet redirected to the lower device
 static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 {
-    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
-             meta, meta->first_sector, meta->nr_sectors);
+    DCORR_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+                meta, meta->first_sector, meta->nr_sectors);
 
-    u64 salt_crc = meta->part->dm_ctx->sb.salt_crc;
+    u64 salt_crc = meta->part->dc->sb.salt_crc;
     sector_t sector = meta->part->sector;
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = data_crc_seed(salt_crc, sector);
@@ -43,10 +45,10 @@ static void bio_crc_calc(struct trn_mw_rq *meta, struct bio *bio)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
-                DM_DEBUG("sector=%llu (+%u on chunk), computed_crc=%llu\n",
-                         (unsigned long long)(meta->part->index + sector_idx),
-                         sector_idx,
-                         current_crc);
+                DCORR_DEBUG("sector=%llu (+%u on chunk), computed_crc=%llu\n",
+                            (unsigned long long)(meta->part->index + sector_idx),
+                            sector_idx,
+                            current_crc);
 
                 meta->crc[sector_idx++] = cpu_to_le64(current_crc);
                 current_crc = data_crc_seed(salt_crc, ++sector);
@@ -79,9 +81,9 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
     struct page *page;
     unsigned int offset;
 
-    DM_DEBUG("part=%p\n", part);
+    DCORR_DEBUG("part=%p\n", part);
 
-    meta->first_sector = (u8)(part->sector % DATA_SIZE_SECTORS);
+    meta->first_sector = (u8)(part->sector % DCORR_CHUNK_SECTORS);
     meta->nr_sectors = (u8)bio_sectors(part->bio);
     meta->part = part;
     meta->area = area;
@@ -91,18 +93,18 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
 
     bio_crc_calc(meta, part->bio);
 
-    DM_DEBUG("meta=%p, first_sector=%u, nr_sectors=%u\n",
-             meta,
-             meta->first_sector,
-             meta->nr_sectors);
-    DM_DEBUG_BIO(&part->meta_bio);
+    DCORR_DEBUG("meta=%p, first_sector=%u, nr_sectors=%u\n",
+                meta,
+                meta->first_sector,
+                meta->nr_sectors);
+    DCORR_DEBUG_BIO(&part->meta_bio);
 
     if (metadata_sector_bad(area, part->sector))
         return BLK_STS_IOERR;
 
     if (metadata_sector_single(area, part->sector))
-        DM_DEV_WARN_LIMIT(part->dm_ctx->ti, "the chunk at sector %llu is written with one copy of its metadata\n",
-                          (unsigned long long)(part->sector - part->sector % DATA_SIZE_SECTORS));
+        DCORR_DEV_WARN_LIMIT(part->dc->ti, "the chunk at sector %llu is written with one copy of its metadata\n",
+                             (unsigned long long)(part->sector - part->sector % DCORR_CHUNK_SECTORS));
 
     return BLK_STS_OK;
 }
@@ -111,7 +113,7 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
 /// @details
 /// Changes only the CRCs of the sectors of this write; the entries of the
 /// neighbouring chunks and the CRCs of the other sectors of this chunk stay as
-/// the area holds them, which is what the device below holds. Called just
+/// the area holds them, which is what the lower device holds. Called just
 /// before part->meta_bio is submitted, when no other write of the metadata
 /// sector is in flight. No read of the chunk is in flight either, and none
 /// starts until the write back ends, so nobody reads the entry meanwhile.
@@ -121,11 +123,11 @@ blk_status_t trn_mw_rq_init(struct trn_mw_rq *meta,
 void update_crc_local(struct trn_mw_rq *meta)
 {
     struct trn_p_rq *part = meta->part;
-    struct chunk_metadata *md = metadata_entry(meta->area, METADATA_LEAD, part->sector);
+    struct metadata_entry *md = metadata_area_entry(meta->area, METADATA_LEAD, part->sector);
     unsigned int offset;
 
-    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
-             meta, meta->first_sector, meta->nr_sectors);
+    DCORR_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+                meta, meta->first_sector, meta->nr_sectors);
 
     for (unsigned int i = meta->first_sector; i < meta->first_sector + meta->nr_sectors; i++)
         md->crc[i] = meta->crc[i];

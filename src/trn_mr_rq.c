@@ -1,6 +1,7 @@
+#include "dm-dcorr.h"
 #include "trn_mr_rq.h"
 #include "trn_p_rq.h"
-#include "macros.h"
+#include "log.h"
 #include "data_crc.h"
 
 /// @brief Initializes struct trn_mr_rq
@@ -8,26 +9,26 @@
 /// Copies both entries of the chunk from the metadata cache, which reads the
 /// metadata area of the region first if it is not in RAM.
 ///
-/// Expected execution context - dm_map, may sleep: waits for the metadata
+/// Expected execution context - dcorr_map, may sleep: waits for the metadata
 /// area of the region, see metadata_get, and never fails to allocate.
 /// @param meta   Structure to initialize, inside part
 /// @param part   Parent struct trn_p_rq for chunk transformation
-/// @param dm_ctx Driver context
+/// @param dc     The context of the target
 /// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk does not read in either copy
 blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
                             struct trn_p_rq *part,
-                            struct dm_context *dm_ctx)
+                            struct dcorr_ctx *dc)
 {
-    DM_DEBUG("part=%p bio_sector=%llu\n", part, (unsigned long long)part->bio->bi_iter.bi_sector);
+    DCORR_DEBUG("part=%p bio_sector=%llu\n", part, (unsigned long long)part->bio->bi_iter.bi_sector);
 
-    meta->first_sector = (u8)(part->sector % DATA_SIZE_SECTORS);
+    meta->first_sector = (u8)(part->sector % DCORR_CHUNK_SECTORS);
     meta->nr_sectors = bio_sectors(part->bio);
     meta->part = part;
 
-    DM_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
-             meta, meta->first_sector, meta->nr_sectors);
+    DCORR_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
+                meta, meta->first_sector, meta->nr_sectors);
 
-    return metadata_copy_entries(dm_ctx->metadata, part->sector, meta->md);
+    return metadata_copy_entries(dc->metadata, part->sector, meta->md);
 }
 
 /// @brief Verifies CRC of read data against chunk metadata
@@ -48,12 +49,12 @@ void check_crc(struct trn_mr_rq *meta)
 {
     struct trn_p_rq *part = meta->part;
 
-    DM_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
-             part, meta->first_sector, meta->nr_sectors);
+    DCORR_DEBUG("part=%p first_sector=%u nr_sectors=%u\n",
+                part, meta->first_sector, meta->nr_sectors);
 
-    const struct chunk_metadata *lead = &meta->md[METADATA_LEAD];
-    const struct chunk_metadata *trail = &meta->md[METADATA_TRAIL];
-    u64 salt_crc = part->dm_ctx->sb.salt_crc;
+    const struct metadata_entry *lead = &meta->md[METADATA_LEAD];
+    const struct metadata_entry *trail = &meta->md[METADATA_TRAIL];
+    u64 salt_crc = part->dc->sb.salt_crc;
     sector_t sector = part->sector;
     unsigned int sector_idx = meta->first_sector;
     u64 current_crc = data_crc_seed(salt_crc, sector);
@@ -79,12 +80,12 @@ void check_crc(struct trn_mr_rq *meta)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
-                DM_DEBUG("sector=%llu, sector_idx=%u, lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
-                         (unsigned long long)sector,
-                         sector_idx,
-                         (unsigned long long)le64_to_cpu(lead->crc[sector_idx]),
-                         (unsigned long long)le64_to_cpu(trail->crc[sector_idx]),
-                         (unsigned long long)current_crc);
+                DCORR_DEBUG("sector=%llu, sector_idx=%u, lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
+                            (unsigned long long)sector,
+                            sector_idx,
+                            (unsigned long long)le64_to_cpu(lead->crc[sector_idx]),
+                            (unsigned long long)le64_to_cpu(trail->crc[sector_idx]),
+                            (unsigned long long)current_crc);
 
                 if (lead->crc[sector_idx] != cpu_to_le64(current_crc) &&
                     trail->crc[sector_idx] != cpu_to_le64(current_crc))
@@ -105,11 +106,11 @@ void check_crc(struct trn_mr_rq *meta)
 
     if (mismatches)
     {
-        atomic64_add(mismatches, &part->dm_ctx->crc_mismatches);
-        dcorr_error(part->dm_ctx->ti);
-        DM_DEV_ERR_LIMIT(part->dm_ctx->ti, "CRC mismatch in %u of %u sectors read at sector %llu, the first at sector %llu\n",
-                         mismatches, meta->nr_sectors, (unsigned long long)part->sector,
-                         (unsigned long long)first_mismatch);
+        atomic64_add(mismatches, &part->dc->stats.crc_mismatches);
+        dcorr_error(part->dc->ti);
+        DCORR_DEV_ERR_LIMIT(part->dc->ti, "CRC mismatch in %u of %u sectors read at sector %llu, the first at sector %llu\n",
+                            mismatches, meta->nr_sectors, (unsigned long long)part->sector,
+                            (unsigned long long)first_mismatch);
 
         part->status = BLK_STS_IOERR;
 

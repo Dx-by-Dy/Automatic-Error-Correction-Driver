@@ -12,7 +12,7 @@
 flowchart TB
     fs["Файловая система или приложение"]
     subgraph driver["dm-dcorr"]
-        map["dm_map: ждёт, если должен, но никогда собственного нижнего bio"]
+        map["dcorr_map: ждёт, если должен, но никогда собственного нижнего bio"]
         cache["Кэш: 64 MiB грязных чанков"]
         worker["Воркер: обратная запись, flush, discard"]
         meta["Метаданные в RAM: 32 области, обе копии"]
@@ -99,7 +99,7 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant Up as Верхний уровень
-    participant Map as dm_map
+    participant Map as dcorr_map
     participant Cache as Кэш
     participant W as Воркер
     participant Meta as Область метаданных в RAM
@@ -169,7 +169,7 @@ stateDiagram-v2
     FAILED --> FREE: discard чанка
     note right of WRITING
         записи в него и чтения его
-        чистых секторов ждут в dm_map
+        чистых секторов ждут в dcorr_map
     end note
     note right of FAILED
         каждый flush отказывает, пока такой есть
@@ -305,7 +305,7 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant Up as Верхний уровень
-    participant Map as dm_map
+    participant Map as dcorr_map
     participant W as Воркер
     participant Low as Нижнее устройство
     Up->>Map: discard

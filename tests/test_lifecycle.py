@@ -72,7 +72,7 @@ def loaded(make_stack):
 
 @pytest.mark.slow
 def test_suspend_and_resume_under_load(make_stack):
-    """A suspend waits for the writes in flight, also those that may wait in dm_map for the cache.
+    """A suspend waits for the writes in flight, also those that may wait in dcorr_map for the cache.
 
     4 jobs of 128 requests of 1 MiB keep 512 MiB in flight, far more than the cache holds, and
     each job has an area of 120 MiB, so that it keeps that many in flight. Whether writes wait for

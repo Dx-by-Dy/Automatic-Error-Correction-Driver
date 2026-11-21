@@ -9,7 +9,7 @@ decisions stay here for their reasoning. "The user" is the author of the project
 | --- | --- | --- | --- |
 | [D1](#d1-tests-run-in-a-vm-crashes-are-replayed-from-a-log) | stage 1 | Tests run in a VM; crashes are replayed from a log | In force |
 | [D2](#d2-device-mapper-splits-requests-at-chunk-boundaries) | 2026-11-09 | Device mapper splits requests at chunk boundaries | In force |
-| [D3](#d3-nothing-on-the-io-path-can-fail-to-allocate) | 2026-11-09 | Nothing on the I/O path can fail to allocate; waits only in `dm_map` and the worker | In force |
+| [D3](#d3-nothing-on-the-io-path-can-fail-to-allocate) | 2026-11-09 | Nothing on the I/O path can fail to allocate; waits only in `dcorr_map` and the worker | In force |
 | [D4](#d4-a-write-back-cache-of-our-own-in-ram) | 2026-11-10, 11-11 | A write back cache of our own in RAM, before the format | In force |
 | [D5](#d5-a-write-cut-short-by-a-crash-two-crcs) | 2026-11-11 | A write cut short by a crash: two CRCs | Realized as D10 |
 | [D6](#d6-a-failed-write-back-stays-in-ram) | 2026-11-11 | A failed write back stays in RAM; flushes fail meanwhile | In force |
@@ -69,9 +69,9 @@ machinery was to be built around the pairing.
 completions that give those back; and a bio-based device has no request queue to bound the load.
 
 **Chosen.** Nothing on the I/O path allocates in a way that can fail: per-bio data, embedded structures, pools
-allocated with the target. All waiting happens in `dm_map` or in the worker of the cache; the workers of
-`transform_wq` never wait. `dm_map` never waits for a lower bio of its own. At most 4096 parts in flight per
-device, waited for in `dm_map`, counted in `dmsetup status`.
+allocated with the target. All waiting happens in `dcorr_map` or in the worker of the cache; the workers of
+`transform_wq` never wait. `dcorr_map` never waits for a lower bio of its own. At most 4096 parts in flight per
+device, waited for in `dcorr_map`, counted in `dmsetup status`.
 
 **Why.** The rules make a hang under memory pressure impossible by construction, and `test_memory.py` checks it
 with fault injection. 4096 parts are 16 MiB of data, more than any disk queue, so ordinary load never waits.
@@ -142,7 +142,7 @@ timer of its own.
   path of code.
 - **A partial chunk keeps a mask** of its dirty sectors; write back writes only those, without reading the
   rest.
-- **A write to a chunk under write back waits** in `dm_map`, counted. A second copy of the chunk, as in
+- **A write to a chunk under write back waits** in `dcorr_map`, counted. A second copy of the chunk, as in
   `dm-writecache`, is the likely final answer.
 - **Defaults are constants:** 64 MiB of cache, write back from 50% used down to 45%, an age of 1 s.
 
@@ -380,7 +380,7 @@ generation of clears. For write zeroes: leave it out, add `iterate_devices` now,
 names no device.
 
 **Chosen**, on 2026-11-16: discard in whole chunks, not passed down, with no limit of its own on the length; the
-worker of the cache drops the entries of the chunks and clears their bits, not `dm_map`; a generation of clears,
+worker of the cache drops the entries of the chunks and clears their bits, not `dcorr_map`; a generation of clears,
 the choice of the user; no write zeroes until `iterate_devices`, in the stage of device mapper integration.
 
 **Why.**

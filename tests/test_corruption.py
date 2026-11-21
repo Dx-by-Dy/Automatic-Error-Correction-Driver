@@ -348,7 +348,7 @@ def test_every_damaged_sector_of_a_read_is_counted_and_logged(stack, written):
     assert device_status()["crc_mismatches"] == mismatches + 3
 
     text = (
-        f"dcorr {UPPER_NAME} [check_crc]: CRC mismatch in 3 of {DATA_SECTORS} sectors read at sector {FIRST}, "
+        f"dcorr {UPPER_NAME}: CRC mismatch in 3 of {DATA_SECTORS} sectors read at sector {FIRST}, "
         f"the first at sector {FIRST + 1}"
     )
     assert warned(lambda: assert_read_fails(stack.upper, FIRST, DATA_SECTORS), text)
@@ -410,4 +410,4 @@ def test_a_flood_on_one_device_does_not_hide_the_errors_of_another(stack, other_
             for chunk in range(chunks):
                 assert_read_fails(stack.upper, chunk * DATA_SECTORS, DATA_SECTORS)
         assert_read_fails(other_stack.upper, 0, DATA_SECTORS)
-    assert any(f"dcorr {OTHER_NAME} [check_crc]: CRC mismatch" in message for message in messages), messages
+    assert any(f"dcorr {OTHER_NAME}: CRC mismatch" in message for message in messages), messages
