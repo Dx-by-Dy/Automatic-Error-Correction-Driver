@@ -107,12 +107,6 @@ in a run, **From reading** means it was only found in the code.
   simplicity: until a chunk of the sector is written back, it stays with one copy, and a warning is logged at
   every access, rate-limited. A trailing sector that failed to write is counted, not retried. Fix: rewrite the
   failed copy from the other once it is found, in the worker.
-- **A sync may start before the completion of the last write back has set its bit.** From reading, at
-  `8a153d4`: the worker waits for `nr_jobs` or `nr_writing` to reach zero without the lock of the cache, before
-  the barrier, the sync of crowded areas and the sync of a suspend, but the completion of a job decrements them
-  before it sets the bit of its chunk, in the same hold of the lock. The sync may then write a block of the
-  bitmap while a bit in it changes, and miss that bit or write a block whose CRC no longer matches. The flush of
-  the lower device that comes first makes it unlikely. Fix: take the lock once after the wait, or decrement last.
 
 ## Device Mapper integration
 

@@ -342,7 +342,10 @@ Only reads from the lower device and write backs reach the lower device, and the
 - The jobs of the chunks of one metadata sector go one at a time, as each writes that sector from the same memory:
   a second one would change it under the first. The end of one starts the next, without a worker waiting.
 
-The cache has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O.
+The cache has one spinlock, held only for a lookup and a copy of at most one chunk, never across I/O. The worker
+waits for no job or no write back in flight without it, before a sync or a discard, and then takes it once: the
+completion of the last job lowers the counters and sets the bit of its chunk in one hold of the lock, and the
+sync must not write the bitmap before that hold ends.
 
 ### Memory
 

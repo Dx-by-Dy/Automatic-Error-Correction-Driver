@@ -459,6 +459,11 @@ has no FUA; it goes the way of a FUA write, through the flushes of the worker. A
 as `dm-log-writes` has no write zeroes, so a write zeroes over it comes as ordinary writes; its whole chunks go
 the way of a discard and its ends the way of a write, both cut by the crash tests.
 
+The worker takes the lock of the cache once after it waits for no job or no write back in flight, so that a
+sync never writes a block of the bitmap while the completion of the last job is still setting a bit in it. This
+is fixed by reading and is not tested: the window is a few instructions in one hold of the lock, and no run
+reaches it on purpose.
+
 If the kernel log overruns during a run, the summary reports it as `Kernel log overran N times`; a report in
 that window would go unseen.
 

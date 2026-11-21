@@ -171,6 +171,21 @@ static void cache_wait(struct cache *cache)
     dcorr_events_wait(&cache->events, &cache->lock);
 }
 
+/// @brief Waits, without the lock, until a condition on the counters of the cache holds
+/// @details
+/// The completion of a job lowers nr_jobs and nr_writing, and sets the bit of
+/// its chunk in the bitmap of written chunks, in one hold of the lock: the
+/// condition can hold before that hold ends. So the lock is taken once after
+/// the wait, and whoever goes on after it, a sync above all, sees all that
+/// the completions did. By reading: no test catches the window.
+#define cache_wait_until(cache, condition)                    \
+    do                                                        \
+    {                                                         \
+        wait_event((cache)->events.wait, condition);          \
+        spin_lock(&(cache)->lock);                            \
+        spin_unlock(&(cache)->lock);                          \
+    } while (0)
+
 /// @brief Runs the worker now
 static void cache_kick(struct cache *cache)
 {
@@ -603,7 +618,7 @@ static void cache_discard_bios(struct cache *cache, struct bio_list *discards)
     struct written_map *written = cache->dc->written;
     struct bio *bio;
 
-    wait_event(cache->events.wait, !READ_ONCE(cache->nr_writing));
+    cache_wait_until(cache, !READ_ONCE(cache->nr_writing));
 
     while ((bio = bio_list_pop(discards)))
     {
@@ -824,7 +839,7 @@ static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entr
     if (metadata_written_since_flush(metadata, area, sector) ||
         (unwritten && cache->clears != cache->synced_clears))
     {
-        wait_event(cache->events.wait, !READ_ONCE(cache->nr_jobs));
+        cache_wait_until(cache, !READ_ONCE(cache->nr_jobs));
         atomic64_inc(&cache->stats->barriers);
         cache_sync(cache, NULL, false);
     }
@@ -995,7 +1010,7 @@ static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes
 {
     unsigned long failed;
 
-    wait_event(cache->events.wait, !READ_ONCE(cache->nr_writing));
+    cache_wait_until(cache, !READ_ONCE(cache->nr_writing));
 
     spin_lock(&cache->lock);
     failed = cache->nr_failed;
@@ -1015,7 +1030,7 @@ static void cache_crowded_flush(struct cache *cache)
     if (!metadata_crowded(cache->dc->metadata))
         return;
 
-    wait_event(cache->events.wait, !READ_ONCE(cache->nr_jobs));
+    cache_wait_until(cache, !READ_ONCE(cache->nr_jobs));
     atomic64_inc(&cache->stats->crowded_flushes);
     cache_sync(cache, NULL, false);
 }
@@ -1116,7 +1131,7 @@ void cache_suspend(struct cache *cache)
     spin_unlock(&cache->lock);
 
     cache_kick(cache);
-    wait_event(cache->events.wait, !READ_ONCE(cache->nr_dirty) && !READ_ONCE(cache->nr_writing));
+    cache_wait_until(cache, !READ_ONCE(cache->nr_dirty) && !READ_ONCE(cache->nr_writing));
     cancel_delayed_work_sync(&cache->worker);
 
     cache_sync(cache, NULL, false);
