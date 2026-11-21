@@ -827,26 +827,46 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 /// a bit in RAM, and the device keeps it set until the next sync; a crash after
 /// a write back that skipped the settle could then leave sectors matching
 /// neither copy. So a chunk with its bit clear, while a clear is not yet
-/// durable, waits for a sync too, counted as a barrier; if that sync fails,
-/// the chunk is settled as one written before.
+/// durable, waits for a sync too, counted as a barrier.
+///
+/// If the sync of a barrier fails, nothing has become durable and the chunk
+/// may not be written back: the error is returned, and the caller gives the
+/// write back up.
 /// @param unwritten Whether the bit of the chunk in the bitmap of written chunks is clear
-static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entry, bool unwritten)
+/// @return 0, or the error of the sync of the barrier
+static int cache_prepare_metadata(struct cache *cache, struct cache_entry *entry, bool unwritten)
 {
     struct metadata_cache *metadata = cache->dc->metadata;
     sector_t sector = entry->chunk * DCORR_CHUNK_SECTORS;
     struct metadata_area *area = metadata_get(metadata, sector);
+    int r = 0;
 
     if (metadata_written_since_flush(metadata, area, sector) ||
         (unwritten && cache->clears != cache->synced_clears))
     {
         cache_wait_until(cache, !READ_ONCE(cache->nr_jobs));
         atomic64_inc(&cache->stats->barriers);
-        cache_sync(cache, NULL, false);
+        r = cache_sync(cache, NULL, false);
     }
 
-    if (!unwritten || cache->clears != cache->synced_clears)
+    if (!r && !unwritten)
         metadata_settle(metadata, area, sector, entry->mask);
     metadata_put(metadata, area);
+
+    return r;
+}
+
+/// @brief Gives up the write back of an entry in CACHE_WRITING before any of its jobs is sent
+/// @details The entry fails and keeps its data, as after a failed write back; a flush tries it again.
+static void cache_abandon_entry(struct cache *cache, struct cache_entry *entry)
+{
+    spin_lock(&cache->lock);
+    entry->jobs = 0;
+    entry->status = BLK_STS_IOERR;
+    cache_finish_entry(cache, entry);
+    cache_event(cache);
+    spin_unlock(&cache->lock);
+    dcorr_events_wake(&cache->events);
 }
 
 /// @brief Writes back an entry in CACHE_WRITING, one job per run of its sectors
@@ -862,13 +882,15 @@ static void cache_prepare_metadata(struct cache *cache, struct cache_entry *entr
 /// clear, writes it whole, the sectors not written from above as zeros: once
 /// the bit is set they are read from the lower device, where they hold
 /// whatever was there before the format.
-static void cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
+/// @return 0, or the error of the sync of a barrier, when the write back is given up
+static int cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
 {
     bool unwritten;
     unsigned int first;
     unsigned int run;
     unsigned int jobs = 0;
     u8 mask;
+    int r;
 
     spin_lock(&cache->lock);
     unwritten = !written_test(cache->dc->written, entry->chunk * DCORR_CHUNK_SECTORS);
@@ -901,7 +923,12 @@ static void cache_write_back_entry(struct cache *cache, struct cache_entry *entr
         cache_wait(cache);
     spin_unlock(&cache->lock);
 
-    cache_prepare_metadata(cache, entry, unwritten);
+    r = cache_prepare_metadata(cache, entry, unwritten);
+    if (r)
+    {
+        cache_abandon_entry(cache, entry);
+        return r;
+    }
 
     for (first = 0; first < DCORR_CHUNK_SECTORS; first += run)
     {
@@ -909,6 +936,8 @@ static void cache_write_back_entry(struct cache *cache, struct cache_entry *entr
         if (mask & BIT(first))
             cache_submit_job(cache, entry, first, run);
     }
+
+    return 0;
 }
 
 /// @brief Whether the worker has to write back more to keep entries free
@@ -946,7 +975,10 @@ static int cache_flush_lower(struct cache *cache)
 /// CRCs of that durable data, the other copies of the blocks of the bitmap are
 /// written, and the lower device is flushed once more, so that both copies are
 /// durable before a chunk is written back again. If a flush before fails, no
-/// trailing copy is written: the data may not be on the device.
+/// trailing copy is written, as the data may not be on the device: the areas
+/// stay pinned and their chunks marked as written since the last flush, so
+/// that the next sync writes their trailing copies once the lower device
+/// flushes again, and until then none of those chunks is written back.
 ///
 /// Expected execution context - the worker, or postsuspend once the worker is
 /// cancelled; may sleep.
@@ -984,10 +1016,9 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 
     if (r)
     {
-        DCORR_DEV_ERR_LIMIT(cache->dc->ti, "lower flush or bitmap failed, err=%d, trailing metadata not written\n",
+        DCORR_DEV_ERR_LIMIT(cache->dc->ti, "lower flush or bitmap failed, err=%d, trailing metadata kept for the next sync\n",
                             r);
         written_abort(written);
-        metadata_unpin_all(metadata);
         return r;
     }
 
@@ -1024,15 +1055,17 @@ static void cache_complete_flushes(struct cache *cache, struct bio_list *flushes
 /// A write back holds the area of its chunk, and pins it when it completes,
 /// until the trailing copy is written. So once half the areas are busy, the
 /// worker waits for the jobs in flight and runs cache_sync, which unpins them
-/// all; otherwise the areas could run out with the worker waiting for one.
-static void cache_crowded_flush(struct cache *cache)
+/// all; otherwise the areas could run out with the worker waiting for one. If
+/// that sync fails, the pins stay, and the worker stops writing back.
+/// @return 0, or the error of the sync
+static int cache_crowded_flush(struct cache *cache)
 {
     if (!metadata_crowded(cache->dc->metadata))
-        return;
+        return 0;
 
     cache_wait_until(cache, !READ_ONCE(cache->nr_jobs));
     atomic64_inc(&cache->stats->crowded_flushes);
-    cache_sync(cache, NULL, false);
+    return cache_sync(cache, NULL, false);
 }
 
 /// @brief The worker
@@ -1046,6 +1079,12 @@ static void cache_crowded_flush(struct cache *cache)
 /// worker when too many metadata areas are pinned. Then it schedules itself
 /// for the next entry to come of age.
 ///
+/// Once the sync of a barrier or of crowded areas fails, the lower device has
+/// failed to flush, and the worker stops at its level: the entries it picked
+/// and has not written back yet fail without I/O and keep their data, as
+/// after a failed write back, so that the flushes fail and a flush tries them
+/// again. The next pass of the worker tries the lower device again.
+///
 /// It runs on an ordered workqueue of its own, never in transform_wq, so it may
 /// wait for jobs, for places among the parts in flight and for reads in flight:
 /// their completions run there.
@@ -1057,7 +1096,9 @@ static void cache_worker(struct work_struct *work)
     struct bio_list flushes;
     struct bio_list discards;
     LIST_HEAD(picked);
+    unsigned int abandoned = 0;
     bool all;
+    int r = 0;
 
     spin_lock(&cache->lock);
     discards = cache->discards;
@@ -1091,9 +1132,18 @@ static void cache_worker(struct work_struct *work)
     list_for_each_entry_safe(entry, next, &picked, list)
     {
         list_del_init(&entry->list);
-        cache_crowded_flush(cache);
-        cache_write_back_entry(cache, entry);
+        if (!r)
+            r = cache_crowded_flush(cache);
+        if (!r)
+            r = cache_write_back_entry(cache, entry);
+        else
+            cache_abandon_entry(cache, entry);
+        if (r)
+            abandoned++;
     }
+    if (abandoned)
+        DCORR_DEV_ERR_LIMIT(cache->dc->ti, "write back stopped: the lower device failed to flush, err=%d, %u chunks kept in RAM\n",
+                            r, abandoned);
 
     if (!bio_list_empty(&flushes))
         cache_complete_flushes(cache, &flushes);
@@ -1117,7 +1167,10 @@ static void cache_worker(struct work_struct *work)
 /// flight. Tries the failed entries once more; those that fail again keep their
 /// data in RAM, which is lost if the target is destroyed, as a suspend cannot fail.
 /// Then flushes the lower device and writes the trailing copies of the
-/// metadata, see cache_sync, so that no metadata area is pinned.
+/// metadata, see cache_sync, so that no metadata area is pinned. If that sync
+/// fails, the trailing copies of the chunks written back since the last flush
+/// are given up and the areas unpinned anyway, as the metadata in RAM is
+/// dropped on suspend: those chunks keep their two copies different.
 ///
 /// Expected execution context - process, may sleep.
 void cache_suspend(struct cache *cache)
@@ -1134,7 +1187,11 @@ void cache_suspend(struct cache *cache)
     cache_wait_until(cache, !READ_ONCE(cache->nr_dirty) && !READ_ONCE(cache->nr_writing));
     cancel_delayed_work_sync(&cache->worker);
 
-    cache_sync(cache, NULL, false);
+    if (cache_sync(cache, NULL, false))
+    {
+        metadata_unpin_all(cache->dc->metadata);
+        DCORR_DEV_ERR(cache->dc->ti, "the lower device failed to flush on suspend, the trailing metadata of the chunks written back since the last flush is not written\n");
+    }
 
     spin_lock(&cache->lock);
     cache->write_all = false;

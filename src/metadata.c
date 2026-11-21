@@ -683,8 +683,10 @@ void metadata_write_trails(struct metadata_cache *mc)
 
 /// @brief Unpins every area without writing the trailing copies
 /// @details
-/// For when the lower device failed to flush, so that the data written back
-/// may not be durable: the trailing copies keep the CRCs they had.
+/// For a suspend whose flush of the lower device failed, so that the data
+/// written back may not be durable: the trailing copies keep the CRCs they
+/// had, and the areas can be dropped. A sync that fails otherwise keeps the
+/// pins, for the next sync to write the trailing copies.
 void metadata_unpin_all(struct metadata_cache *mc)
 {
     struct metadata_area *area;

@@ -392,7 +392,8 @@ the choice of the user; no write zeroes until `iterate_devices`, in the stage of
 - The trap: the first write back of a chunk skips the settle, right only while its bit is clear on the device
   too; after a discard the bit is clear in RAM and still set on the device until the next sync. So such a write
   back syncs first. The generation costs no memory, and only first writes between a discard and the next flush
-  pay; if that sync fails, the chunk is settled as one written before.
+  pay; if that sync fails, the write back is given up, as for any barrier since 2026-11-21, when a failed flush
+  stopped forgetting the trailing copies.
 - Device mapper offers write zeroes only through `iterate_devices` with every device below capable; there is no
   flag for a target that emulates it. Until then `blkdev_issue_zeroout` writes zero pages, correct and slower.
 - A discard and a write racing on one chunk may land in either order: concurrent I/O, the business of the layer

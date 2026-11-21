@@ -437,18 +437,7 @@ def test_a_failed_flush_is_counted(faulty):
     assert device_status()["flush_errors"] == after["flush_errors"]
 
 
-@pytest.mark.parametrize(
-    "flush",
-    [
-        "none",
-        pytest.param(
-            "failed",
-            marks=pytest.mark.xfail(
-                strict=True, reason="A failed flush of the lower device leaves the trailing copies behind"
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("flush", ["none", "failed"])
 def test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier(faulty, flush):
     """A chunk written back holds its old or its new data until the lower device flushes, so the next write
     back of it takes a barrier first. A flush that fails has made nothing durable, so the same holds after it.
@@ -467,6 +456,32 @@ def test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier(faulty,
     wait_for_write_back()
     assert device_status()["barriers"] == barriers + 1, "written back again with no barrier"
     faulty.upper.flush_settled()
+    assert faulty.upper.read(first, DATA_SECTORS) == pattern("third", DATA_SECTORS)
+
+
+def test_a_chunk_whose_barrier_fails_is_not_written_back(faulty):
+    """A chunk written back since the last flush waits for a barrier before its next write back. When the flush
+    of the barrier fails nothing has become durable, so the write back is given up before any I/O: the entry
+    fails and keeps its data, and a flush once the lower device works again writes it back.
+
+    The write back counts no error of its own: one that was sent through a lower device that fails writes would.
+    """
+    first = BAD_CHUNK * DATA_SECTORS
+    faulty.upper.write(first, pattern("second", DATA_SECTORS))
+    wait_for_write_back()
+    faulty.load(f"flakey {faulty.lower} 0 0 1 1 error_writes")
+    try:
+        before = device_status()
+        faulty.upper.write(first, pattern("third", DATA_SECTORS))
+        wait_for_write_back()
+        after = device_status()
+    finally:
+        faulty.load(f"linear {faulty.lower} 0")
+    assert after["barriers"] == before["barriers"] + 1
+    assert after["failed"] == 1
+    assert after["write_errors"] == before["write_errors"], "the write back was sent"
+    faulty.upper.flush_settled()
+    assert device_status()["failed"] == 0
     assert faulty.upper.read(first, DATA_SECTORS) == pattern("third", DATA_SECTORS)
 
 

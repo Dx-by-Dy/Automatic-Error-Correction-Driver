@@ -75,11 +75,6 @@ in a run, **From reading** means it was only found in the code.
   Fix, to be designed: read the failed copy again before the sector is written; while it still fails, read the
   chunks of the sector, and if the data of one of them does not match the copy that reads, leave the failed copy
   as it is and fail the write back, as for a sector failed in both copies.
-- **A failed flush of the lower device leaves the trailing copies behind.** Confirmed at `8a153d4` by
-  `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier`: the chunks written back before it are
-  forgotten without their trailing copy, so their copies differ, the next write back of such a chunk takes no
-  barrier, and the read before it may see data that is not durable. A device that fails flushes gives no durability anyway.
-  Fix, if it matters: keep them pinned and retry, with a way out when the areas run out.
 - **A lost write passes as the old contents until the flush after its write back.** Confirmed by
   `test_lost_writes.py`, by decision of the threat model: until then the trailing copy holds the old CRC, and the
   read accepts it; a write lost together with both copies of its metadata passes for ever, which a test pins.

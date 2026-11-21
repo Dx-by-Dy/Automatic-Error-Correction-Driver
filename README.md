@@ -101,7 +101,7 @@ sudo dmsetup remove dcorr
 
 | Stage | What | State |
 | --- | --- | --- |
-| Test base | 385 tests in a VM: data, damage, crashes replayed from a log, failing drives, filesystems, load | Done; the commit before the cache is to be marked for the baseline |
+| Test base | 386 tests in a VM: data, damage, crashes replayed from a log, failing drives, filesystems, load | Done; the commit before the cache is to be marked for the baseline |
 | Cache | A write back cache of its own, flushes and FUA | Done |
 | Integrity and format | Groups and superblocks, two copies of the CRCs, the bitmap of written chunks, discard | Done |
 | Device mapper integration | Counters, the event, the table, queue limits, write zeroes; this documentation | Done |

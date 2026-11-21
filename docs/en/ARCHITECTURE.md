@@ -306,7 +306,11 @@ everything dirty, waits for it, and syncs:
 4. write the trailing copies of the metadata of the chunks written back, and the other copy of the blocks of the
    bitmap, and flush, so that both copies are durable before the chunks are written back again.
 
-If the first flush fails, no trailing copy is written: the data may not be on the device.
+If the first flush fails, no trailing copy is written, as the data may not be on the device: the areas stay pinned
+and their chunks count as written since the last flush, so none of them is written back before a sync succeeds,
+and that sync writes their trailing copies. When the sync of a barrier or of crowded areas fails, the worker
+stops: the entries it has not written back yet fail without I/O and keep their data, and a later pass or a flush
+tries the lower device again. A suspend whose sync fails unpins the areas anyway, as it drops the metadata in RAM.
 
 ### Discard
 
@@ -319,7 +323,7 @@ under it.
 
 The cleared bits reach the device with the next sync, so after a crash before it the chunks may hold their old
 data. Until then the bit of such a chunk is still set on the device, so its first write back, which does not
-settle, syncs first, counted as a barrier; if that sync fails, the chunk is settled as one written before.
+settle, syncs first, counted as a barrier; if that sync fails, the write back is given up, as for any barrier.
 
 Write zeroes is offered where the device below has it, as device mapper offers it only then (D23), and is never
 passed down either. Device mapper does not split it at chunks. Its partial chunks are written as zeros through the

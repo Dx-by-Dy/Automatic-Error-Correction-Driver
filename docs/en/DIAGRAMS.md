@@ -212,8 +212,35 @@ Covered by [`test_durability.py`](../../tests/test_durability.py) (all);
 [`test_crash.py`](../../tests/test_crash.py): `test_flushed_writes_survive_a_crash`.
 
 The same sync runs for a barrier, when half the metadata areas are busy, and on a suspend. If the first flush
-fails, the flushes from above fail and no trailing copy is written, but the chunks written back are forgotten as
-well: [A failed flush of the lower device](#a-failed-flush-of-the-lower-device).
+fails, the flushes from above fail and no trailing copy is written; the chunks written back stay pinned for the
+next sync: [A failed flush of the lower device](#a-failed-flush-of-the-lower-device).
+
+## A failed flush of the lower device
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant M as Metadata in RAM
+    participant Low as Lower device
+    W->>Low: write back of chunk A, version 2: leading copy with FUA, then the data
+    W->>M: A written since the flush, its area pinned
+    W->>Low: flush
+    Low-->>W: fails
+    Note over M: the area stays pinned, A still counts as written since the flush
+    W->>W: next write back of A, version 3: a barrier first
+    W->>Low: flush
+    alt the flush fails again
+        Low-->>W: fails
+        W->>W: the write back is given up, A keeps version 3 in RAM, the flushes fail
+    else the flush succeeds
+        Low-->>W: done, version 2 durable
+        W->>Low: the trailing copy of A takes version 2, then leading version 3 and the data
+    end
+```
+
+Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py):
+`test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier`, a barrier with a failed flush between the
+two write backs as with none, and `test_a_chunk_whose_barrier_fails_is_not_written_back`.
 
 ## A crash between the two copies
 
@@ -491,28 +518,6 @@ stateDiagram-v2
 
 Pinned by `test_old_data_put_back_fails_once_the_new_was_read`: with the trailing copy lost, strict `xfail`; with
 both copies written, the old data put back fails its CRC.
-
-### A failed flush of the lower device
-
-```mermaid
-sequenceDiagram
-    participant W as Worker
-    participant M as Metadata in RAM
-    participant Low as Lower device
-    W->>Low: write back of chunk A, version 2: leading copy with FUA, then the data
-    W->>M: A written since the flush, its area pinned
-    W->>Low: flush
-    Low-->>W: fails
-    W->>M: every area unpinned: A no longer counts as written
-    Note over Low: version 2 may not be durable, the trailing copy holds version 1
-    W->>W: next write back of A, version 3, with no barrier
-    W->>Low: settle reads A and may get version 2 from the cache of the drive
-    W->>Low: the trailing copy takes version 2 with FUA, then leading version 3 and the data
-    Note over Low: after a crash the drive may hold version 1, which matches neither copy
-```
-
-Pinned by `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier`: with the failed flush between
-the two write backs, no barrier, strict `xfail`; with no flush between, one barrier.
 
 ### The probe takes a copy stored as data
 

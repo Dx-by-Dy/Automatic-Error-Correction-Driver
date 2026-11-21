@@ -1,6 +1,6 @@
 # Тесты драйвера
 
-385 тестов на pytest. Они работают от root в VM для разработки и отказываются работать где-либо ещё, так как
+386 тестов на pytest. Они работают от root в VM для разработки и отказываются работать где-либо ещё, так как
 перезаписывают `/dev/vdb`. VM описана в [DEPLOY.md](DEPLOY.md), почему тесты устроены так — в
 [D1](DECISIONS.md#d1-тесты-работают-в-vm-крахи-воспроизводятся-из-журнала).
 
@@ -9,8 +9,8 @@
 ## Запуск
 
 ```bash
-deploy/vm.sh test                                     # all 385 tests
-deploy/vm.sh test -m "not slow"                       # the fast ones: 344 tests
+deploy/vm.sh test                                     # all 386 tests
+deploy/vm.sh test -m "not slow"                       # the fast ones: 345 tests
 deploy/vm.sh test -k corruption                       # by name
 deploy/vm.sh test test_fio.py::test_single_job -v     # one test
 ```
@@ -278,7 +278,7 @@ bio перед отправкой, так что задержанное чтен
 | `test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other` | 2 | Первая запись, у которой отброшена ведущая или замыкающая копия блока: эта копия сохраняет старое поколение, и чанк читается после пересоздания target |
 | `test_old_data_put_back_fails_once_the_new_was_read` | 2 | Перезапись сброшена flush, target создан снова, новые данные прочитаны и сброшены flush, затем старые данные возвращены в их слот: с обеими записанными копиями они отказывают; с потерянной замыкающей копией проходят, строгий `xfail` |
 
-### `test_lower_errors.py`: нижнее устройство отказывает (27 тестов)
+### `test_lower_errors.py`: нижнее устройство отказывает (28 тестов)
 
 `dm-dust` с блоками по 512 байт делает неудачными чтения выбранных секторов нижнего устройства, а записи в них —
 выбранное число раз; запись в такой сектор его очищает. Один тест загружает на его место `dm-flakey`. Сначала
@@ -305,7 +305,8 @@ bio перед отправкой, так что задержанное чтен
 | `test_a_failed_read_is_counted_and_logged_with_the_device` | 1 | Неудачный сектор данных, прочитанный отдельно: `read_errors` растёт на 1, а журнал называет устройство так, как его называет `dmsetup`, и логический сектор |
 | `test_a_failed_metadata_read_is_counted_in_sectors` | 1 | Отказывают три сектора ведущей копии, метаданные сброшены из RAM: всё читается, а `metadata_read_errors` растёт на кратное 3, так как каждое чтение области учитывает каждый сектор; сколько раз её читает udev, не известно |
 | `test_a_failed_flush_is_counted` | 1 | `dm-flakey` с `error_writes`, и записывать обратно нечего: flush сверху отказывает, `flush_errors` растёт на 1, а `write_errors` нет; с вернувшимся `dm-linear` flush удаётся |
-| `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier` | 2 | Чанк дважды записан обратно по возрасту: один барьер без flush между ними; с неудавшимся flush между ними — ни одного, строгий `xfail` |
+| `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier` | 2 | Чанк дважды записан обратно по возрасту: один барьер без flush между ними и один с неудавшимся flush между ними, так как он ничего не сделал долговечным |
+| `test_a_chunk_whose_barrier_fails_is_not_written_back` | 1 | `dm-flakey` с `error_writes` перед второй обратной записью: её барьер не удаётся, так что элемент отказывает без отправленной обратной записи, `write_errors` не меняется; с вернувшимся `dm-linear` flush записывает его, и он читается |
 | `test_the_first_error_raises_one_device_mapper_event` | 1 | Неудачное чтение: `dmsetup wait` видит одно событие; ещё три неудачных чтения не поднимают ни одного |
 | `test_write_zeroes_is_not_offered_over_a_lower_device_without_it` | 1 | У `dm-dust` нет write zeroes, значит, нет и у драйвера; `BLKZEROOUT` обнуляет обычными записями, так что после flush чанки читаются с нижнего устройства |
 
@@ -444,11 +445,10 @@ KiB, которые удерживают KASAN и kmemleak, а не память
 записями, которые журнал воспроизводит в порядке их завершения, а dm-log-writes ничего не пишет о записи, пока она
 не завершилась, так что перестановка внутри одного flush никогда не видна при воспроизведении.
 
-Две вещи discard не тестируются. Кэш округляет начало discard вверх до чанка, но `__blkdev_issue_discard` всегда
+Одна вещь discard не тестируется. Кэш округляет начало discard вверх до чанка, но `__blkdev_issue_discard` всегда
 заканчивает первый bio диапазона на границе гранулярности, так что невыровненное начало доходит до target как bio
 без целого чанка, завершаемый в `dcorr_map`, и округление из пространства пользователя никогда не нужно: discard и
-начального чанка проходил все тесты. А согласование чанка, чей бит очищен, когда синхронизация перед его обратной
-записью не удалась, требует flush, который отказывает именно в этот момент.
+начального чанка проходил все тесты.
 
 Две вещи write zeroes не тестируются. Write zeroes с FUA, так как из пространства пользователя его никто не
 отправляет: у `BLKZEROOUT` нет FUA; он идёт путём записи FUA, через flush воркера. И крах посреди него, так как у
@@ -680,6 +680,7 @@ discard. Пойманы 4 из 5:
 | Событие при каждой ошибке | Упал | `test_the_first_error_raises_one_device_mapper_event` |
 | Журнал называет устройство по major:minor | Упали, 2 | `test_a_failed_read_is_counted_and_logged_with_the_device`, `test_every_damaged_sector_of_a_read_is_counted_and_logged` |
 | Неудачный flush не учитывается | Упал | `test_a_failed_flush_is_counted` |
+| Неудачный flush открепляет области и забывает их чанки, а неудачный барьер всё равно записывает обратно (код до 2026-11-21, `007c904`) | Упал: нет барьера после неудачного flush, и обратная запись отправлена, `write_errors` 1 | `test_a_chunk_written_back_again_after_a_failed_flush_takes_a_barrier`, `test_a_chunk_whose_barrier_fails_is_not_written_back` |
 | Неудачное чтение копии области учитывается как 1, а не по её секторам | Упал | `test_a_failed_metadata_read_is_counted_in_sectors` |
 | Неудачная обратная запись не учитывается | Упали, 4 | `test_failed_write_is_reported` |
 | Неудачное чтение не учитывается | Упал | `test_a_failed_read_is_counted_and_logged_with_the_device` |
