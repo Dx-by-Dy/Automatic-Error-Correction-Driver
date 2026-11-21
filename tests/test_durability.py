@@ -117,8 +117,20 @@ def test_fsync_on_the_lower_device_flushes(stack):
     assert any(bio.preflush for bio in bios)
 
 
+def write_and_fsync_settled(path, sector):
+    """A write and an fsync, then a wait longer than the cache of the driver keeps dirty data.
+
+    The flush from above completes before the sync of the driver writes the trailing copies of the metadata
+    and the second copies of the blocks of the bitmap, and flushes them: stopped at once, the trace may catch
+    those writes without their flush. The wait lets them in whole, and a write left in the cache would be
+    written back meanwhile, with no flush after it.
+    """
+    write_and_fsync(path, sector)
+    time.sleep(CACHE_AGE_SECONDS * 2)
+
+
 def test_fsync_on_the_device_flushes(stack):
-    bios = bios_on_test_disk(lambda: write_and_fsync(stack.upper_path, 0))
+    bios = bios_on_test_disk(lambda: write_and_fsync_settled(stack.upper_path, 0))
     assert any(bio.preflush for bio in bios)
     assert not writes_left_in_the_cache(bios)
 

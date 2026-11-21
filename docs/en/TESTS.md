@@ -195,7 +195,7 @@ or a flush is queued after it, so after an `fsync` no write it caused may be nei
 | `test_the_test_disk_has_a_write_cache` | 1 | Control: `vdb` is `write back`, or the next tests would prove nothing |
 | `test_device_reports_a_write_cache_and_fua` | 1 | The device is `write back` with `fua` 1, or the layers above send neither |
 | `test_fsync_on_the_lower_device_flushes` | 1 | Control: this way of counting does see flushes |
-| `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes |
+| `test_fsync_on_the_device_flushes` | 1 | An `fsync` on the device gives a flush on `vdb` after its writes; the trace goes on 2 s after it, so that it holds the tail of the sync, the trailing metadata and the second copies of the bitmap, with their flush: stopped at once, it caught them without it about once in 15 runs of the file |
 | `test_fsync_on_ext4_leaves_nothing_in_the_cache` | 3 | A new file and an `fsync` on ext4 without lazy initialisation: the journal commit is seen, as a FUA write on the lower device alone and as a flush through the driver, whose cache turns FUA into a write back and a flush; and no write is left unflushed. On the lower device alone it is the control; on the device with 4 KiB blocks the commit block is a whole chunk, with 1 KiB blocks it is part of one, so its metadata is read first |
 
 ### `test_crash.py`: the device after a crash (16 tests)
@@ -516,6 +516,7 @@ Flushes and FUA, with `test_durability.py`:
 | Before the cache: the metadata write of a whole chunk without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 4k blocks]` |
 | Before the cache: the metadata write of a partial write without FUA | 1 | `test_fsync_on_ext4_leaves_nothing_in_the_cache[device, 1k blocks]` |
 | An empty flush completed in `dcorr_map` without reaching the lower device | 3 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
+| No flush after the trailing metadata and the second copies of the bitmap | 3, in 5 runs of 5 | `test_fsync_on_the_device_flushes` and the two ext4 cases of the device |
 
 Crash consistency, with `test_crash.py`:
 
