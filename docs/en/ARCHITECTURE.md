@@ -294,7 +294,11 @@ copies and then drops every area, as the lower device may change before the devi
 
 If the read of a copy fails, its sectors are read one at a time. A sector that failed in one copy is taken from the
 other, and a rate-limited warning names each chunk read or written with one copy; the next write of that sector
-puts it right. Only the chunks whose entries are in a sector failed in both copies fail, and an area with such
+puts it right, once checked: after a crash in a write back the failed copy may hold the only CRC that matches a
+chunk, so it is read again first, and while it fails the chunks of the sector are read and compared with the copy
+that reads, but those the write covers, those written back since the last flush, chunks never written and slots
+of parity. If one does not match, a leading sector is not written and the write back fails, so the neighbours
+wait until the sector reads again or that chunk is rewritten whole; a trailing sector is left and counted. Only the chunks whose entries are in a sector failed in both copies fail, and an area with such
 sectors is read again by the next request that finds it unused. A trailing sector that fails to write is counted,
 and its chunks go on with the leading copy.
 
@@ -412,7 +416,7 @@ the cache; `dcorr_status` prints them:
 | 6 | `failed` | Entries whose write back failed |
 | 7 | `metadata_loads` | Metadata areas read from the lower device |
 | 8 | `metadata_waits` | Waits for a metadata area to be let go, as all were in use |
-| 9 | `trail_errors` | Sectors of the trailing copy of the metadata that failed to write |
+| 9 | `trail_errors` | Sectors of the trailing copy of the metadata that failed to write, or were left as their copy did not read and a chunk there matched only it |
 | 10 | `crowded_flushes` | Syncs the worker made by itself, as too many metadata areas were busy |
 | 11 | `barriers` | Syncs before a write back of a chunk written back since the last flush, or of a chunk whose bit is clear while a clear is not yet synced |
 | 12 | `settle_reads` | Chunks read to settle them, before a write back or after a read, as their two copies of the metadata differed |
@@ -427,7 +431,7 @@ the cache; `dcorr_status` prints them:
 | 21 | `discarded_chunks` | Whole chunks they covered |
 | 22 | `read_errors` | Reads of data from the lower device that failed |
 | 23 | `crc_mismatches` | Sectors read from the lower device that matched neither CRC of their chunk |
-| 24 | `write_errors` | Write backs that failed, at the leading metadata sector or at the data |
+| 24 | `write_errors` | Write backs that failed, at the leading metadata sector or at the data, or before it, as the leading sector could not be written from RAM |
 | 25 | `metadata_read_errors` | Sectors of a copy of the metadata that failed to read, counted at each read of the area |
 | 26 | `flush_errors` | Flushes of the lower device that failed |
 

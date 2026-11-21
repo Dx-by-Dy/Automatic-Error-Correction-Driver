@@ -210,28 +210,29 @@ def test_a_failed_leading_sector_is_rebuilt_from_the_trailing_copy():
         faulty.remove()
 
 
-REBUILT = "A metadata sector rebuilt from one copy can fail its neighbours for good"
-
-
 @pytest.mark.parametrize(
     "failed, state",
     [
         ("leading", "copies equal"),
-        pytest.param("leading", "crash after the data", marks=pytest.mark.xfail(strict=True, reason=REBUILT)),
-        pytest.param("trailing", "crash before the data", marks=pytest.mark.xfail(strict=True, reason=REBUILT)),
+        ("leading", "crash after the data"),
+        ("leading", "crash after the data, read again"),
+        ("trailing", "crash before the data"),
     ],
 )
 def test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable(faulty, failed, state):
-    """A copy of a metadata sector that fails to read is filled from the other one in RAM, and the next write of
-    a chunk there writes the whole sector from RAM. That is right while the copies agree. After a crash in a
+    """A copy of a metadata sector that fails to read is filled from the other one in RAM, and a write of a
+    chunk there would write the whole sector from RAM. That is right while the copies agree. After a crash in a
     write back they differ, and the data of the chunk matches only one of them: filled from the other, the
-    sector loses the CRC that matched, and once it is written the chunk fails for good, though the sector
-    reads again.
+    sector would lose the CRC that matched, and once written the chunk would fail for good, though the sector
+    reads again. So before such a sector is written, the copy is read again, and while it fails the chunks of
+    the sector are read and checked against the copy that reads.
 
     The chunk is left as a crash leaves it: the new data with the trailing copy still old, or the old data
     with the leading copy already new. Then the copy that holds the CRC of the data fails to read, a
-    neighbouring chunk is written, and the sector is healed. "copies equal" is the positive control, the
-    copies left as the flush made them.
+    neighbouring chunk is written, and the sector is healed. With the leading copy failed the write back of
+    the neighbour fails until then, and its flush with it; with the trailing one failed the neighbour is
+    written and its trailing sector left. "copies equal" is the positive control, the copies left as the flush
+    made them; "read again" heals the copy before the neighbour is written, so it is read again and written.
     """
     first = BAD_CHUNK * DATA_SECTORS
     old = pattern("before", AREA)[first * 512 :][: DATA_SECTORS * 512]
@@ -253,7 +254,13 @@ def test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable(faulty, fa
     faulty.fail(lead if failed == "leading" else trail)
     drop_metadata()
     neighbour = (BAD_CHUNK + 1) * DATA_SECTORS
-    flushed_write(faulty.upper, neighbour, pattern("neighbour", DATA_SECTORS))
+    if state.endswith("read again"):
+        faulty.heal()
+    faulty.upper.write(neighbour, pattern("neighbour", DATA_SECTORS))
+    if state == "crash after the data":
+        assert fails_with_eio(faulty.upper.flush), "the sector was written over the only CRC of the chunk"
+        faulty.heal()
+    faulty.upper.flush_settled()
     faulty.heal()
     drop_metadata()
     assert faulty.upper.read(neighbour, DATA_SECTORS) == pattern("neighbour", DATA_SECTORS)

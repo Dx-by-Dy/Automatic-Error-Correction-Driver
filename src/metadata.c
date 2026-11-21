@@ -5,6 +5,7 @@
 
 #include "data_crc.h"
 #include "metadata.h"
+#include "written.h"
 #include "log.h"
 
 /// @brief First sector of a copy of the metadata area of a region on the lower device
@@ -130,7 +131,9 @@ static void metadata_fill_sector(struct metadata_area *area, enum metadata_copy 
 /// @details
 /// A sector that failed to read in one copy is filled from the other, so that
 /// the next write of it from RAM puts the right entries of the other chunks
-/// there. A sector that failed in both fails its chunks, and the area is read
+/// there, and marked filled: after a crash the copy that failed may hold the
+/// only CRC that matches a chunk, so it is not written before metadata_may_write
+/// says it may be. A sector that failed in both fails its chunks, and the area is read
 /// again by the next who gets it while nobody holds it, so that a sector that
 /// reads again is seen.
 ///
@@ -146,6 +149,7 @@ static void metadata_load(struct work_struct *work)
     for (unsigned int copy = 0; copy < METADATA_COPIES; copy++)
     {
         bitmap_zero(area->bad[copy], DCORR_REGION_METADATA_SECTORS);
+        bitmap_zero(area->filled[copy], DCORR_REGION_METADATA_SECTORS);
         failed[copy] = metadata_load_copy(area, copy);
     }
 
@@ -162,6 +166,8 @@ static void metadata_load(struct work_struct *work)
                 metadata_fill_sector(area, METADATA_TRAIL, i);
             else if (trail)
                 metadata_fill_sector(area, METADATA_LEAD, i);
+            if (lead != trail)
+                __set_bit(i, area->filled[lead ? METADATA_LEAD : METADATA_TRAIL]);
         }
     }
 
@@ -383,6 +389,7 @@ void metadata_written(struct metadata_cache *mc, struct metadata_area *area, sec
     {
         area->sectors[chunk] |= mask;
         __clear_bit(metadata_area_sector(area, sector), area->bad[METADATA_LEAD]);
+        __clear_bit(metadata_area_sector(area, sector), area->filled[METADATA_LEAD]);
     }
     if (!ok)
         __set_bit(chunk, area->write_failed);
@@ -450,7 +457,8 @@ static void metadata_unpin(struct metadata_cache *mc, struct metadata_area *area
 
 /// @brief Puts what was written into the trailing copy in RAM, and records whether it reached the device
 /// @details A sector that failed keeps the new contents in RAM and is written again with the next
-/// change of the sector; until then reads take the leading copy alone.
+/// change of the sector; until then reads take the leading copy alone. Either way RAM holds what the
+/// sector should hold, so it is no longer filled.
 static void metadata_trail_done(struct metadata_cache *mc, struct metadata_area *area,
                                 unsigned int first, unsigned int end, int r)
 {
@@ -470,6 +478,7 @@ static void metadata_trail_done(struct metadata_cache *mc, struct metadata_area 
         bitmap_set(area->bad[METADATA_TRAIL], first, end - first);
     else
         bitmap_clear(area->bad[METADATA_TRAIL], first, end - first);
+    bitmap_clear(area->filled[METADATA_TRAIL], first, end - first);
     spin_unlock(&mc->lock);
 
     if (r)
@@ -499,13 +508,132 @@ static __le64 *metadata_trail_to_scratch(struct metadata_cache *mc, struct metad
 /// @brief Puts the leading CRCs of some sectors of a chunk into its entry in a trailing sector built in scratch
 static void metadata_lead_to_scratch(struct metadata_area *area, __le64 *scratch, unsigned int chunk, u8 mask)
 {
-    const struct metadata_entry *lead = metadata_area_entry(area, METADATA_LEAD, (sector_t)chunk * DCORR_CHUNK_SECTORS);
+    const struct metadata_entry *lead = metadata_entry_at(area, METADATA_LEAD, chunk);
     struct metadata_entry *entry = (struct metadata_entry *)scratch + chunk % DCORR_CHUNKS_PER_METADATA_SECTOR;
 
     for (unsigned int i = 0; i < DCORR_CHUNK_SECTORS; i++)
     {
         if (mask & BIT(i))
             entry->crc[i] = lead->crc[i];
+    }
+}
+
+static int metadata_read_chunk(struct metadata_cache *mc, sector_t sector);
+
+/// @brief Whether a metadata sector of a copy may be written from RAM
+/// @details
+/// A sector that failed to read in this copy holds in RAM the entries of the
+/// other one. After a crash in a write back the copies of a chunk differ and
+/// its data may match only the copy that failed: writing the sector from RAM
+/// would put the other CRC there on the device too, and the chunk would fail
+/// for good, though the sector reads again later.
+///
+/// So the copy is read again first; if it reads now, it is taken into RAM, and
+/// the sector may be written. If it still fails, each chunk of the sector is
+/// read and compared with the copy that reads, and the sector may be written
+/// only if all match. Left out are the sectors of the chunk that the write
+/// covers (skip_chunk, skip_mask), those a write back has written since the
+/// last flush, whose entries RAM holds, chunks never written, whose bit is
+/// clear, and slots of parity. A chunk that does not read cannot be checked,
+/// and counts as not matching.
+///
+/// No write of the sector may be in flight, as it is written from the same
+/// memory; reads of the area may go on.
+///
+/// Expected execution context - the worker of the data cache, or postsuspend, which holds the area; may sleep.
+/// @return Whether the sector may be written; if not, a warning names the first chunk that does not match
+static bool metadata_may_write(struct metadata_cache *mc, struct metadata_area *area, enum metadata_copy copy,
+                               unsigned int index, unsigned int skip_chunk, u8 skip_mask)
+{
+    enum metadata_copy other = copy == METADATA_LEAD ? METADATA_TRAIL : METADATA_LEAD;
+    const struct dcorr_layout *layout = &mc->sb->layout;
+    unsigned int byte = index * SECTOR_SIZE;
+    u8 *buffer = page_address(mc->chunk_page);
+    bool filled;
+
+    spin_lock(&mc->lock);
+    filled = test_bit(index, area->filled[copy]);
+    spin_unlock(&mc->lock);
+    if (!filled)
+        return true;
+
+    if (!bdev_rw_virt(mc->bdev, metadata_copy_start(area, copy) + index, buffer, SECTOR_SIZE, REQ_OP_READ))
+    {
+        spin_lock(&mc->lock);
+        memcpy(page_address(area->pages[copy][byte / PAGE_SIZE]) + byte % PAGE_SIZE, buffer, SECTOR_SIZE);
+        __clear_bit(index, area->bad[copy]);
+        __clear_bit(index, area->filled[copy]);
+        spin_unlock(&mc->lock);
+        DCORR_DEV_INFO(mc->ti, "%s metadata sector %u of region %llu reads again\n",
+                       copy == METADATA_LEAD ? "leading" : "trailing", index, (unsigned long long)area->region);
+        return true;
+    }
+
+    for (unsigned int chunk = index * DCORR_CHUNKS_PER_METADATA_SECTOR;
+         chunk < (index + 1) * DCORR_CHUNKS_PER_METADATA_SECTOR; chunk++)
+    {
+        struct metadata_entry entry;
+        sector_t sector;
+        u8 skip = chunk == skip_chunk ? skip_mask : 0;
+
+        spin_lock(&mc->lock);
+        if (test_bit(chunk, area->written))
+            skip |= area->sectors[chunk];
+        entry = *metadata_entry_at(area, other, chunk);
+        spin_unlock(&mc->lock);
+
+        if (skip == 0xff || !layout_slot_logical(layout, area->region, chunk, &sector) ||
+            !written_test(mc->written, sector))
+            continue;
+
+        if (!metadata_read_chunk(mc, sector))
+        {
+            const u8 *data = page_address(mc->chunk_page);
+            unsigned int i;
+
+            for (i = 0; i < DCORR_CHUNK_SECTORS; i++)
+            {
+                if (skip & BIT(i))
+                    continue;
+                if (cpu_to_le64(crc64_be(data_crc_seed(mc->sb->salt_crc, sector + i), data + i * SECTOR_SIZE,
+                                         SECTOR_SIZE)) != entry.crc[i])
+                    break;
+            }
+            if (i == DCORR_CHUNK_SECTORS)
+                continue;
+        }
+
+        DCORR_DEV_WARN_LIMIT(mc->ti, "%s metadata sector %u of region %llu does not read, and the chunk at sector %llu matches only it, so it is not written\n",
+                             copy == METADATA_LEAD ? "leading" : "trailing", index,
+                             (unsigned long long)area->region, (unsigned long long)sector);
+        return false;
+    }
+
+    return true;
+}
+
+/// @brief Whether the leading metadata sector of a chunk may be written from RAM by its write back
+/// @details See metadata_may_write; the sectors in mask are the ones the write back writes.
+/// @return Whether the write back may go on
+bool metadata_may_write_lead(struct metadata_cache *mc, struct metadata_area *area, sector_t sector, u8 mask)
+{
+    return metadata_may_write(mc, area, METADATA_LEAD, metadata_area_sector(area, sector),
+                              metadata_area_chunk(area, sector), mask);
+}
+
+/// @brief Leaves out of a write of trailing sectors those that may not be written, and counts them
+static void metadata_check_trails(struct metadata_cache *mc, struct metadata_area *area, unsigned long *sectors,
+                                  unsigned int skip_chunk, u8 skip_mask)
+{
+    unsigned int index;
+
+    for_each_set_bit(index, sectors, DCORR_REGION_METADATA_SECTORS)
+    {
+        if (metadata_may_write(mc, area, METADATA_TRAIL, index, skip_chunk, skip_mask))
+            continue;
+        __clear_bit(index, sectors);
+        atomic64_inc(&mc->stats->trail_errors);
+        dcorr_error(mc->ti);
     }
 }
 
@@ -545,6 +673,7 @@ static void metadata_write_area_trail(struct metadata_cache *mc, struct metadata
         if (!test_bit(chunk, area->write_failed) && area->sectors[chunk])
             __set_bit(chunk / DCORR_CHUNKS_PER_METADATA_SECTOR, sectors);
     }
+    metadata_check_trails(mc, area, sectors, DCORR_REGION_CHUNKS, 0);
 
     for_each_set_bit(first, sectors, DCORR_REGION_METADATA_SECTORS)
     {
@@ -667,6 +796,13 @@ void metadata_settle(struct metadata_cache *mc, struct metadata_area *area, sect
 
     if (to_trail)
     {
+        DECLARE_BITMAP(sectors, DCORR_REGION_METADATA_SECTORS);
+
+        bitmap_zero(sectors, DCORR_REGION_METADATA_SECTORS);
+        __set_bit(index, sectors);
+        metadata_check_trails(mc, area, sectors, chunk, to_trail);
+        if (!test_bit(index, sectors))
+            return;
         metadata_lead_to_scratch(area, metadata_trail_to_scratch(mc, area, index), chunk, to_trail);
         metadata_write_trail_range(mc, area, index, index + 1, REQ_OP_WRITE | REQ_FUA);
     }
@@ -771,9 +907,11 @@ static void metadata_cache_free(struct metadata_cache *mc)
 /// @param sb     The superblock taken: the layout and where the CRC of every data sector starts, see
 ///               data_crc.h; it must outlive the cache
 /// @param stats  The counters of the device
+/// @param written The bitmap of written chunks, which must outlive the cache
 /// @return The cache, or ERR_PTR(-ENOMEM)
 struct metadata_cache *metadata_cache_create(struct dm_target *ti, struct block_device *bdev,
-                                             const struct superblock_info *sb, struct dcorr_stats *stats)
+                                             const struct superblock_info *sb, struct dcorr_stats *stats,
+                                             struct written_map *written)
 {
     struct metadata_cache *mc = kzalloc_obj(*mc, GFP_KERNEL);
 
@@ -790,6 +928,7 @@ struct metadata_cache *metadata_cache_create(struct dm_target *ti, struct block_
     mc->bdev = bdev;
     mc->sb = sb;
     mc->stats = stats;
+    mc->written = written;
 
     mc->areas = kvcalloc(METADATA_AREAS, sizeof(*mc->areas), GFP_KERNEL);
     mc->wq = alloc_workqueue("dcorr_metadata", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);

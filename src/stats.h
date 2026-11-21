@@ -30,7 +30,8 @@ struct dcorr_stats
     /// @brief Waits for a metadata area to be let go, as all were in use
     atomic64_t metadata_waits;
 
-    /// @brief Sectors of the trailing copy of the metadata that failed to write
+    /// @brief Sectors of the trailing copy of the metadata that failed to write, or were left as their copy
+    /// did not read and a chunk there matched only it, see metadata_may_write
     atomic64_t trail_errors;
 
     /// @brief Syncs the worker made by itself, as too many metadata areas were busy, see metadata_crowded
@@ -77,7 +78,8 @@ struct dcorr_stats
     /// @brief Sectors read from the lower device that matched neither CRC of their chunk
     atomic64_t crc_mismatches;
 
-    /// @brief Write backs that failed, at the leading metadata sector or at the data
+    /// @brief Write backs that failed, at the leading metadata sector or at the data, or before it, as the
+    /// leading sector could not be written from RAM, see cache_lead_writable
     atomic64_t write_errors;
 
     /// @brief Sectors of a copy of the metadata that failed to read, counted at each read of the area

@@ -45,6 +45,21 @@ static inline unsigned int layout_region_chunk(const struct dcorr_layout *layout
     return (unsigned int)(dcorr_chunk_slot(layout, sector) % DCORR_REGION_CHUNKS);
 }
 
+/// @brief The logical sector where the chunk in a slot of a region starts, if the slot holds data
+/// @details The data columns of a group take its first slots, so a slot past its capacity is of parity.
+/// @return Whether the slot holds data; sector is set then
+static inline bool layout_slot_logical(const struct dcorr_layout *layout, sector_t region, unsigned int index,
+                                       sector_t *sector)
+{
+    u64 group = region / layout->group_regions;
+    u64 slot = region % layout->group_regions * DCORR_REGION_CHUNKS + index;
+
+    if (slot >= dcorr_regions_of_group(layout, group) * DCORR_REGION_CAPACITY / DCORR_CHUNK_SECTORS)
+        return false;
+    *sector = group * layout->group_capacity + slot * DCORR_CHUNK_SECTORS;
+    return true;
+}
+
 /// @brief The physical sector that holds the data of a logical sector
 static inline sector_t layout_data_sector(const struct dcorr_layout *layout, sector_t sector)
 {

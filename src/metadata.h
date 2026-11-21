@@ -73,6 +73,7 @@ enum metadata_state
 };
 
 struct metadata_cache;
+struct written_map;
 
 /// @brief The metadata of one region, both copies, kept in RAM
 /// @details
@@ -126,6 +127,10 @@ struct metadata_area
     /// @brief Sectors of each copy that failed to read, and of the trailing copy that failed to write;
     /// reads take such a sector from the other copy
     DECLARE_BITMAP(bad[METADATA_COPIES], DCORR_REGION_METADATA_SECTORS);
+
+    /// @brief Of the bad sectors, those that failed to read and were filled from the other copy in RAM,
+    /// so that RAM may lack a CRC the lower device holds there; see metadata_may_write
+    DECLARE_BITMAP(filled[METADATA_COPIES], DCORR_REGION_METADATA_SECTORS);
 
     /// @brief Chunks with a write back since the last flush of the lower device, failed or not.
     /// Their data may not be durable, so they are not written back again before a flush.
@@ -201,12 +206,16 @@ struct metadata_cache
 
     /// @brief The counters of the device, owned by the context of the target
     struct dcorr_stats *stats;
+
+    /// @brief The bitmap of written chunks, owned by the context of the target, see metadata_may_write
+    struct written_map *written;
 };
 
 struct dm_target;
 
 struct metadata_cache *metadata_cache_create(struct dm_target *ti, struct block_device *bdev,
-                                             const struct superblock_info *sb, struct dcorr_stats *stats);
+                                             const struct superblock_info *sb, struct dcorr_stats *stats,
+                                             struct written_map *written);
 void metadata_cache_destroy(struct metadata_cache *mc);
 struct metadata_area *metadata_get(struct metadata_cache *mc, sector_t sector);
 void metadata_put(struct metadata_cache *mc, struct metadata_area *area);
@@ -216,6 +225,7 @@ void metadata_written(struct metadata_cache *mc, struct metadata_area *area, sec
                       u8 mask, bool ok);
 bool metadata_written_since_flush(struct metadata_cache *mc, struct metadata_area *area, sector_t sector);
 void metadata_settle(struct metadata_cache *mc, struct metadata_area *area, sector_t sector, u8 mask);
+bool metadata_may_write_lead(struct metadata_cache *mc, struct metadata_area *area, sector_t sector, u8 mask);
 bool metadata_crowded(struct metadata_cache *mc);
 void metadata_write_trails(struct metadata_cache *mc);
 void metadata_unpin_all(struct metadata_cache *mc);
@@ -263,14 +273,27 @@ static inline struct page *metadata_sector_page(const struct metadata_area *area
     return area->pages[copy][byte / PAGE_SIZE];
 }
 
-/// @brief The entry of the chunk of a logical sector in a copy of the area of its region
+/// @brief The entry of a chunk of an area, by its index in the region, in a copy of the area
 /// @details The pages of an area come from the direct map, so the address stays valid.
+static inline struct metadata_entry *metadata_entry_at(const struct metadata_area *area, enum metadata_copy copy,
+                                                       unsigned int chunk)
+{
+    unsigned int byte = chunk * DCORR_METADATA_ENTRY_BYTES;
+
+    return page_address(area->pages[copy][byte / PAGE_SIZE]) + byte % PAGE_SIZE;
+}
+
+/// @brief The entry of the chunk of a logical sector in a copy of the area of its region
 static inline struct metadata_entry *metadata_area_entry(const struct metadata_area *area, enum metadata_copy copy,
                                                          sector_t sector)
 {
-    unsigned int byte = metadata_area_chunk(area, sector) * DCORR_METADATA_ENTRY_BYTES;
+    return metadata_entry_at(area, copy, metadata_area_chunk(area, sector));
+}
 
-    return page_address(area->pages[copy][byte / PAGE_SIZE]) + byte % PAGE_SIZE;
+/// @brief Whether the metadata sector of the chunk of a logical sector was filled in RAM from the other copy
+static inline bool metadata_sector_filled(const struct metadata_area *area, enum metadata_copy copy, sector_t sector)
+{
+    return test_bit(metadata_area_sector(area, sector), area->filled[copy]);
 }
 
 #endif

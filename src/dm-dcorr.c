@@ -247,7 +247,7 @@ static int dcorr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         goto err_put_device;
     }
 
-    dc->metadata = metadata_cache_create(ti, dc->lower->bdev, &dc->sb, &dc->stats);
+    dc->metadata = metadata_cache_create(ti, dc->lower->bdev, &dc->sb, &dc->stats, dc->written);
     if (IS_ERR(dc->metadata))
     {
         ti->error = "metadata cache alloc failed";

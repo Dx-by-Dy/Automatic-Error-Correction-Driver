@@ -59,15 +59,6 @@ in a run, **From reading** means it was only found in the code.
 - **A crash together with a lost sector of the other copy fails the chunks that were in flight.** By
   decision: between the write back of a chunk and the flush after it, only the trailing copy has the CRC of the
   old data and only the leading one that of the new. Fix, if the threat model asks for it: a third copy, or ECC.
-- **A metadata sector rebuilt from one copy can fail its neighbours for good.** Confirmed at `8a153d4` by
-  `test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`: a copy of a metadata sector that fails to
-  read is filled from the other in RAM, and the next write back of any of its 8 chunks writes the whole sector
-  from RAM. After a crash in a write back the copies of a chunk differ and its data matches only one of them; when
-  that copy fails to read, the chunk fails, as the item above says, but once a neighbour is written the CRC that
-  matched is overwritten on the device as well, and the chunk fails for good, though the sector reads again.
-  Fix, to be designed: read the failed copy again before the sector is written; while it still fails, read the
-  chunks of the sector, and if the data of one of them does not match the copy that reads, leave the failed copy
-  as it is and fail the write back, as for a sector failed in both copies.
 - **A lost write passes as the old contents until the flush after its write back.** Confirmed by
   `test_lost_writes.py`, by decision of the threat model: until then the trailing copy holds the old CRC, and the
   read accepts it; a write lost together with both copies of its metadata passes for ever, which a test pins.
@@ -85,8 +76,9 @@ in a run, **From reading** means it was only found in the code.
   which need the other entries. Fix: ECC, or a third copy if the threat model asks for it.
 - **A failed copy of a metadata sector is put right only by the next write of that sector.** By decision, for
   simplicity: until a chunk of the sector is written back, it stays with one copy, and a warning is logged at
-  every access, rate-limited. A trailing sector that failed to write is counted, not retried. Fix: rewrite the
-  failed copy from the other once it is found, in the worker.
+  every access, rate-limited. That write reads the failed copy again first, and while it fails writes the
+  sector only if the chunks there match the copy that reads. A trailing sector that failed to write is counted,
+  not retried. Fix: rewrite the failed copy from the other once it is found, in the worker.
 
 ## Device Mapper integration
 

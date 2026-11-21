@@ -266,9 +266,9 @@ stateDiagram-v2
     note right of datanew: new data matches the leading copy, reads new
 ```
 
-A crash in any state leaves each sector readable, as old or new. Not covered: a crash in the middle states
-together with a lost sector of the copy that matches, which a later write of a neighbour makes permanent, see [A
-metadata sector rebuilt from one copy](#a-metadata-sector-rebuilt-from-one-copy). A crash after the flush from
+A crash in any state leaves each sector readable, as old or new. A crash in the middle states together with a
+lost sector of the copy that matches fails the chunk while the sector does not read, by decision, and a write of a
+neighbour does not make it permanent: [A metadata sector rebuilt from one copy](#a-metadata-sector-rebuilt-from-one-copy). A crash after the flush from
 above and before the trailing copy leaves the state with the new data; the first read of it, which matches only
 the leading copy, hands the chunk to the worker to settle, see [The read path](#the-read-path).
 
@@ -387,7 +387,7 @@ Covered by [`test_discard.py`](../../tests/test_discard.py): `test_the_device_of
 flowchart LR
     subgraph reads["A read fails"]
         rd["data sector"] --> rdo["only the bios over it fail"]
-        rm1["metadata sector, one copy"] --> rm1o["taken from the other copy, warned"]
+        rm1["metadata sector, one copy"] --> rm1o["taken from the other copy, warned; checked before it is written over"]
         rm2["metadata sector, both copies"] --> rm2o["its 8 chunks fail, reads and writes"]
     end
     subgraph writes["A write fails"]
@@ -403,6 +403,29 @@ Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py) (all);
 `test_a_second_copy_that_fails_to_write_is_counted`. A metadata sector failed in one copy after a crash: [A
 metadata sector rebuilt from one copy](#a-metadata-sector-rebuilt-from-one-copy); a failed flush: [A failed
 flush of the lower device](#a-failed-flush-of-the-lower-device).
+
+## A metadata sector rebuilt from one copy
+
+```mermaid
+flowchart TD
+    load["A copy of a metadata sector fails to read: filled in RAM from the other, marked filled"] --> due["A write of the sector from RAM is due: leading by a write back, trailing by a sync or a settle"]
+    due --> again{"The failed copy reads again?"}
+    again -- yes --> take["Taken into RAM, the sector written as usual"]
+    again -- no --> check["Each chunk of the sector read and compared with the copy that reads"]
+    check --> match{"All match? Left out: what the write covers, chunks written since the flush, never written, parity"}
+    match -- yes --> wr["The sector written from RAM"]
+    match -- no --> which{"Which copy?"}
+    which -- leading --> fail["The write back fails, its entry kept; the neighbours wait until the sector reads or the chunk is rewritten whole"]
+    which -- trailing --> skip["The trailing sector left, counted in trail_errors"]
+```
+
+After a crash in a write back the copies of a chunk differ and its data matches only one of them; if that copy
+fails to read, writing the sector from RAM would put the other CRC on the device and fail the chunk for good.
+Covered by [`test_lower_errors.py`](../../tests/test_lower_errors.py):
+`test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`, with the leading copy failed after a crash
+after the data, the write back of a neighbour failing until the sector heals; with the trailing copy failed after
+a crash before the data, the neighbour written and the trailing sector left; with the copies equal, and with the
+failed copy reading again, the neighbour written.
 
 ## Every error is a signal
 
@@ -464,24 +487,6 @@ flowchart TD
 ```
 
 Pinned by `test_a_zeroed_chunk_in_a_read_only_block_never_reads_its_old_data`, for discard and write zeroes.
-
-### A metadata sector rebuilt from one copy
-
-```mermaid
-flowchart TD
-    crash["After a crash in a write back: chunk Y has data NEW, leading NEW, trailing OLD"] --> fail["The leading sector of Y fails to read"]
-    fail --> fill["Loaded: the leading copy in RAM filled from the trailing one, Y has OLD in both"]
-    fill --> eio1["Y fails: a crash with a lost sector of the copy that matches, by decision"]
-    fill --> neigh["Chunk X of the same metadata sector written back"]
-    neigh --> wr["The whole leading sector written from RAM: Y gets OLD on the device too"]
-    wr --> heal["The sector reads again"]
-    heal --> eio2["Y still fails, for good: data NEW, both copies OLD"]
-```
-
-The mirror case: a crash before the data leaves data OLD, leading NEW, trailing OLD; the trailing sector fails, is
-filled with NEW, and the next sync writes NEW over it. Pinned by
-`test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`, both cases strict `xfail`; with the copies
-equal, the positive control, Y reads.
 
 ### The probe takes a copy stored as data
 

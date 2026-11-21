@@ -939,6 +939,32 @@ static void cache_abandon_entry(struct cache *cache, struct cache_entry *entry)
     dcorr_events_wake(&cache->events);
 }
 
+/// @brief Whether the leading metadata sector of an entry may be written from RAM, see metadata_may_write_lead
+/// @details
+/// Only a sector that failed to read in the leading copy and was filled from
+/// the trailing one is checked. The jobs in flight on the sector, of the
+/// neighbouring chunks, are waited for first, as the check may read the
+/// leading copy again into the memory they write from.
+static bool cache_lead_writable(struct cache *cache, struct cache_entry *entry)
+{
+    struct metadata_cache *metadata = cache->dc->metadata;
+    sector_t sector = entry->chunk * DCORR_CHUNK_SECTORS;
+    struct metadata_area *area = metadata_get(metadata, sector);
+    bool writable = true;
+
+    if (metadata_sector_filled(area, METADATA_LEAD, sector))
+    {
+        spin_lock(&cache->lock);
+        while (cache_find_sector(cache, entry->chunk / DCORR_CHUNKS_PER_METADATA_SECTOR))
+            cache_wait(cache);
+        spin_unlock(&cache->lock);
+        writable = metadata_may_write_lead(metadata, area, sector, entry->mask);
+    }
+    metadata_put(metadata, area);
+
+    return writable;
+}
+
 /// @brief Writes back an entry in CACHE_WRITING, one job per run of its sectors
 /// @details
 /// Writes to the entry wait until it leaves CACHE_WRITING, so its mask and its
@@ -952,6 +978,10 @@ static void cache_abandon_entry(struct cache *cache, struct cache_entry *entry)
 /// clear, writes it whole, the sectors not written from above as zeros: once
 /// the bit is set they are read from the lower device, where they hold
 /// whatever was there before the format.
+///
+/// A write back whose leading metadata sector may not be written from RAM, see
+/// cache_lead_writable, fails as one whose sector failed in both copies would,
+/// with the entry kept; the worker goes on with the others.
 /// @return 0, or the error of the sync of a barrier, when the write back is given up
 static int cache_write_back_entry(struct cache *cache, struct cache_entry *entry)
 {
@@ -998,6 +1028,14 @@ static int cache_write_back_entry(struct cache *cache, struct cache_entry *entry
     {
         cache_abandon_entry(cache, entry);
         return r;
+    }
+
+    if (!cache_lead_writable(cache, entry))
+    {
+        atomic64_inc(&cache->stats->write_errors);
+        dcorr_error(cache->dc->ti);
+        cache_abandon_entry(cache, entry);
+        return 0;
     }
 
     for (first = 0; first < DCORR_CHUNK_SECTORS; first += run)
