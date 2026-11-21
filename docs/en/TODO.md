@@ -39,13 +39,6 @@ in a run, **From reading** means it was only found in the code.
   By decision, as for the trailing metadata: until then the block has one copy, and the next change writes the
   failed copy first. Counted. A block found with one copy when the device is created is repaired by the next
   flush, unless the table is read only.
-- **An older copy of a block of the bitmap stays on the device.** Confirmed at `8a153d4` by
-  `test_an_older_copy_is_rewritten_before_the_newer_is_lost`: when both copies of a block are valid but of
-  different generations, after a crash between the writes of the two copies or a second copy that failed to
-  write, the newer is taken and the older is left until the block changes. If the newer copy is lost later, the
-  older one is taken alone, and the chunks first written between the two generations read as zeros, with no
-  error; the repair of a block with one valid copy then writes those old bits into both. Fix: mark such a block
-  dirty when the device is created, as one with a single valid copy, so that the next flush writes both.
 - **A reload after a failed write of the bitmap loses its new bits.** The new table reads the bitmap on its
   first resume, after the old one has written its bitmap on suspend; when that write fails, the new table reads
   the chunks first written since the last good flush as zeros, though their data is on the device. Fix: hand

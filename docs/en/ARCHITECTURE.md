@@ -217,8 +217,9 @@ for each size of a group.
 
 On the first resume of the table the header of every group is read, one request each: the superblocks of groups 2
 and on are checked against the one taken, and a copy that is not valid or differs is counted and named in the log,
-not refused. Each block of the bitmap is taken from its valid copy with the larger generation. A block valid in one
-copy is repaired by the next flush, unless the table is read only; a block invalid in both makes its range read
+not refused. Each block of the bitmap is taken from its valid copy with the larger generation; if the other copy is valid
+but older, after a crash between the two writes, the next flush writes both, and the log says how many blocks
+had one. A block valid in one copy is repaired by the next flush, unless the table is read only; a block invalid in both makes its range read
 only. The bitmap is read on the first resume, not in the constructor: on a reload the old table has written its
 bitmap by then.
 

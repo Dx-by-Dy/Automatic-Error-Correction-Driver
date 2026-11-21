@@ -311,7 +311,7 @@ flowchart TD
     start(["First resume: both copies of a block read"]) --> lv{"Leading copy valid? CRC from the salt, group, index, role"}
     lv -- yes --> both{"Trailing copy valid too?"}
     lv -- no --> tv{"Trailing copy valid?"}
-    both -- yes --> newer["Take the one with the larger generation; the older stays on the device"]
+    both -- yes --> newer["Take the one with the larger generation; an older one is rewritten with the next flush"]
     both -- no --> single["Take the leading one, repair the other with the next flush"]
     tv -- yes --> single2["Take the trailing one, repair the other with the next flush"]
     tv -- no --> ro["Read only range: chunks read as written, CRC decides, writes and discards fail"]
@@ -321,9 +321,9 @@ Covered by [`test_bitmap.py`](../../tests/test_bitmap.py): `test_one_damaged_cop
 `test_the_copy_with_the_larger_generation_is_taken`, `test_a_block_of_another_place_or_device_is_not_taken`,
 `test_a_block_invalid_in_both_copies_makes_its_range_read_only`, `test_a_discard_touching_a_read_only_block_fails_whole`,
 `test_a_reload_keeps_the_bits_the_old_table_sets`; [`test_lost_writes.py`](../../tests/test_lost_writes.py):
-`test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other`. What the older copy costs later: [An older
-copy of a block of the bitmap](#an-older-copy-of-a-block-of-the-bitmap); what a read only range gives for a chunk
-zeroed before: [A zeroed chunk in a read only range](#a-zeroed-chunk-in-a-read-only-range).
+`test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other`, and for the older copy rewritten
+`test_an_older_copy_is_rewritten_before_the_newer_is_lost`. What a read only range gives for a chunk zeroed
+before: [A zeroed chunk in a read only range](#a-zeroed-chunk-in-a-read-only-range).
 
 ## Discard and its trap
 
@@ -447,27 +447,6 @@ restart](#the-trailing-copy-after-a-restart).
 
 Found by the review of `src/` on 2026-11-17, each pinned by a strict `xfail` with its item in [TODO.md](TODO.md);
 the diagram shows the path to the wrong result. A positive control of each test passes.
-
-### An older copy of a block of the bitmap
-
-```mermaid
-sequenceDiagram
-    participant Drv as Driver
-    participant L as Leading copy
-    participant T as Trailing copy
-    Note over L,T: generation 2 in both, with the bit of chunk A
-    Drv->>L: first write of chunk B, flush: generation 3 with A and B
-    Note over Drv,T: a crash before the second copy, or its write fails
-    Drv->>Drv: created again: both valid, the newer taken
-    Note over T: generation 2 without B, not marked to repair, so it stays
-    Note over L: later the leading copy is lost
-    Drv->>T: created again: only the trailing copy is valid
-    Drv->>Drv: chunk B reads as zeros, with no error
-    Drv->>L: the repair of the next flush writes generation 2 into both
-```
-
-Pinned by `test_an_older_copy_is_rewritten_before_the_newer_is_lost`: with a flush alone between, strict
-`xfail`; with a first write to another chunk of the block between, which rewrites both copies, it passes.
 
 ### A zeroed chunk in a read only range
 

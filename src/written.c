@@ -139,11 +139,16 @@ static void written_take(struct written_map *map, u64 idx, struct page *page)
 /// @details
 /// The leading copy is in RAM already, valid or not, as lead_ok says; the
 /// trailing one is in trail, valid or not, as trail_read says it read. Of two
-/// valid copies the one with the larger generation is taken. A block with one
-/// valid copy is marked dirty, the other copy to be written first, so that the
-/// next sync repairs it; a block with none is read only, with every bit set.
+/// valid copies the one with the larger generation is taken; if the other is
+/// older, after a crash between the writes of the two copies or a second copy
+/// that failed to write, the block is marked dirty, the older copy to be
+/// written first, so that the next sync writes both: otherwise the older copy
+/// would stay, and be taken alone once the newer is lost. That is no error,
+/// and is only counted for the log, in older. A block with one valid copy is
+/// marked dirty the same way, so that the next sync repairs it; a block with
+/// none is read only, with every bit set.
 static void written_choose(struct written_map *map, u64 group, const unsigned long *lead_ok,
-                           struct page **trail, const unsigned long *trail_read)
+                           struct page **trail, const unsigned long *trail_read, u64 *older)
 {
     u64 blocks = map->sb->layout.bitmap_blocks;
 
@@ -157,11 +162,21 @@ static void written_choose(struct written_map *map, u64 group, const unsigned lo
 
         if (lv && tv)
         {
-            if (le64_to_cpu(other->generation) > le64_to_cpu(lead->generation))
+            u64 lead_generation = le64_to_cpu(lead->generation);
+            u64 trail_generation = le64_to_cpu(other->generation);
+
+            if (trail_generation > lead_generation)
                 written_take(map, idx, trail[i]);
-            else if (other->generation == lead->generation && memcmp(other->bits, lead->bits, sizeof(lead->bits)))
+            else if (trail_generation == lead_generation && memcmp(other->bits, lead->bits, sizeof(lead->bits)))
                 DCORR_DEV_WARN(map->ti, "block %u of the bitmap of group %llu: copies of one generation differ, taking the leading\n",
                                i, (unsigned long long)group);
+            if (trail_generation != lead_generation && map->writable)
+            {
+                if (trail_generation < lead_generation)
+                    set_bit(idx, map->trail_first);
+                set_bit(idx, map->dirty);
+                (*older)++;
+            }
             continue;
         }
 
@@ -256,6 +271,7 @@ static int written_load(struct written_map *map)
     unsigned long *lead_ok = bitmap_zalloc(map->nr_blocks, GFP_KERNEL);
     struct page *sb_page = alloc_page(GFP_KERNEL);
     ktime_t begin = ktime_get();
+    u64 older = 0;
     int r = -ENOMEM;
 
     if (!trail || !bvecs || !read || !first_read || !trail_read || !lead_ok || !sb_page)
@@ -299,13 +315,16 @@ static int written_load(struct written_map *map)
         }
 
         if (group)
-            written_choose(map, group - 1, lead_ok, trail, trail_read);
+            written_choose(map, group - 1, lead_ok, trail, trail_read, &older);
     }
-    written_choose(map, layout->groups - 1, lead_ok, first_trail, first_read);
+    written_choose(map, layout->groups - 1, lead_ok, first_trail, first_read, &older);
 
     DCORR_DEV_INFO(map->ti, "bitmap of %llu groups read in %lld ms\n",
                    (unsigned long long)layout->groups,
                    ktime_ms_delta(ktime_get(), begin));
+    if (older)
+        DCORR_DEV_INFO(map->ti, "%llu blocks of the bitmap have an older copy, the next sync writes both\n",
+                       (unsigned long long)older);
     r = 0;
 
 out:

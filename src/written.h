@@ -69,7 +69,7 @@ struct written_map
     /// @brief Blocks whose first copy was written in this sync, so the other one is to follow
     unsigned long *pending;
 
-    /// @brief Blocks whose trailing copy is not known to be valid on the device, so it is written first
+    /// @brief Blocks whose trailing copy is not known to be valid on the device, or is older, so it is written first
     unsigned long *trail_first;
 
     /// @brief Blocks invalid in both copies: their chunks read as written, writes there fail

@@ -280,16 +280,7 @@ def test_the_copy_with_the_larger_generation_is_taken(device, older):
 
 
 @pytest.mark.parametrize("older", ROLES)
-@pytest.mark.parametrize(
-    "then",
-    [
-        "a new bit",
-        pytest.param(
-            "a flush alone",
-            marks=pytest.mark.xfail(strict=True, reason="An older copy of a block of the bitmap stays on the device"),
-        ),
-    ],
-)
+@pytest.mark.parametrize("then", ["a new bit", "a flush alone"])
 def test_an_older_copy_is_rewritten_before_the_newer_is_lost(device, older, then):
     """Of two valid copies the newer is taken, but the older stays on the device until the block changes:
     once the newer copy is lost, the older one alone reads the chunks written in between as zeros, with no
