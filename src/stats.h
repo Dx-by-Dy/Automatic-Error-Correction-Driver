@@ -40,7 +40,8 @@ struct dcorr_stats
     /// bit is clear while a clear is not yet synced, see cache_prepare_metadata
     atomic64_t barriers;
 
-    /// @brief Chunks read before a write back, as their two copies of the metadata differed
+    /// @brief Chunks read to settle them, before a write back or after a read, as their two copies of the
+    /// metadata differed
     atomic64_t settle_reads;
 
     /// @brief Sectors so read that matched neither copy, or did not read

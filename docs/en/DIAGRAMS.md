@@ -139,7 +139,10 @@ flowchart TD
     lower --> error{"Lower error?"}
     error -- yes --> eio["BLK_STS_IOERR for this bio only"]
     error -- no --> crc{"Each sector matches the leading or the trailing CRC?"}
-    crc -- yes --> ok(["Complete"])
+    crc -- yes --> only{"A sector matched only the leading copy, the chunk not written back since the flush?"}
+    only -- yes --> settle["Hand the chunk to the worker to settle"]
+    only -- no --> ok(["Complete"])
+    settle --> ok
     crc -- no --> eio
     copy --> ok
     zeros --> ok
@@ -151,7 +154,9 @@ Covered by [`test_cache.py`](../../tests/test_cache.py): `test_a_read_of_a_partl
 [`test_corruption.py`](../../tests/test_corruption.py): `test_data_corruption_fails_only_that_sector`,
 `test_crc_corruption_in_one_copy_is_covered_by_the_other`;
 [`test_metadata.py`](../../tests/test_metadata.py): `test_a_read_takes_one_lower_read_when_the_metadata_is_in_ram`;
-[`test_lower_errors.py`](../../tests/test_lower_errors.py): `test_failed_data_sector_fails_only_its_reads`.
+[`test_lower_errors.py`](../../tests/test_lower_errors.py): `test_failed_data_sector_fails_only_its_reads`;
+[`test_lost_writes.py`](../../tests/test_lost_writes.py): `test_old_data_put_back_fails_once_the_new_was_read`;
+[`test_crash.py`](../../tests/test_crash.py): `test_a_second_crash_after_one_between_the_copies`.
 
 ## An entry of the cache
 
@@ -264,8 +269,8 @@ stateDiagram-v2
 A crash in any state leaves each sector readable, as old or new. Not covered: a crash in the middle states
 together with a lost sector of the copy that matches, which a later write of a neighbour makes permanent, see [A
 metadata sector rebuilt from one copy](#a-metadata-sector-rebuilt-from-one-copy). A crash after the flush from
-above and before the trailing copy leaves the state with the new data, and nothing moves it on before the next
-write back: [The trailing copy after a restart](#the-trailing-copy-after-a-restart).
+above and before the trailing copy leaves the state with the new data; the first read of it, which matches only
+the leading copy, hands the chunk to the worker to settle, see [The read path](#the-read-path).
 
 Covered by [`test_crash.py`](../../tests/test_crash.py): `test_a_write_cut_between_data_and_metadata_reads_old_or_new`,
 `test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each`, `test_ext4_survives_a_crash_after_each_fsync`,
@@ -431,7 +436,7 @@ flowchart TD
     a1 --> a2["After the flush: both copies hold the new CRC, the chunk fails"]
     what -- "data of a first write" --> b1["Fails at once: zeros below match neither copy, through the seed"]
     what -- "the leading metadata sector" --> c1["The trailing copy covers it, the next write back settles it"]
-    what -- "the trailing metadata sector, or a crash before it" --> t1["The old CRC stays until the next write back: the old data put back passes, for ever"]
+    what -- "the trailing metadata sector, or a crash before it" --> t1["The old CRC stays until the chunk is read or written back; a read of the new data settles it, and the old data put back fails"]
     what -- "one copy of a bitmap block" --> d1["The other copy, of the newer generation, is taken"]
     what -- "data and both metadata copies" --> e1["The old data passes, for ever: the blind spot, for the parity of the correction stage"]
 ```
@@ -440,8 +445,7 @@ Covered by [`test_lost_writes.py`](../../tests/test_lost_writes.py) (all); the s
 [`test_corruption.py`](../../tests/test_corruption.py): `test_zeroed_chunk_is_detected`,
 `test_chunk_copied_elsewhere_is_detected`, `test_sectors_swapped_inside_a_chunk_with_their_crcs_are_detected`,
 `test_a_zeroed_region_with_its_chunks_written_is_detected`, `test_a_region_shifted_whole_with_its_metadata_is_detected`,
-`test_a_chunk_from_another_device_is_detected`. The trailing sector lost is drawn in [The trailing copy after a
-restart](#the-trailing-copy-after-a-restart).
+`test_a_chunk_from_another_device_is_detected`.
 
 ## Cases that fail today
 
@@ -478,25 +482,6 @@ The mirror case: a crash before the data leaves data OLD, leading NEW, trailing 
 filled with NEW, and the next sync writes NEW over it. Pinned by
 `test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`, both cases strict `xfail`; with the copies
 equal, the positive control, Y reads.
-
-### The trailing copy after a restart
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    apart: data NEW, leading NEW, trailing OLD
-    read: created again, NEW reads, flushes change nothing
-    back: the drive gives OLD back
-    passes: OLD matches the trailing copy, read with no error
-    [*] --> apart: crash after the flush from above, before the trailing copy, or the trailing write lost
-    apart --> read
-    read --> back: a write lost from the cache of the drive
-    back --> passes
-    note right of read: nothing settles a chunk before its next write back
-```
-
-Pinned by `test_old_data_put_back_fails_once_the_new_was_read`: with the trailing copy lost, strict `xfail`; with
-both copies written, the old data put back fails its CRC.
 
 ### The probe takes a copy stored as data
 

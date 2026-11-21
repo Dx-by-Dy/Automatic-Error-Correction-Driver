@@ -28,7 +28,7 @@ blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
     DCORR_DEBUG("meta=%p first_sector=%u nr_sectors=%u\n",
                 meta, meta->first_sector, meta->nr_sectors);
 
-    return metadata_copy_entries(dc->metadata, part->sector, meta->md);
+    return metadata_copy_entries(dc->metadata, part->sector, meta->md, &meta->written);
 }
 
 /// @brief Verifies CRC of read data against chunk metadata
@@ -41,7 +41,10 @@ blk_status_t trn_mr_rq_init(struct trn_mr_rq *meta,
 /// of the chunk: a sector passes if it matches either. Every sector of the bio
 /// is checked, so that crc_mismatches counts the damaged sectors, not the
 /// reads. On a mismatch, sets the status of the part and logs the first
-/// damaged sector and how many there are.
+/// damaged sector and how many there are. A sector that matched only the
+/// leading copy hands the chunk to the worker to settle, see cache_queue_settle,
+/// unless the chunk was written back since the last flush: the next sync
+/// writes its trailing copy.
 ///
 /// Expected execution context - process.
 /// @param meta Metadata transformation structure
@@ -61,6 +64,7 @@ void check_crc(struct trn_mr_rq *meta)
     unsigned int in_sector_pos = 0;
     unsigned int mismatches = 0;
     sector_t first_mismatch = 0;
+    bool lead_only = false;
     struct bvec_iter iter = meta->saved_iter;
 
     while (iter.bi_size)
@@ -80,6 +84,9 @@ void check_crc(struct trn_mr_rq *meta)
 
             if (in_sector_pos == SECTOR_SIZE)
             {
+                bool lead_ok = lead->crc[sector_idx] == cpu_to_le64(current_crc);
+                bool trail_ok = trail->crc[sector_idx] == cpu_to_le64(current_crc);
+
                 DCORR_DEBUG("sector=%llu, sector_idx=%u, lead_crc=%llu, trail_crc=%llu, computed_crc=%llu\n",
                             (unsigned long long)sector,
                             sector_idx,
@@ -87,13 +94,14 @@ void check_crc(struct trn_mr_rq *meta)
                             (unsigned long long)le64_to_cpu(trail->crc[sector_idx]),
                             (unsigned long long)current_crc);
 
-                if (lead->crc[sector_idx] != cpu_to_le64(current_crc) &&
-                    trail->crc[sector_idx] != cpu_to_le64(current_crc))
+                if (!lead_ok && !trail_ok)
                 {
                     if (!mismatches)
                         first_mismatch = sector;
                     mismatches++;
                 }
+                if (lead_ok && !trail_ok)
+                    lead_only = true;
                 sector_idx++;
                 current_crc = data_crc_seed(salt_crc, ++sector);
                 in_sector_pos = 0;
@@ -103,6 +111,9 @@ void check_crc(struct trn_mr_rq *meta)
         kunmap_local(addr);
         bio_advance_iter_single(part->bio, &iter, bvec.bv_len);
     }
+
+    if (lead_only && !meta->written)
+        cache_queue_settle(part->dc->cache, part->sector / DCORR_CHUNK_SECTORS);
 
     if (mismatches)
     {

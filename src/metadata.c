@@ -323,9 +323,11 @@ void metadata_put(struct metadata_cache *mc, struct metadata_area *area)
 /// @param mc     The metadata cache of the device
 /// @param sector Logical sector
 /// @param md     Where to copy the entries, by enum metadata_copy
+/// @param written Set to whether the chunk was written back since the last flush of the lower device, so
+///               that its copies differ until the next sync
 /// @return BLK_STS_OK, or BLK_STS_IOERR if the metadata sector of the chunk failed to read in both copies
 blk_status_t metadata_copy_entries(struct metadata_cache *mc, sector_t sector,
-                                   struct metadata_entry md[METADATA_COPIES])
+                                   struct metadata_entry md[METADATA_COPIES], bool *written)
 {
     struct metadata_area *area = metadata_get(mc, sector);
     unsigned int index = metadata_area_sector(area, sector);
@@ -334,6 +336,7 @@ blk_status_t metadata_copy_entries(struct metadata_cache *mc, sector_t sector,
 
     spin_lock(&mc->lock);
     single = metadata_sector_single(area, sector);
+    *written = test_bit(metadata_area_chunk(area, sector), area->written);
     if (metadata_sector_bad(area, sector))
         status = BLK_STS_IOERR;
     for (unsigned int copy = 0; copy < METADATA_COPIES && !status; copy++)
@@ -575,10 +578,13 @@ static int metadata_read_chunk(struct metadata_cache *mc, sector_t sector)
     return r;
 }
 
-/// @brief Makes the trailing copy hold the CRC of what the device holds, before a write back of a chunk
+/// @brief Makes the trailing copy hold the CRC of what the device holds
 /// @details
-/// A write back writes the leading copy first, so the trailing copy has to
-/// hold the CRC of the data on the device for every sector it writes. That
+/// Before a write back of a chunk, and after a read that matched only the
+/// leading copy, see cache_queue_settle. A write back writes the leading copy
+/// first, so the trailing copy has to hold the CRC of the data on the device
+/// for every sector it writes; a chunk read after a restart may be left with
+/// an older trailing copy that a write lost later would match. That
 /// holds wherever the two copies are equal. Where they differ, after a crash
 /// or a failed write back, the chunk is read and each such sector compared:
 /// if it matches the leading copy, that CRC is written into the trailing copy
@@ -587,14 +593,17 @@ static int metadata_read_chunk(struct metadata_cache *mc, sector_t sector)
 /// sector failed in one copy counts as equal to the other.
 ///
 /// The chunk must not have been written back since the last flush of the
-/// lower device, see metadata_written_since_flush, so that what the read
-/// returns is durable. No read of it may be in flight, and none may start.
+/// lower device, see metadata_written_since_flush, and the lower device must
+/// have flushed since the table was created, so that what the read returns is
+/// durable. Before a write back, no read of the chunk may be in flight, and
+/// none may start; reads alone may go on, as only the trailing copy changes, to
+/// what the leading one holds.
 ///
 /// Expected execution context - the worker of the data cache, which holds the area; may sleep.
 /// @param mc     The metadata cache of the device
 /// @param area   The area of the region of the chunk
 /// @param sector Logical sector of the chunk
-/// @param mask   Sectors of the chunk the write back will write
+/// @param mask   Sectors of the chunk the write back will write, or all of them after a read
 void metadata_settle(struct metadata_cache *mc, struct metadata_area *area, sector_t sector, u8 mask)
 {
     unsigned int index = metadata_area_sector(area, sector);

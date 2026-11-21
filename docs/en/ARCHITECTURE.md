@@ -64,7 +64,7 @@ The terms of the project, in the order they build on each other. The source file
 | Part | `struct trn_p_rq`: a read of the lower device, or the lower write of a job, with its CRC work | Lives in per-bio data or in a job, so nothing on the I/O path allocates |
 | Parts in flight | At most 4096 parts per device | Bounds the load, as a bio-based device has no request queue |
 | First write back | The write back of a chunk whose bit is clear | Writes the whole chunk, zeros around what was written, and does not settle |
-| Settle | A read of a chunk before its write back when its two copies differ in the sectors to be written | Puts the CRC that matches the data into the trailing copy, so that a second crash leaves a readable chunk |
+| Settle | A read of a chunk whose two copies differ: before its write back, in the sectors to be written, or after a read that matched only the leading copy | Puts the CRC that matches the data into the trailing copy, so that a second crash leaves a readable chunk |
 | Barrier | A sync before the write back of a chunk written back since the last flush, or of a chunk whose bit is clear while a clear of a discard is not yet synced | A completed write is not durable: two write backs between flushes would leave three versions for two copies |
 | Sync | `cache_sync`: flush, the first copy of the changed blocks of the bitmap, flush, the flushes from above completed, the trailing metadata and the other copy of the blocks, flush | Makes data durable, then its bits, then its trailing copy |
 | Generation of clears | A counter of the discards that cleared a bit, and the value the last sync made durable | A first write back after a discard not yet synced syncs first |
@@ -262,6 +262,10 @@ one chunk. A discard is not split at chunks, only by the limits of the queue.
 3. For the others: the read is registered in the tree of reads of the cache, both entries of the chunk are copied
    from the metadata area of its region in RAM, the data is read, and in a worker each sector is checked: it
    passes if it matches either copy. A mismatch fails the bio with `BLK_STS_IOERR`.
+4. A sector that matched only the leading copy, of a chunk not written back since the last flush, hands the chunk
+   to the worker, which settles it: after a crash between a flush and the trailing copy, or with the trailing write
+   lost, the trailing copy holds the CRC of an older version, which the drive could give back later. The worker
+   takes up to 64 such chunks at a time; a read finds the others again.
 
 ### Cache
 
@@ -312,6 +316,11 @@ and their chunks count as written since the last flush, so none of them is writt
 and that sync writes their trailing copies. When the sync of a barrier or of crowded areas fails, the worker
 stops: the entries it has not written back yet fail without I/O and keep their data, and a later pass or a flush
 tries the lower device again. A suspend whose sync fails unpins the areas anyway, as it drops the metadata in RAM.
+
+The first settle of a table, before a write back or after a read, flushes the lower device first unless a sync
+has: data written before the table was created, by an earlier table or before a crash of the host, may still be
+only in the cache of the drive, and a settle must take the CRC of durable data. If that flush fails, the write
+back is given up, as for a barrier, and the settles after reads are left.
 
 ### Discard
 
@@ -406,7 +415,7 @@ the cache; `dcorr_status` prints them:
 | 9 | `trail_errors` | Sectors of the trailing copy of the metadata that failed to write |
 | 10 | `crowded_flushes` | Syncs the worker made by itself, as too many metadata areas were busy |
 | 11 | `barriers` | Syncs before a write back of a chunk written back since the last flush, or of a chunk whose bit is clear while a clear is not yet synced |
-| 12 | `settle_reads` | Chunks read before a write back, as their two copies of the metadata differed |
+| 12 | `settle_reads` | Chunks read to settle them, before a write back or after a read, as their two copies of the metadata differed |
 | 13 | `settle_mismatches` | Sectors so read that matched neither copy, or did not read |
 | 14 | `unwritten_reads` | Chunks read as zeros without a read of the lower device, as never written |
 | 15 | `read_only_blocks` | Blocks of the bitmap invalid in both copies when the device was created |

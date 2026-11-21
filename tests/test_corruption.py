@@ -161,11 +161,13 @@ def test_a_sector_whose_copies_differ_is_read_before_it_is_written(stack, writte
     """As after a crash between the copies: the data matches one of them, and a write of it reads it first.
 
     With the other copy damaged, the data matches the trailing copy or the leading one; the read
-    finds which, and after the write and its flush both copies hold the new CRC.
+    finds which, and after the write and its flush both copies hold the new CRC. With the trailing copy
+    damaged, the data matches the leading copy only, and udev reads the chunk once the device resumes,
+    which settles it before the write: one settle either way.
     """
+    before = settle_counts(stack)
     stack.lower.flip_bit(copies(stack, FIRST)[copy], byte=metadata_offset(FIRST), bit=0)
     stack.drop_metadata()
-    before = settle_counts(stack)
     update = pattern("update", 1)
     stack.upper.write(FIRST, update)
     stack.upper.flush_settled()

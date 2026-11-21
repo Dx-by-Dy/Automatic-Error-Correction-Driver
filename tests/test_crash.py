@@ -22,6 +22,7 @@ from conftest import (
 )
 from harness import (
     DATA_SECTORS,
+    REGION_CHUNKS,
     BlockDevice,
     capacity,
     format_device,
@@ -76,10 +77,20 @@ class LoggedStack:
         self.create_upper(f"/dev/mapper/{LOG_NAME}")
 
     def log_again(self):
-        """Logs anew from the state of the last replay: its entries and the new ones replay in a row."""
+        """Logs anew from the state of the last replay, and returns that state.
+
+        The driver may have written on the replay, as a read settles a chunk whose copies differ, and those
+        writes are in no log: the new entries replay onto the state returned, see replay.
+        """
         dmsetup_remove(UPPER_NAME)
+        lower = BlockDevice(self.lower_path)
+        try:
+            base = lower.read(0, self.lower_sectors)
+        finally:
+            lower.close()
         run("dd", "if=/dev/zero", f"of={self.log_device_path}", "bs=1M", "oflag=direct", f"count={LOG_MIB}")
         self.start_log()
+        return base
 
     @property
     def sectors(self):
@@ -98,18 +109,23 @@ class LoggedStack:
         dmsetup_remove(LOG_NAME)
         return read_log(self.log_device_path)
 
-    def replay(self, entries):
-        """The device after a crash with only these entries on its disk; close it after use."""
+    def replay(self, entries, base=None, upper=True):
+        """The device after a crash with only these entries on its disk, over the state base if given, as
+        log_again returns it; close it after use. With upper false, only the lower device is written."""
         dmsetup_remove(UPPER_NAME)
-        if self.fill:
-            self.write_fill()
-        else:
+        if base is None and not self.fill:
             run("dd", "if=/dev/zero", f"of={self.lower_path}", "bs=1M", "oflag=direct", f"count={LOWER_MIB}")
         lower = BlockDevice(self.lower_path)
         try:
+            if base is not None:
+                lower.write(0, base)
+            elif self.fill:
+                lower.write(0, self.fill)
             replay(entries, lower)
         finally:
             lower.close()
+        if not upper:
+            return None
         self.create_upper(self.lower_path)
         return BlockDevice(self.upper_path)
 
@@ -198,9 +214,9 @@ def chunk_entries(entries, first, last, chunk):
     return data, metadata
 
 
-def read_after(logged, entries, start, sectors=DATA_SECTORS):
-    """What the device holds at these sectors after a crash with only these entries on its disk."""
-    device = logged.replay(entries)
+def read_after(logged, entries, start, sectors=DATA_SECTORS, base=None):
+    """What the device holds at these sectors after a crash with only these entries on its disk, over base."""
+    device = logged.replay(entries, base)
     try:
         return device.read(start, sectors)
     except OSError as error:
@@ -329,31 +345,41 @@ def test_a_chunk_written_back_twice_between_flushes_reads_one_of_its_versions(lo
         assert read_after(logged, entries[: point + 1], start) in versions, f"after a crash at entry {point}"
 
 
-@pytest.mark.parametrize("cut", ["leading copy", "data"])
+@pytest.mark.parametrize("cut", ["leading copy", "data", "data, not read"])
 def test_a_second_crash_after_one_between_the_copies(logged, cut):
     """A crash leaves the copies of a chunk different; the next write back of it reads it first.
 
     Cut after the leading copy, the old data is there and matches the trailing copy. Cut after the
     data, the new data matches the leading copy, so the driver writes its CRC into the trailing copy
     before the leading one changes again: otherwise a second crash would leave the new data with
-    neither copy matching it.
+    neither copy matching it. A read after the first crash does it already, as it matches only the
+    leading copy; with no read, in region 1, which udev does not read, the write back does it.
     """
-    chunk = 3
+    chunk = REGION_CHUNKS + 3 if cut == "data, not read" else 3
     start = chunk * DATA_SECTORS
     entries, old, new = write_old_and_new(logged, start, DATA_SECTORS)
     data, metadata = chunk_entries(entries, mark_index(entries, "old"), mark_index(entries, "new"), chunk)
     first = entries[: (metadata[0] if cut == "leading copy" else data[0]) + 1]
     survived = old if cut == "leading copy" else new
-    assert read_after(logged, first, start) == survived
+    if cut == "data, not read":
+        logged.replay(first, upper=False)
+        lower = BlockDevice(logged.lower_path)
+        try:
+            assert lower.read(physical_sector(start, logged.lower_sectors), DATA_SECTORS) == survived
+        finally:
+            lower.close()
+    else:
+        assert read_after(logged, first, start) == survived
 
-    logged.log_again()
+    base = logged.log_again()
     newer = pattern("newer", DATA_SECTORS)
     write_and_flush(logged.upper_path, [(start, newer)])
     status = device_status()
-    assert (status["settle_reads"], status["settle_mismatches"], status["barriers"]) == (1, 0, 0), status
+    settles = 0 if cut == "data" else 1
+    assert (status["settle_reads"], status["settle_mismatches"], status["barriers"]) == (settles, 0, 0), status
     second = logged.finish()
     for point in range(len(second)):
-        assert read_after(logged, first + second[: point + 1], start) in (survived, newer), (
+        assert read_after(logged, second[: point + 1], start, base=base) in (survived, newer), (
             f"after a second crash at entry {point}"
         )
 
@@ -531,21 +557,25 @@ def test_a_write_after_a_discard_cut_anywhere_reads_zeros_or_new(logged):
     A first crash between the data and the trailing copy leaves the new data, matching the leading copy
     only. Then the chunk is discarded and one sector written; a second crash at any entry leaves the data
     of the first crash, zeros, or the new sector with zeros around it.
+
+    A read of the chunk would settle it, so the state after the first crash is checked on the lower device,
+    and the chunk lies in region 1, which udev does not read when the device is created.
     """
-    chunk = 3
+    chunk = REGION_CHUNKS + 3
     start = chunk * DATA_SECTORS
     entries, old, new = write_old_and_new(logged, start, DATA_SECTORS)
     data, metadata = chunk_entries(entries, mark_index(entries, "old"), mark_index(entries, "new"), chunk)
     first = entries[: data[0] + 1]
-    assert read_after(logged, first, start) == new
+    logged.replay(first, upper=False)
     lower = BlockDevice(logged.lower_path)
     try:
+        assert lower.read(physical_sector(start, logged.lower_sectors), DATA_SECTORS) == new
         lead, trail = metadata_sectors(start, logged.lower_sectors)
         assert lower.read(lead) != lower.read(trail), "the copies of the metadata are equal after the first crash"
     finally:
         lower.close()
 
-    logged.log_again()
+    base = logged.log_again()
     discard(logged.upper_path, start, DATA_SECTORS)
     update = pattern("update", 1)
     device = BlockDevice(logged.upper_path)
@@ -564,7 +594,7 @@ def test_a_write_after_a_discard_cut_anywhere_reads_zeros_or_new(logged):
     newer[2 * 512 : 3 * 512] = update
     states = set()
     for point in range(len(second)):
-        found = read_after(logged, first + second[: point + 1], start)
+        found = read_after(logged, second[: point + 1], start, base=base)
         assert found in (new, zeros, bytes(newer)), f"after a second crash at entry {point}"
         states.add(found)
     assert found == bytes(newer), "the new sector is not durable after the flush"

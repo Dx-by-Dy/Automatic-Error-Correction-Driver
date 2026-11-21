@@ -74,14 +74,6 @@ in a run, **From reading** means it was only found in the code.
   Fix, for the correction stage: parity computed from the data in RAM, not from what is read back, would make
   such a stripe disagree, and P+Q can tell which member is wrong, so a scrub could find the chunk and rebuild
   it.
-- **After a restart the trailing copy keeps the old CRC until the chunk is written again.** Confirmed at
-  `8a153d4` by `test_old_data_put_back_fails_once_the_new_was_read`: a crash after the flush that made a write
-  back durable and before its trailing copy, or a lost trailing write, leaves the leading copy with the CRC of the
-  new data and the trailing one with that of the old. Once the device is created again nothing settles such a
-  chunk before its next write back: its new data reads and is flushed, but the old data, put back by a drive that
-  lost the write from its cache, passes for ever, not only until the flush as in the item above. Fix: settle a
-  chunk whose copies differ when it is first read, or all of them in the background after activation, which
-  [TODO_OPTIMIZATION.md](TODO_OPTIMIZATION.md) proposes for speed.
 - **No write zeroes over a lower device without it.** By decision (D23): device mapper offers write zeroes only
   where every device below has it, so over such a device `blkdev_issue_zeroout` writes zero pages through the
   cache. Correct, only slower. Fix, if it matters: device mapper has no flag for a target that zeroes by itself.

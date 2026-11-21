@@ -56,8 +56,8 @@ statement, the cause, what it costs, and a way to fix it if known; it is removed
     chunk. Helps partial writes, not full rewrites of a chunk.
   - FUA data writes, after which the trailing copy can take the new CRC at once: cheap on SSDs with power loss
     protection, slow on HDDs.
-- **The read before a write back is synchronous in the worker.** It happens only for chunks whose copies differ,
-  after a crash or a failed write back. Fix, if it matters: settle them in the background after activation.
+- **The settle is synchronous in the worker.** It happens only for chunks whose copies differ, after a crash or a
+  failed write back, before their write back or after a read that matched only the leading copy. Fix, if it matters: settle them in the background after activation.
 - **The trailing copies are written one range at a time, synchronously, in the worker.** Each range of an area is
   a request of its own. Fix: send them all, then wait, as runs will do for the data.
 

@@ -140,7 +140,10 @@ flowchart TD
     lower --> error{"Ошибка снизу?"}
     error -- да --> eio["BLK_STS_IOERR только для этого bio"]
     error -- нет --> crc{"Каждый сектор совпадает с ведущим или замыкающим CRC?"}
-    crc -- да --> ok(["Завершить"])
+    crc -- да --> only{"Сектор совпал только с ведущей копией, чанк не записан обратно после flush?"}
+    only -- да --> settle["Передать чанк воркеру на согласование"]
+    only -- нет --> ok(["Завершить"])
+    settle --> ok
     crc -- нет --> eio
     copy --> ok
     zeros --> ok
@@ -152,7 +155,9 @@ flowchart TD
 [`test_corruption.py`](../../tests/test_corruption.py): `test_data_corruption_fails_only_that_sector`,
 `test_crc_corruption_in_one_copy_is_covered_by_the_other`;
 [`test_metadata.py`](../../tests/test_metadata.py): `test_a_read_takes_one_lower_read_when_the_metadata_is_in_ram`;
-[`test_lower_errors.py`](../../tests/test_lower_errors.py): `test_failed_data_sector_fails_only_its_reads`.
+[`test_lower_errors.py`](../../tests/test_lower_errors.py): `test_failed_data_sector_fails_only_its_reads`;
+[`test_lost_writes.py`](../../tests/test_lost_writes.py): `test_old_data_put_back_fails_once_the_new_was_read`;
+[`test_crash.py`](../../tests/test_crash.py): `test_a_second_crash_after_one_between_the_copies`.
 
 ## Элемент кэша
 
@@ -265,8 +270,8 @@ stateDiagram-v2
 Крах в любом состоянии оставляет каждый сектор читаемым, старым или новым. Не покрыто: крах в средних состояниях
 вместе с потерянным сектором той копии, которая совпадает, что последующая запись соседа делает постоянным, см.
 [Сектор метаданных, восстановленный из одной копии](#сектор-метаданных-восстановленный-из-одной-копии). Крах после
-flush сверху и до замыкающей копии оставляет состояние с новыми данными, и ничто не продвигает его дальше до
-следующей обратной записи: [Замыкающая копия после перезапуска](#замыкающая-копия-после-перезапуска).
+flush сверху и до замыкающей копии оставляет состояние с новыми данными; первое его чтение, совпадающее только с
+ведущей копией, передаёт чанк воркеру на согласование, см. [Путь чтения](#путь-чтения).
 
 Покрыто [`test_crash.py`](../../tests/test_crash.py): `test_a_write_cut_between_data_and_metadata_reads_old_or_new`,
 `test_chunks_of_a_region_cut_between_flushes_read_old_or_new_each`, `test_ext4_survives_a_crash_after_each_fsync`,
@@ -433,7 +438,7 @@ flowchart TD
     a1 --> a2["После flush: обе копии хранят новый CRC, чанк отказывает"]
     what -- "данные первой записи" --> b1["Отказывает сразу: нули внизу не совпадают ни с одной копией, благодаря затравке"]
     what -- "ведущий сектор метаданных" --> c1["Его покрывает замыкающая копия, следующая обратная запись согласует"]
-    what -- "замыкающий сектор метаданных, или крах до него" --> t1["Старый CRC остаётся до следующей обратной записи: возвращённые старые данные проходят, навсегда"]
+    what -- "замыкающий сектор метаданных, или крах до него" --> t1["Старый CRC остаётся, пока чанк не прочитан или не записан обратно; чтение новых данных согласует его, и возвращённые старые данные отказывают"]
     what -- "одна копия блока битовой карты" --> d1["Берётся другая копия, более нового поколения"]
     what -- "данные и обе копии метаданных" --> e1["Старые данные проходят навсегда: слепое пятно, для чётности этапа коррекции"]
 ```
@@ -442,8 +447,7 @@ flowchart TD
 [`test_corruption.py`](../../tests/test_corruption.py): `test_zeroed_chunk_is_detected`,
 `test_chunk_copied_elsewhere_is_detected`, `test_sectors_swapped_inside_a_chunk_with_their_crcs_are_detected`,
 `test_a_zeroed_region_with_its_chunks_written_is_detected`, `test_a_region_shifted_whole_with_its_metadata_is_detected`,
-`test_a_chunk_from_another_device_is_detected`. Потерянный замыкающий сектор нарисован в разделе [Замыкающая копия
-после перезапуска](#замыкающая-копия-после-перезапуска).
+`test_a_chunk_from_another_device_is_detected`.
 
 ## Случаи, которые сейчас не проходят
 
@@ -480,25 +484,6 @@ flowchart TD
 читается, заполняется NEW, и следующая синхронизация пишет NEW поверх него. Закреплено
 `test_a_sector_rebuilt_from_one_copy_keeps_its_neighbours_readable`, оба случая — строгий `xfail`; с равными
 копиями, позитивный контроль, Y читается.
-
-### Замыкающая копия после перезапуска
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    apart: данные NEW, ведущая NEW, замыкающая OLD
-    read: создан снова, NEW читается, flush ничего не меняют
-    back: диск возвращает OLD
-    passes: OLD совпадает с замыкающей копией, читается без ошибки
-    [*] --> apart: крах после flush сверху, до замыкающей копии, или потерянная запись замыкающей
-    apart --> read
-    read --> back: запись, потерянная из кэша диска
-    back --> passes
-    note right of read: ничто не согласует чанк до его следующей обратной записи
-```
-
-Закреплено `test_old_data_put_back_fails_once_the_new_was_read`: с потерянной замыкающей копией — строгий
-`xfail`; с обеими записанными копиями возвращённые старые данные не проходят CRC.
 
 ### Поиск берёт копию, сохранённую как данные
 

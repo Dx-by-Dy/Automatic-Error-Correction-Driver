@@ -32,6 +32,9 @@ struct trn_mr_rq
     /// matches either
     struct metadata_entry md[METADATA_COPIES];
 
+    /// @brief The chunk was written back since the last flush of the lower device, see metadata_copy_entries
+    bool written;
+
     /// @brief Saved iter for bio from struct trn_p_rq
     /// @details Used to extract data from bio after its return
     /// from the lower level and for further data analysis and CRC verification against md.

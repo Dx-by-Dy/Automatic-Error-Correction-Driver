@@ -524,6 +524,40 @@ void cache_read_done(struct cache *cache, struct cache_lower_read *lower)
         dcorr_events_wake(&cache->events);
 }
 
+/// @brief Hands a chunk to the worker to settle, after a read that matched only its leading copy
+/// @details
+/// After a crash between the flush that made a write back durable and its
+/// trailing copy, or with the trailing write lost, the leading copy of a chunk
+/// has the CRC of its data and the trailing copy that of an older version.
+/// Nothing would settle it before its next write back, and the older data,
+/// put back by a drive that lost the write from its cache, would pass. So a
+/// read that matched only the leading copy in a sector hands the chunk to the
+/// worker, see cache_settle_reads. The table holds CACHE_SETTLES chunks; one
+/// already there is not added again, and when it is full the chunk is left
+/// out, for a later read to hand it again.
+///
+/// Expected execution context - process, complete_work of the read.
+void cache_queue_settle(struct cache *cache, sector_t chunk)
+{
+    bool queued = false;
+
+    spin_lock(&cache->lock);
+    for (unsigned int i = 0; i < cache->nr_settles; i++)
+    {
+        if (cache->settles[i] == chunk)
+            queued = true;
+    }
+    if (!queued && cache->nr_settles < CACHE_SETTLES)
+    {
+        cache->settles[cache->nr_settles++] = chunk;
+        queued = true;
+    }
+    spin_unlock(&cache->lock);
+
+    if (queued)
+        cache_kick(cache);
+}
+
 /// @brief Hands an empty flush to the worker, which completes it
 /// @details
 /// Expected execution context - dcorr_map.
@@ -810,6 +844,37 @@ static void cache_submit_job(struct cache *cache, struct cache_entry *entry,
         queue_work(dc->transform_wq, &job->part.submit_work);
 }
 
+/// @brief Flushes the lower device, counting a failure
+/// @details A flush that succeeds records that the lower device has flushed since the table was created.
+/// @return 0, or the error of the flush
+static int cache_flush_lower(struct cache *cache)
+{
+    int r = blkdev_issue_flush(cache->dc->lower->bdev);
+
+    if (r)
+    {
+        atomic64_inc(&cache->stats->flush_errors);
+        dcorr_error(cache->dc->ti);
+        return r;
+    }
+    cache->lower_flushed = true;
+    return 0;
+}
+
+/// @brief Makes sure the lower device has flushed since the table was created, before a settle
+/// @details
+/// A settle reads a chunk and puts the CRC of what it reads into the trailing
+/// copy with FUA. Data written before the table was created, by an earlier
+/// table or before a crash of the host, may still be only in the cache of the
+/// drive; a settle that took its CRC would leave the chunk matching neither
+/// copy once the drive lost it. So the first settle of a table flushes first;
+/// any sync does it as well.
+/// @return 0, or the error of the flush
+static int cache_flush_before_settle(struct cache *cache)
+{
+    return cache->lower_flushed ? 0 : cache_flush_lower(cache);
+}
+
 static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed);
 
 /// @brief Makes the metadata of a chunk ready for a write back that writes the leading copy first
@@ -831,9 +896,10 @@ static int cache_sync(struct cache *cache, struct bio_list *flushes, bool failed
 ///
 /// If the sync of a barrier fails, nothing has become durable and the chunk
 /// may not be written back: the error is returned, and the caller gives the
-/// write back up.
+/// write back up. So it does if the flush before the first settle of the
+/// table fails, see cache_flush_before_settle.
 /// @param unwritten Whether the bit of the chunk in the bitmap of written chunks is clear
-/// @return 0, or the error of the sync of the barrier
+/// @return 0, or the error of the sync of the barrier or of the flush before a settle
 static int cache_prepare_metadata(struct cache *cache, struct cache_entry *entry, bool unwritten)
 {
     struct metadata_cache *metadata = cache->dc->metadata;
@@ -850,7 +916,11 @@ static int cache_prepare_metadata(struct cache *cache, struct cache_entry *entry
     }
 
     if (!r && !unwritten)
-        metadata_settle(metadata, area, sector, entry->mask);
+    {
+        r = cache_flush_before_settle(cache);
+        if (!r)
+            metadata_settle(metadata, area, sector, entry->mask);
+    }
     metadata_put(metadata, area);
 
     return r;
@@ -944,20 +1014,6 @@ static int cache_write_back_entry(struct cache *cache, struct cache_entry *entry
 static bool cache_under_pressure(struct cache *cache)
 {
     return cache->nr_free + cache->nr_writing < CACHE_STOP_FREE;
-}
-
-/// @brief Flushes the lower device, counting a failure
-/// @return 0, or the error of the flush
-static int cache_flush_lower(struct cache *cache)
-{
-    int r = blkdev_issue_flush(cache->dc->lower->bdev);
-
-    if (r)
-    {
-        atomic64_inc(&cache->stats->flush_errors);
-        dcorr_error(cache->dc->ti);
-    }
-    return r;
 }
 
 /// @brief Flushes the lower device, writes the bitmap, completes the flushes from above, then writes the
@@ -1068,9 +1124,55 @@ static int cache_crowded_flush(struct cache *cache)
     return cache_sync(cache, NULL, false);
 }
 
+/// @brief Settles the chunks that reads handed to the worker, see cache_queue_settle
+/// @details
+/// A chunk under write back, or written back since the last flush, is left:
+/// its trailing copy is written by the next sync, or it is settled before its
+/// next write back. Only the worker starts write backs, so neither changes
+/// while it settles; a read of the chunk meanwhile takes either copy. If the
+/// flush before the first settle of the table fails, the chunks are left.
+///
+/// Expected execution context - the worker, may sleep.
+static void cache_settle_reads(struct cache *cache)
+{
+    struct metadata_cache *metadata = cache->dc->metadata;
+    sector_t chunks[CACHE_SETTLES];
+    unsigned int nr;
+
+    spin_lock(&cache->lock);
+    nr = cache->nr_settles;
+    memcpy(chunks, cache->settles, nr * sizeof(chunks[0]));
+    cache->nr_settles = 0;
+    spin_unlock(&cache->lock);
+
+    for (unsigned int i = 0; i < nr; i++)
+    {
+        sector_t sector = chunks[i] * DCORR_CHUNK_SECTORS;
+        struct metadata_area *area;
+        struct cache_entry *entry;
+        bool busy;
+
+        spin_lock(&cache->lock);
+        entry = cache_find(cache, chunks[i]);
+        busy = entry && entry->state == CACHE_WRITING;
+        spin_unlock(&cache->lock);
+        if (busy)
+            continue;
+
+        if (cache_flush_before_settle(cache))
+            return;
+
+        area = metadata_get(metadata, sector);
+        if (!metadata_written_since_flush(metadata, area, sector))
+            metadata_settle(metadata, area, sector, 0xff);
+        metadata_put(metadata, area);
+    }
+}
+
 /// @brief The worker
 /// @details
-/// Carries out the discards first, see cache_discard_bios. Then writes back
+/// Carries out the discards first, see cache_discard_bios, and settles the
+/// chunks that reads handed to it, see cache_settle_reads. Then writes back
 /// the dirty entries, the oldest first: all of them for a flush,
 /// a FUA write or a suspend, and otherwise those older than CACHE_AGE_MS and
 /// as many as keep CACHE_STOP_FREE entries free or on their way to it. A flush
@@ -1107,6 +1209,8 @@ static void cache_worker(struct work_struct *work)
 
     if (!bio_list_empty(&discards))
         cache_discard_bios(cache, &discards);
+
+    cache_settle_reads(cache);
 
     spin_lock(&cache->lock);
     flushes = cache->flushes;

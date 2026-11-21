@@ -211,7 +211,7 @@ void metadata_cache_destroy(struct metadata_cache *mc);
 struct metadata_area *metadata_get(struct metadata_cache *mc, sector_t sector);
 void metadata_put(struct metadata_cache *mc, struct metadata_area *area);
 blk_status_t metadata_copy_entries(struct metadata_cache *mc, sector_t sector,
-                                   struct metadata_entry md[METADATA_COPIES]);
+                                   struct metadata_entry md[METADATA_COPIES], bool *written);
 void metadata_written(struct metadata_cache *mc, struct metadata_area *area, sector_t sector,
                       u8 mask, bool ok);
 bool metadata_written_since_flush(struct metadata_cache *mc, struct metadata_area *area, sector_t sector);

@@ -31,6 +31,9 @@
 /// @brief Number of write back jobs, so of lower writes of the cache, in flight at once
 #define CACHE_JOBS 256
 
+/// @brief Chunks that reads may hand to the worker to settle before it runs, see cache_queue_settle
+#define CACHE_SETTLES 64
+
 struct dcorr_ctx;
 struct cache_job;
 
@@ -158,6 +161,16 @@ struct cache
     /// @brief The value of clears the last sync made durable, see cache_prepare_metadata
     u64 synced_clears;
 
+    /// @brief Chunks that reads found settled in the leading copy only, for the worker to settle
+    sector_t settles[CACHE_SETTLES];
+
+    /// @brief How many of settles are in use
+    unsigned int nr_settles;
+
+    /// @brief The lower device has flushed since the table was created, see cache_flush_lower
+    /// @details Changed and read only by the worker, or in postsuspend once it is cancelled.
+    bool lower_flushed;
+
     /// @brief The worker writes back everything dirty, set during a suspend
     bool write_all;
 
@@ -194,6 +207,7 @@ void cache_write(struct cache *cache, struct bio *bio);
 void cache_write_zeroes(struct cache *cache, struct bio *bio);
 bool cache_read(struct cache *cache, struct bio *bio, struct cache_lower_read *lower);
 void cache_read_done(struct cache *cache, struct cache_lower_read *lower);
+void cache_queue_settle(struct cache *cache, sector_t chunk);
 void cache_flush(struct cache *cache, struct bio *bio);
 void cache_discard(struct cache *cache, struct bio *bio);
 void cache_suspend(struct cache *cache);

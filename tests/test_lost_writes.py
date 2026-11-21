@@ -224,24 +224,14 @@ def test_a_lost_copy_of_a_block_of_the_bitmap_is_covered_by_the_other(lossy, rol
     assert lossy.upper.read(NEVER, DATA_SECTORS) == new
 
 
-@pytest.mark.parametrize(
-    "trailing",
-    [
-        "written",
-        pytest.param(
-            "lost",
-            marks=pytest.mark.xfail(
-                strict=True, reason="After a restart the trailing copy keeps the old CRC until the chunk is written again"
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("trailing", ["written", "lost"])
 def test_old_data_put_back_fails_once_the_new_was_read(lossy, trailing):
     """The trailing copy of a rewrite is lost, as a crash after the flush and before the trailing copy leaves
     it: the leading copy has the CRC of the new data and the trailing one that of the old. Once the target is
     created again the new data reads and is flushed, so it is durable; yet the trailing copy keeps the old CRC
     until the chunk is written again, and the old data, put back below by a drive that lost the write from its
-    cache, passes for ever. Settling such chunks when they are first read, or in the background, would close it.
+    cache, would pass for ever. So the read that matched only the leading copy hands the chunk to the worker to
+    settle.
 
     "written" is the positive control: with both copies new, the old data put back fails its CRC.
     """
